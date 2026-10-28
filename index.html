@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetNotrh — Визуализация</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <div class="brand" aria-label="NetNotrh">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">NetNotrh</span>
+  </div>
+  <header class="topbar">
+    <input id="projectTitle" class="project-title" value="Новая схема" aria-label="Название проекта" maxlength="90" spellcheck="false">
+    <div class="topbar-spacer"></div>
+    <button class="top-action" id="themeToggleBtn" title="Переключить светлую и тёмную тему"><span>Тема</span></button>
+    <button class="top-action" id="exportBtn" title="Экспортировать схему как PNG или JPG">
+      <span class="tool-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v11m-4-4 4 4 4-4M5 16v4h14v-4"/></svg></span>
+      <span>Экспорт</span>
+    </button>
+    <input type="file" class="hidden-file" id="importFile" accept="application/json,.json">
+    <input type="file" class="hidden-file" id="imageFile" accept=".png,.jpg,.jpeg">
+  </header>
+
+  <aside class="sidebar">
+    <div class="section-label">ИНСТРУМЕНТЫ</div>
+    <button class="tool-button active" data-mode="select" title="Выбор и перемещение">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="m5 3 14 10-7 1-3 7L5 3Z"/></svg></span><span class="label">Выбор</span><span class="shortcut">V</span>
+    </button>
+    <button class="tool-button" data-mode="text" title="Нажмите на поле, чтобы создать текстовый узел">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M4 6V4h16v2M12 4v16m-4 0h8"/></svg></span><span class="label">Текстовый узел</span><span class="shortcut">T</span>
+    </button>
+    <button class="tool-button" data-mode="connect" title="Выберите два узла, чтобы соединить их">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="m8 8 8 8"/></svg></span><span class="label">Связь</span><span class="shortcut">C</span>
+    </button>
+    <div class="sidebar-separator"></div>
+    <div class="section-label">ДЕЙСТВИЯ</div>
+    <button class="tool-button" id="deleteBtn" title="Удалить выбранный узел">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5"/></svg></span><span class="label">Удалить выбранное</span><span class="shortcut">Del</span>
+    </button>
+    <button class="tool-button" id="undoBtn" title="Отменить действие">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5M4 9h9a6 6 0 0 1 0 12h-2"/></svg></span><span class="label">Отменить</span><span class="shortcut">Ctrl Z</span>
+    </button>
+    <button class="tool-button" id="redoBtn" title="Повторить действие">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5m5 5h-9a6 6 0 0 0 0 12h2"/></svg></span><span class="label">Повторить</span><span class="shortcut">Ctrl ⇧ Z</span>
+    </button>
+    <div class="sidebar-separator"></div>
+    <div class="section-label">ИСТОРИЯ</div>
+    <button class="tool-button" id="playHistoryBtn" title="Ускоренно воспроизвести процесс создания схемы">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg></span><span class="label">Анимация создания</span>
+    </button>
+    <button class="tool-button" id="exportJsonBtn" title="Сохранить проект для последующего импорта">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M12 3v11m-4-4 4 4 4-4M5 16v4h14v-4"/></svg></span><span class="label">Экспорт проекта JSON</span>
+    </button>
+    <button class="tool-button" id="importBtn" title="Открыть ранее экспортированный проект">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M12 14V3m-4 4 4-4 4 4M5 14v6h14v-6"/></svg></span><span class="label">Импорт проекта</span>
+    </button>
+    <div class="sidebar-spacer"></div>
+    <div class="sidebar-bottom">
+      <button class="tool-button" id="clearBtn" title="Очистить рабочее поле">
+        <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13"/></svg></span><span class="label">Очистить поле</span>
+      </button>
+    </div>
+  </aside>
+
+  <main class="main" id="mainArea">
+    <div class="workspace" id="workspace">
+      <div class="world" id="world">
+        <div class="stage" id="stage" aria-label="Рабочее поле"></div>
+      </div>
+    </div>
+    <div class="empty-state" id="emptyState" role="status" aria-live="polite">
+      <button class="empty-state-close" id="emptyStateCloseBtn" type="button" aria-label="Закрыть подсказку" title="Больше не показывать">×</button>
+      <div class="empty-state-mark" aria-hidden="true"></div>
+      <strong>Начните с первого узла</strong>
+      <span>ПКМ: создать узел или загрузить изображение</span>
+    </div>
+    <div class="mode-indicator" id="modeIndicator"></div>
+    <div class="zoom-indicator" id="zoomIndicator">100%</div>
+    <div class="context-menu" id="nodeContextMenu" role="menu" aria-label="Контекстное меню NetNotrh">
+      <div id="canvasContextActions" hidden>
+        <button class="context-item" data-canvas-action="create-text" role="menuitem">Создать текстовый узел</button>
+        <button class="context-item" data-canvas-action="upload-image" role="menuitem">Загрузить изображение</button>
+      </div>
+      <div id="nodeContextActions">
+        <div id="textNodeContextActions">
+          <div class="context-caption">ЦВЕТ ТЕКСТА</div>
+          <div class="color-grid">
+            <button class="color-swatch" data-node-color="#111111" title="Чёрный" aria-label="Чёрный" style="background:#111111"></button>
+            <button class="color-swatch" data-node-color="#4b4b4b" title="Графитовый" aria-label="Графитовый" style="background:#4b4b4b"></button>
+            <button class="color-swatch" data-node-color="#888888" title="Серый" aria-label="Серый" style="background:#888888"></button>
+            <button class="color-swatch" data-node-color="#bf2929" title="Красный" aria-label="Красный" style="background:#bf2929"></button>
+            <button class="color-swatch" data-node-color="#185abc" title="Синий" aria-label="Синий" style="background:#185abc"></button>
+            <button class="color-swatch" data-node-color="#267344" title="Зелёный" aria-label="Зелёный" style="background:#267344"></button>
+            <button class="color-swatch" data-node-color="#7a35a2" title="Фиолетовый" aria-label="Фиолетовый" style="background:#7a35a2"></button>
+          </div>
+          <div class="context-divider"></div>
+          <button class="context-item" data-node-action="underline" role="menuitemcheckbox" aria-checked="false">Подчеркнуть текст <span class="check"></span></button>
+          <button class="context-item" data-node-action="highlight" role="menuitemcheckbox" aria-checked="false">Выделить жёлтым <span class="check"></span></button>
+          <div class="context-divider"></div>
+        </div>
+        <button class="context-item" data-node-action="upload-image" role="menuitem">Загрузить изображение</button>
+        <button class="context-item danger" data-node-action="delete" role="menuitem">Удалить узел…</button>
+      </div>
+    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <div class="playback-panel" id="playbackPanel">
+      <div class="playback-top">
+        <button class="small-icon-button" id="playPauseBtn" aria-label="Воспроизвести" title="Воспроизвести или приостановить">
+          <svg id="playPauseIcon" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>
+        </button>
+        <div><div class="playback-title">История создания</div><div class="playback-subtitle" id="playbackSubtitle">Плавно в начале и конце, быстрее в середине</div></div>
+        <div class="playback-spacer"></div>
+        <button class="small-icon-button" id="exitPlaybackBtn" aria-label="Закрыть анимацию" title="Закрыть">
+          <svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+      <input type="range" id="playbackRange" class="playback-track" min="0" max="1000" value="0" aria-label="Позиция воспроизведения">
+      <div class="playback-bottom"><span id="playbackTime">0:00</span><span id="playbackStep">Шаг 1</span></div>
+    </div>
+    <div class="modal-backdrop" id="modalBackdrop">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <h2 id="modalTitle">Очистить рабочее поле?</h2>
+        <p id="modalText">Все узлы и связи будут удалены из текущей схемы. Это действие можно отменить.</p>
+        <div class="modal-actions"><button id="modalCancel">Отмена</button><button class="danger" id="modalConfirm">Очистить</button></div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="start-screen visible" id="startScreen" role="dialog" aria-modal="true" aria-label="Главное меню NetNotrh">
+  <div class="start-shell">
+    <div class="start-panel">
+      <section id="startMainPanel">
+        <h1>NetNotrh</h1>
+        <div class="start-actions">
+          <button class="start-button primary" id="createCanvasBtn"><span>Создать холст</span><span class="start-chevron">↗</span></button>
+          <button class="start-button" id="openPreviousBtn"><span>Открыть прошлые</span><span class="start-chevron">→</span></button>
+          <button class="start-button" id="settingsBtn"><span>Настройки</span><span class="start-chevron">→</span></button>
+        </div>
+      </section>
+      <section id="startProjectsPanel" hidden>
+        <button class="start-back" data-start-back="main">← Главное меню</button>
+        <h2>Прошлые проекты</h2>
+        <div class="saved-project-list" id="savedProjectList"></div>
+        <button class="start-button" id="importFromStartBtn" style="margin-top:10px"><span>Импортировать JSON</span><span class="start-chevron">↓</span></button>
+      </section>
+      <section id="startSettingsPanel" hidden>
+        <button class="start-back" data-start-back="main">← Главное меню</button>
+        <h2>Настройки</h2>
+        <p class="start-description">Настрой оформление и поведение рабочего пространства.</p>
+        <div style="font-size:12px;font-weight:650">Тема оформления</div>
+        <div class="theme-choice"><button type="button" data-theme-choice="light">Светлая</button><button type="button" data-theme-choice="dark">Тёмная</button></div>
+        <div class="setting-toggle-row">
+          <div class="setting-toggle-copy">
+            <span class="setting-toggle-title">Авторасстановка веток</span>
+            <span class="setting-toggle-description">Ровно распределять связанные вкладки при создании новых связей.</span>
+          </div>
+          <label class="setting-switch" aria-label="Авторасстановка веток">
+            <input type="checkbox" id="autoArrangeToggle" checked>
+            <span class="setting-switch-track"></span>
+          </label>
+        </div>
+        <button class="start-button primary" data-start-back="main" style="margin-top:18px">Готово</button>
+      </section>
+    </div>
+  </div>
+</div>
+<div id="projectActionsMenu" class="project-actions-menu" role="menu" aria-label="Действия с проектом">
+  <button type="button" data-project-menu-action="rename" role="menuitem">Переименовать</button>
+  <button type="button" data-project-menu-action="delete" role="menuitem" class="danger">Удалить</button>
+</div>
+<div class="project-modal-backdrop" id="projectRenameBackdrop" role="dialog" aria-modal="true" aria-labelledby="projectRenameTitle" aria-hidden="true">
+  <form class="project-modal" id="projectRenameForm">
+    <h2 id="projectRenameTitle">Переименовать проект</h2>
+    <label for="projectRenameInput">Название проекта</label>
+    <input id="projectRenameInput" name="projectTitle" type="text" maxlength="90" required autocomplete="off">
+    <div class="project-modal-actions">
+      <button type="button" id="projectRenameCancelBtn">Отмена</button>
+      <button type="submit" class="primary">Сохранить</button>
+    </div>
+  </form>
+</div>
+<div class="project-modal-backdrop" id="projectDeleteBackdrop" role="dialog" aria-modal="true" aria-labelledby="projectDeleteTitle" aria-describedby="projectDeleteText" aria-hidden="true">
+  <div class="project-modal">
+    <h2 id="projectDeleteTitle">Удалить проект?</h2>
+    <p id="projectDeleteText">Это действие нельзя отменить.</p>
+    <div class="project-modal-actions">
+      <button type="button" id="projectDeleteCancelBtn">Отмена</button>
+      <button type="button" id="projectDeleteConfirmBtn" class="danger">Удалить</button>
+    </div>
+  </div>
+</div>
+<div class="exit-confirm-backdrop" id="exitConfirmBackdrop" role="dialog" aria-modal="true" aria-labelledby="exitConfirmTitle" aria-describedby="exitConfirmText">
+  <div class="modal exit-confirm-modal">
+    <h2 id="exitConfirmTitle">Сохранить изменения?</h2>
+    <p id="exitConfirmText">В проекте есть изменения, которые ещё не сохранены. Что сделать перед выходом в главное меню?</p>
+    <div class="modal-actions exit-confirm-actions">
+      <button type="button" class="primary" id="exitSaveBtn">Сохранить и выйти</button>
+      <button type="button" id="exitWithoutSaveBtn">Выйти без сохранения</button>
+      <button type="button" id="exitCancelBtn">Отмена</button>
+    </div>
+  </div>
+</div>
+<div class="export-screen" id="exportScreen" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
+  <div class="export-panel">
+    <h2 id="exportTitle">Экспорт изображения</h2>
+    <p>Схема будет автоматически вписана в изображение. Фон будет однотонным: белым в светлой теме или чёрным в тёмной.</p>
+    <div class="export-options" role="radiogroup" aria-label="Формат файла">
+      <label class="export-option"><input type="radio" name="exportFormat" value="png" checked><span><strong>PNG</strong><br><span style="color:#888">Без потери качества</span></span></label>
+      <label class="export-option"><input type="radio" name="exportFormat" value="jpeg"><span><strong>JPG</strong><br><span style="color:#888">Меньший размер файла</span></span></label>
+    </div>
+    <div class="export-actions"><button type="button" id="cancelPngExportBtn">Отмена</button><button type="button" class="primary" id="downloadPngBtn">Скачать</button></div>
+  </div>
+</div>
+<script src="script.js"></script>
+</body>
+</html>
