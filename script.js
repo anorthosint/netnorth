@@ -71,6 +71,9 @@
   let mode = 'select';
   let connectionSourceId = null;
   let drag = null;
+  // Track movement during the active pointer gesture. The flag is cleared on pointerup;
+  // a one-shot capture listener separately blocks the synthetic click after dragging a link.
+  let wasDragging = false;
   let linkDraft = null;
   let currentRenderScene = null;
   // Cached DOM/model indexes let drag operations update only affected nodes and edges.
@@ -470,13 +473,16 @@
     }
 
     renameTargetProjectId = id;
-    projectRenameInput.value = item.title || '';
+    projectRenameInput.value = typeof item.title === 'string' ? item.title : '';
     projectRenameBackdrop.classList.add('visible');
     projectRenameBackdrop.setAttribute('aria-hidden', 'false');
-    requestAnimationFrame(() => {
+
+    // Let the modal finish opening before forcing focus into the input.
+    window.setTimeout(() => {
+      if (!projectRenameBackdrop.classList.contains('visible')) return;
       projectRenameInput.focus({ preventScroll: true });
       projectRenameInput.select();
-    });
+    }, 50);
   }
 
   function closeRenameProjectModal() {
@@ -506,9 +512,18 @@
   }
 
   function renameProject(id, title) {
-    const cleanTitle = String(title || '').trim().slice(0, 90);
-    if (!id || !cleanTitle) {
+    const cleanTitle = String(title ?? '').trim().slice(0, 90);
+    if (!cleanTitle) {
       showToast('Введи название проекта');
+      // Empty input is recoverable: keep the modal open and return the caret
+      // to the field so the user can immediately type a project name.
+      if (projectRenameBackdrop.classList.contains('visible')) {
+        projectRenameInput.focus({ preventScroll: true });
+      }
+      return false;
+    }
+    if (!id) {
+      showToast('Проект не найден');
       return false;
     }
 
@@ -840,9 +855,9 @@
       x: clamp(Number(n && n.x) || 0, 0, 100000),
       y: clamp(Number(n && n.y) || 0, 0, 100000),
       text: String(n && n.text || '').slice(0, 10000),
-      width: clamp(Number(n && n.width) || 180, 40, 2000),
-      height: clamp(Number(n && n.height) || 42, 24, 1200),
-      fontSize: clamp(Number(n && n.fontSize) || 16, 10, 80),
+      width: clamp(Number(n && n.width) || 180, 10, 2000),
+      height: clamp(Number(n && n.height) || 42, 10, 1200),
+      fontSize: clamp(Number(n && n.fontSize) || 16, 8, 80),
       autoSize: !n || n.autoSize !== false,
       color: ['#111111','#4b4b4b','#888888','#bf2929','#185abc','#267344','#7a35a2'].includes(n && n.color) ? n.color : '#111111',
       underline: !!(n && n.underline),
@@ -1017,6 +1032,23 @@
     });
   }
 
+  function suppressImmediateDraggedLinkClick() {
+    // A browser may emit click after pointerup even though the user dragged the node.
+    // Catch only that immediate click in capture phase; auto-remove the guard if no click follows.
+    const suppressClick = event => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest('a.node-link')) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      document.removeEventListener('click', suppressClick, true);
+    };
+
+    document.addEventListener('click', suppressClick, true);
+    window.setTimeout(() => {
+      document.removeEventListener('click', suppressClick, true);
+    }, 0);
+  }
+
   function appendTextWithLinks(container, value) {
     const text = String(value ?? '');
     const urlPattern = /(?:https?:\/\/|www\.)[^\s<>\"']+/gi;
@@ -1041,11 +1073,29 @@
       anchor.href = /^www\./i.test(visibleUrl) ? `https://${visibleUrl}` : visibleUrl;
       anchor.target = '_blank';
       anchor.rel = 'noopener noreferrer';
-      // A link opens normally but must not select, drag, or enter edit mode on its node.
-      anchor.addEventListener('pointerdown', event => event.stopPropagation());
-      anchor.addEventListener('mousedown', event => event.stopPropagation());
-      anchor.addEventListener('click', event => event.stopPropagation());
-      anchor.addEventListener('dblclick', event => event.stopPropagation());
+      // Keep pointer events bubbling so select-text and connect-node interactions work.
+      // Handle the link click ourselves to prevent native navigation from opening a duplicate tab.
+      anchor.addEventListener('click', event => {
+        // Avoid opening twice on a double-click; leave the normal selection intact.
+        if (event.detail > 1) {
+          event.preventDefault();
+          return;
+        }
+
+        // Disable native navigation: the app controls when links open.
+        event.preventDefault();
+
+        if (mode !== 'select') return;
+
+        // Do not open a link while a drag is still active.
+        if (drag && drag.moved) return;
+
+        // If the user is selecting text, do not turn that gesture into navigation.
+        const selection = window.getSelection();
+        if (selection && selection.toString().length > 0) return;
+
+        window.open(anchor.href, '_blank', 'noopener,noreferrer');
+      });
       container.appendChild(anchor);
       if (trailing) container.appendChild(document.createTextNode(trailing));
       lastIndex = matchEnd;
@@ -1083,6 +1133,7 @@
     model.nodes.forEach(n => {
       const el = document.createElement('div');
       el.className = 'node';
+      if (Number(n.width) <= 18 || Number(n.height) <= 18) el.classList.add('tiny-node');
       el.dataset.nodeId = n.id;
       el.style.left = `${n.x}px`;
       el.style.top = `${n.y}px`;
@@ -1090,11 +1141,11 @@
       const autoSize = n.autoSize !== false && !isImage;
       if (isImage) {
         el.classList.add('image-node');
-        el.style.width = `${Math.max(40, Number(n.width) || 360)}px`;
-        el.style.height = `${Math.max(24, Number(n.height) || 240)}px`;
+        el.style.width = `${Math.max(10, Number(n.width) || 360)}px`;
+        el.style.height = `${Math.max(10, Number(n.height) || 240)}px`;
         el.style.maxWidth = 'none';
-        el.style.minWidth = '40px';
-        el.style.minHeight = '24px';
+        el.style.minWidth = '10px';
+        el.style.minHeight = '10px';
         const imageEl = document.createElement('img');
         imageEl.className = 'node-image';
         imageEl.alt = 'Изображение';
@@ -1118,8 +1169,8 @@
         // Text nodes wrap to content; images use explicit pixel dimensions above.
         el.style.width = autoSize ? 'max-content' : `${n.width}px`;
         el.style.height = 'auto';
-        el.style.maxWidth = autoSize ? '360px' : 'none';
-        el.style.minWidth = autoSize ? '0' : '40px';
+        el.style.maxWidth = 'none';
+        el.style.minWidth = autoSize ? '0' : '10px';
         el.style.minHeight = '0';
         el.style.fontSize = `${n.fontSize || 16}px`;
         el.style.color = (document.body.classList.contains('dark-theme') && (!n.color || n.color === '#111111')) ? '#f2f2f2' : (n.color || '#111111');
@@ -1166,8 +1217,29 @@
       if (!isPlayback && n.id !== editingId) {
         el.addEventListener('pointerdown', event => {
           if (event.button !== 0) return;
+
+          const pointerTarget = event.target instanceof Element ? event.target : null;
+          const linkTarget = pointerTarget?.closest('a.node-link');
+
+          // A link can also be the drag handle for its node. Keep the event bubbling
+          // (in particular, do not call stopPropagation) while starting the drag here.
+          if (linkTarget && mode === 'select') {
+            const preserveMultiSelection = selectedIds.length > 1 && selectedIds.includes(n.id);
+            selectNode(n.id, preserveMultiSelection, false);
+            startNodeDrag(event, n.id);
+            return;
+          }
+
           if (mode === 'connect') {
-            event.preventDefault(); event.stopPropagation(); handleConnectClick(n.id); return;
+            // Prevent native text selection when starting a connection from a link-bearing node.
+            event.preventDefault();
+            if (linkTarget) {
+              linkTarget.style.setProperty('user-select', 'none');
+              linkTarget.style.setProperty('-webkit-user-select', 'none');
+            }
+            event.stopPropagation();
+            handleConnectClick(n.id);
+            return;
           }
           if (mode !== 'select') return;
           event.stopPropagation();
@@ -1177,6 +1249,9 @@
           if (event.target.closest('.node')) startNodeDrag(event, n.id);
         });
         el.addEventListener('dblclick', event => {
+          const target = event.target instanceof Element ? event.target : null;
+          // Double-clicking a URL must not enter node text-edit mode.
+          if (target?.closest('a.node-link')) return;
           if (event.button !== 0 || mode !== 'select') return;
           event.preventDefault(); event.stopPropagation();
           if (n.type !== 'image') startEditing(n.id);
@@ -1199,10 +1274,12 @@
       if (!el) return;
       if (n.type === 'image') {
         // Images use explicit model dimensions to preserve their aspect ratio.
+        el.classList.toggle('tiny-node', n.width <= 18 || n.height <= 18);
         return;
       }
-      n.width = Math.max(24, el.offsetWidth);
-      n.height = Math.max(22, el.offsetHeight);
+      n.width = Math.max(10, el.offsetWidth);
+      n.height = Math.max(10, el.offsetHeight);
+      el.classList.toggle('tiny-node', n.width <= 18 || n.height <= 18);
     });
 
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -1407,6 +1484,7 @@
           node.y = activeDrag.originY;
           node.width = activeDrag.originW;
           node.height = activeDrag.originH;
+          if (Number.isFinite(activeDrag.originFontSize)) node.fontSize = activeDrag.originFontSize;
           node.autoSize = activeDrag.originAutoSize;
         }
       } else if (activeDrag.type === 'pan') {
@@ -1416,6 +1494,7 @@
     }
 
     drag = null;
+    wasDragging = false;
     linkDraft = null;
     if (activeBox && activeBox.element.isConnected) activeBox.element.remove();
     boxSelect = null;
@@ -1430,12 +1509,16 @@
 
   function startNodeDrag(event, id) {
     if (event.button !== 0 || editingId || mode !== 'select' || drag || linkDraft || boxSelect) return;
+    // Each new pointer gesture begins with a clean drag flag. If this is a click,
+    // wasDragging will remain false and the link can open normally.
+    wasDragging = false;
     const n = nodeById(id); if (!n) return;
+    const startedOnLink = event.target instanceof Element && !!event.target.closest('a.node-link');
     if (selectedIds.length > 1 && selectedIds.includes(id)) {
       const origins = selectedIds.map(nodeId => nodeById(nodeId)).filter(Boolean).map(node => ({ id: node.id, x: node.x, y: node.y }));
-      drag = { type: 'moveSelection', ids: origins, startX: event.clientX, startY: event.clientY, startZoom: zoom, moved: false };
+      drag = { type: 'moveSelection', ids: origins, startX: event.clientX, startY: event.clientY, startZoom: zoom, moved: false, startedOnLink };
     } else {
-      drag = { type: 'move', id, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, moved: false };
+      drag = { type: 'move', id, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, moved: false, startedOnLink };
     }
     attachPointerGesture(onPointerMove, onPointerUp);
   }
@@ -1444,16 +1527,21 @@
     if (playback.active || linkDraft || drag || boxSelect) return;
     const n = nodeById(id); if (!n) return;
     selectedId = id; selectedIds.splice(0, selectedIds.length, id);
-    // Capture the complete pre-gesture state before switching to fixed-width mode.
+    // Text scales by font size and stays content-sized; images use explicit pixel dimensions.
     const originAutoSize = n.autoSize;
+    n.width = Math.max(10, Number(n.width) || 10);
+    n.height = Math.max(10, Number(n.height) || 10);
     const originW = n.width;
     const originH = n.height;
-    n.autoSize = false;
-    drag = { type: 'resize', id, handle, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, originW, originH, originAutoSize, moved: false };
+    const originFontSize = clamp(Number(n.fontSize) || 16, 8, 80);
+    n.autoSize = n.type === 'image' ? false : true;
+    drag = { type: 'resize', id, handle, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, originW, originH, originFontSize, originAutoSize, moved: false };
     attachPointerGesture(onPointerMove, onPointerUp);
   }
+
   function startPan(event) {
     if (event.button !== 0 || editingId || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
+    wasDragging = false;
     event.preventDefault();
     stage.style.cursor = 'grabbing';
     drag = { type: 'pan', startX: event.clientX, startY: event.clientY, startZoom: zoom, originScrollLeft: workspace.scrollLeft, originScrollTop: workspace.scrollTop, moved: false };
@@ -1478,8 +1566,8 @@
     // Growing (never shrinking) avoids scrollbar oscillation while dragging.
     const currentWidth = Number.parseFloat(stage.style.width) || 1200;
     const currentHeight = Number.parseFloat(stage.style.height) || 800;
-    const maxX = scene.nodes.reduce((max, node) => Math.max(max, node.x + Math.max(24, node.width || 24)), 0);
-    const maxY = scene.nodes.reduce((max, node) => Math.max(max, node.y + Math.max(22, node.height || 22)), 0);
+    const maxX = scene.nodes.reduce((max, node) => Math.max(max, node.x + Math.max(10, node.width || 10)), 0);
+    const maxY = scene.nodes.reduce((max, node) => Math.max(max, node.y + Math.max(10, node.height || 10)), 0);
     const nextWidth = Math.max(currentWidth, Math.ceil((workspace.clientWidth || 1000) / zoom), Math.ceil(maxX + 500));
     const nextHeight = Math.max(currentHeight, Math.ceil((workspace.clientHeight || 700) / zoom), Math.ceil(maxY + 400));
     if (nextWidth !== currentWidth || nextHeight !== currentHeight) {
@@ -1520,27 +1608,48 @@
       const node = renderedNodeModels.get(id) || nodeById(id);
       const el = renderedNodeElements.get(id);
       if (!node || !el) return;
-      if (drag.type === 'resize' && id === drag.id) {
-        el.style.width = `${node.width}px`;
-        el.style.maxWidth = 'none';
-        if (node.type === 'image') el.style.height = `${node.height}px`;
-      }
-      el.style.left = `${node.x}px`;
-      el.style.top = `${node.y}px`;
+
       if (drag.type === 'resize' && id === drag.id) {
         const west = drag.handle.includes('w');
         const north = drag.handle.includes('n');
-        if (node.type !== 'image') {
-          // Measure text wrapping so the model bounds remain aligned with the text.
-          node.width = Math.max(40, el.offsetWidth);
-          node.height = Math.max(22, el.offsetHeight);
-          node.x = west ? Math.max(0, drag.originX + drag.originW - node.width) : drag.originX;
-          node.y = north ? Math.max(0, drag.originY + drag.originH - node.height) : drag.originY;
+        el.style.maxWidth = 'none';
+        el.style.minWidth = '0';
+        el.style.minHeight = '0';
+
+        if (node.type === 'image') {
+          // Image dimensions are calculated from the same scale in onPointerMove.
+          el.style.width = `${Math.max(10, node.width)}px`;
+          el.style.height = `${Math.max(10, node.height)}px`;
+        } else {
+          // Scale the text itself. The node follows max-content dimensions so
+          // shrinking changes font size rather than wrapping letters vertically.
+          el.style.width = 'max-content';
+          el.style.height = 'auto';
+          el.style.overflowWrap = 'normal';
+          el.style.whiteSpace = 'pre';
+          el.style.fontSize = `${clamp(Number(node.fontSize) || 16, 8, 80)}px`;
+
+          // Measure only the currently resized node. Convert viewport dimensions
+          // back to graph coordinates to avoid rounding drift at non-100% zoom.
+          const rect = el.getBoundingClientRect();
+          node.width = Math.max(10, rect.width / (zoom || 1));
+          node.height = Math.max(10, rect.height / (zoom || 1));
         }
-        el.style.left = `${node.x}px`;
-        el.style.top = `${node.y}px`;
+
+        // Keep the opposite corner anchored as the node changes size.
+        node.x = west
+          ? Math.max(0, drag.originX + drag.originW - node.width)
+          : drag.originX;
+        node.y = north
+          ? Math.max(0, drag.originY + drag.originH - node.height)
+          : drag.originY;
+        el.classList.toggle('tiny-node', node.width <= 18 || node.height <= 18);
       }
+
+      el.style.left = `${node.x}px`;
+      el.style.top = `${node.y}px`;
     });
+
     ensureStageBoundsForDrag();
     updateRenderedEdgesForNodes(ids);
   }
@@ -1557,7 +1666,12 @@
     if (drag) {
       const dx = event.clientX - drag.startX, dy = event.clientY - drag.startY;
       if (Math.abs(dx) + Math.abs(dy) > 2) {
-        drag.moved = true;
+        // Mark only the first movement. This also covers pan because the state
+        // check happens before branching on drag.type.
+        if (!drag.moved) {
+          drag.moved = true;
+          wasDragging = true;
+        }
         if (event.cancelable) event.preventDefault();
       }
       if (drag.type === 'pan') {
@@ -1590,23 +1704,35 @@
         const verticalDelta = north ? -modelDy : modelDy;
         n.autoSize = false;
         if (n.type === 'image') {
-          const aspect = Math.max(0.01, Number(n.aspectRatio) || (drag.originW / Math.max(1, drag.originH)));
-          const widthFromHeight = verticalDelta * aspect;
-          const widthDelta = Math.abs(horizontalDelta) >= Math.abs(widthFromHeight)
-            ? horizontalDelta : widthFromHeight;
-          n.width = clamp(Math.round((drag.originW + widthDelta) * 10) / 10, 40, 2000);
-          n.height = Math.max(24, Math.round((n.width / aspect) * 10) / 10);
+          // Resize the image uniformly. Clamp the shared scale so both dimensions
+          // stay within 10–2000px without distorting the stored aspect ratio.
+          const originW = Math.max(10, drag.originW);
+          const aspect = Math.max(0.01, Number(n.aspectRatio) || (originW / Math.max(1, drag.originH)));
+          const originH = originW / aspect;
+          const targetW = Math.max(10, drag.originW + horizontalDelta);
+          const targetH = Math.max(10, drag.originH + verticalDelta);
+          const originDiagonal = Math.max(1, Math.hypot(originW, originH));
+          const proposedScale = Math.hypot(targetW, targetH) / originDiagonal;
+          const minScale = Math.max(10 / originW, 10 / originH);
+          const maxScale = Math.min(2000 / originW, 2000 / originH);
+          const imageScale = clamp(proposedScale, minScale, maxScale);
+          n.width = Math.round(originW * imageScale * 10) / 10;
+          n.height = Math.round((n.width / aspect) * 10) / 10;
           n.x = west ? Math.max(0, drag.originX + drag.originW - n.width) : drag.originX;
           n.y = north ? Math.max(0, drag.originY + drag.originH - n.height) : drag.originY;
         } else {
-          // Corner dragging adjusts the text box width; font size remains unchanged.
-          let widthDelta;
-          if (Math.abs(modelDx) > Math.abs(modelDy) * 2) widthDelta = horizontalDelta;
-          else if (Math.abs(modelDy) > Math.abs(modelDx) * 2) widthDelta = verticalDelta;
-          else widthDelta = (horizontalDelta + verticalDelta) / 2;
-          n.width = clamp(Math.round((drag.originW + widthDelta) * 10) / 10, 40, 1200);
-          n.x = west ? Math.max(0, drag.originX + drag.originW - n.width) : drag.originX;
-          n.y = north ? Math.max(0, drag.originY + drag.originH - n.height) : drag.originY;
+          // Scale the complete text node from the dragged corner instead of
+          // constraining width. Content dimensions are measured in paintDragGeometry.
+          const originW = Math.max(10, drag.originW);
+          const originH = Math.max(10, drag.originH);
+          const targetW = Math.max(10, originW + horizontalDelta);
+          const targetH = Math.max(10, originH + verticalDelta);
+          const originDiagonal = Math.max(1, Math.hypot(originW, originH));
+          const scaleFactor = Math.hypot(targetW, targetH) / originDiagonal;
+          const originFontSize = clamp(Number(drag.originFontSize) || Number(n.fontSize) || 16, 8, 80);
+          n.fontSize = Math.round(clamp(originFontSize * scaleFactor, 8, 80) * 10) / 10;
+          // Text keeps natural content width; font size is its scaling source.
+          n.autoSize = true;
         }
       }
       scheduleDragGeometryPaint();
@@ -1622,11 +1748,15 @@
     }
   }
   function onPointerUp(event) {
+    // Snapshot the active gesture's movement before clearing its global state.
+    const movementWasTracked = wasDragging;
+    wasDragging = false;
     detachPointerGestureListeners();
     if (dragPaintRaf) { cancelAnimationFrame(dragPaintRaf); dragPaintRaf = 0; }
     if (drag) {
       const finished = drag;
       const changed = finished.moved;
+      const suppressPostDragLinkClick = movementWasTracked && !!finished.startedOnLink;
       drag = null;
       workspace.classList.remove('panning');
       stage.style.cursor = mode === 'select' ? 'grab' : (mode === 'text' || mode === 'connect' ? 'crosshair' : 'default');
@@ -1635,6 +1765,7 @@
         return;
       }
       if (changed) {
+        if (suppressPostDragLinkClick) suppressImmediateDraggedLinkClick();
         commitScene();
       } else if (finished.type === 'resize') {
         const node = nodeById(finished.id);
@@ -1692,8 +1823,8 @@
     const horizontalGap = 56;
     const verticalGap = 13.5;
     const before = new Map(targets.map(node => [node.id, { x: node.x, y: node.y }]));
-    const widthOf = node => Math.max(24, Number(node.width) || 24);
-    const heightOf = node => Math.max(22, Number(node.height) || 22);
+    const widthOf = node => Math.max(10, Number(node.width) || 10);
+    const heightOf = node => Math.max(10, Number(node.height) || 10);
     let ordered;
 
     if (side === 'right' || side === 'left') {
@@ -1979,11 +2110,11 @@
           pixelHeight = targetHeight;
         }
 
+        // Fit image proportionally into the 360x600 display box without upscaling.
         const aspectRatio = pixelWidth / pixelHeight;
-        // New image nodes start compact; corner resizing can enlarge them later.
-        const displayScale = Math.min(1, 360 / pixelWidth, 600 / pixelHeight);
-        const displayWidth = Math.max(40, Math.round(pixelWidth * displayScale));
-        const displayHeight = Math.max(24, Math.round(displayWidth / Math.max(0.01, aspectRatio)));
+        const scale = Math.min(360 / pixelWidth, 600 / pixelHeight, 1);
+        const displayWidth = Math.max(10, Math.round(pixelWidth * scale));
+        const displayHeight = Math.max(10, Math.round(pixelHeight * scale));
         if (playback.active) exitPlayback();
         if (editingId) finishEditing(editingId, true);
 
@@ -2256,8 +2387,8 @@
       function nodePoint(node, side) {
         const x = Number(node.x) || 0;
         const y = Number(node.y) || 0;
-        const w = Math.max(24, Number(node.width) || 24);
-        const h = Math.max(22, Number(node.height) || 22);
+        const w = Math.max(10, Number(node.width) || 10);
+        const h = Math.max(10, Number(node.height) || 10);
         if (side === 'top') return { x: x + w / 2, y };
         if (side === 'right') return { x: x + w, y: y + h / 2 };
         if (side === 'bottom') return { x: x + w / 2, y: y + h };
@@ -2287,8 +2418,8 @@
         const x = Number(node.x) || 0;
         const y = Number(node.y) || 0;
         includePoint(x, y);
-        includePoint(x + Math.max(24, Number(node.width) || 24),
-                     y + Math.max(22, Number(node.height) || 22));
+        includePoint(x + Math.max(10, Number(node.width) || 10),
+                     y + Math.max(10, Number(node.height) || 10));
       });
 
       const edgeGeometry = [];
@@ -2362,9 +2493,11 @@
         const angles = { left: 0, right: Math.PI, top: Math.PI / 2, bottom: -Math.PI / 2 };
         const angle = angles[edge.toSide] ?? 0;
         const tipX = tx + bp.x * scale, tipY = ty + bp.y * scale;
-        const size = 7 * scale, wing = 4.2 * scale;
-        const baseX = tipX - Math.cos(angle) * size;
-        const baseY = tipY - Math.sin(angle) * size;
+        // Keep arrowheads proportional to export scale while limiting extremes.
+        const arrowSize = Math.max(4, Math.min(14, 7 * scale));
+        const wing = arrowSize * 0.6;
+        const baseX = tipX - Math.cos(angle) * arrowSize;
+        const baseY = tipY - Math.sin(angle) * arrowSize;
         ctx.beginPath();
         ctx.moveTo(tipX, tipY);
         ctx.lineTo(baseX - Math.sin(angle) * wing, baseY + Math.cos(angle) * wing);
@@ -2401,7 +2534,7 @@
         ctx.textBaseline = 'alphabetic';
         const px = tx + (Number(node.x) || 0) * scale + 4 * scale;
         const py = ty + (Number(node.y) || 0) * scale + 2 * scale;
-        const nodeWidth = Math.max(24, Number(node.width) || 24);
+        const nodeWidth = Math.max(10, Number(node.width) || 10);
         const maxTextW = Math.max(fontSize * 2, (nodeWidth - 8) * scale);
         const lines = wrapCanvasText(ctx, node.text, maxTextW);
         const lineHeight = fontSize * 1.28;
@@ -2750,8 +2883,8 @@
     const selected = scene.nodes.filter(node => {
       const nx1 = node.x;
       const ny1 = node.y;
-      const nx2 = node.x + Math.max(24, node.width || 24);
-      const ny2 = node.y + Math.max(22, node.height || 22);
+      const nx2 = node.x + Math.max(10, node.width || 10);
+      const ny2 = node.y + Math.max(10, node.height || 10);
       return nx2 >= left && nx1 <= right && ny2 >= top && ny1 <= bottom;
     }).map(node => node.id);
 
@@ -2992,10 +3125,23 @@
   window.addEventListener('resize', closeProjectActionsMenu);
   document.getElementById('savedProjectList').addEventListener('scroll', closeProjectActionsMenu, { passive: true });
 
+  // Handle validation in JavaScript so an empty title reaches our toast instead
+  // of being blocked by the browser's native `required` validation.
+  projectRenameForm.noValidate = true;
   projectRenameForm.addEventListener('submit', event => {
     event.preventDefault();
-    if (renameProject(renameTargetProjectId, projectRenameInput.value)) {
+    const submittedTitle = projectRenameInput.value;
+    const renamed = renameProject(renameTargetProjectId, submittedTitle);
+
+    if (renamed) {
       projectRenameInput.blur();
+      return;
+    }
+
+    // Submission does not depend on input focus. When it fails, force focus
+    // back to the field, whether Save was clicked or Enter was pressed.
+    if (projectRenameBackdrop.classList.contains('visible')) {
+      projectRenameInput.focus({ preventScroll: true });
     }
   });
   projectRenameCancelBtn.addEventListener('click', closeRenameProjectModal);
