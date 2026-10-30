@@ -50,6 +50,9 @@
   const projectDeleteCancelBtn = document.getElementById('projectDeleteCancelBtn');
   const projectDeleteConfirmBtn = document.getElementById('projectDeleteConfirmBtn');
   const exportScreen = document.getElementById('exportScreen');
+  const mobileMenuToggle = document.getElementById('mobileMenuToggle');
+  const sidebarBackdrop = document.getElementById('sidebarBackdrop');
+  const sidebar = document.querySelector('.sidebar');
   const selectedIds = [];
   const selectedEdgeIds = [];
   let currentProjectId = null;
@@ -75,6 +78,12 @@
   // a one-shot capture listener separately blocks the synthetic click after dragging a link.
   let wasDragging = false;
   let linkDraft = null;
+  // Touch pointers are tracked separately from the existing mouse/pen drag state.
+  // A second finger cancels a one-finger gesture and takes exclusive ownership for pinch zoom.
+  const activeTouchPointers = new Map();
+  let pinchState = null;
+  let longPressTimer = 0;
+  let longPressCandidate = null;
   let currentRenderScene = null;
   // Cached DOM/model indexes let drag operations update only affected nodes and edges.
   // This avoids rebuilding the whole DOM/SVG on every pointermove for large graphs.
@@ -892,6 +901,20 @@
     });
   }
 
+  function setMobileSidebarOpen(open) {
+    const shouldOpen = !!open;
+    document.body.classList.toggle('sidebar-open', shouldOpen);
+    if (mobileMenuToggle) {
+      mobileMenuToggle.setAttribute('aria-expanded', String(shouldOpen));
+      mobileMenuToggle.setAttribute('aria-label', shouldOpen ? 'Закрыть меню инструментов' : 'Открыть меню инструментов');
+    }
+    if (sidebarBackdrop) sidebarBackdrop.setAttribute('aria-hidden', String(!shouldOpen));
+  }
+
+  function closeMobileSidebar() {
+    setMobileSidebarOpen(false);
+  }
+
   function setMode(next) {
     if (playback.active) exitPlayback();
     closeNodeContextMenu();
@@ -927,14 +950,14 @@
     world.style.height = `${(baseHeight + CANVAS_PAD * 2) * zoom}px`;
     zoomIndicator.textContent = `${Math.round(zoom * 100)}%`;
   }
-  function setZoom(nextZoom, clientX, clientY) {
+  function setZoom(nextZoom, clientX, clientY, anchorWorldPoint = null) {
     const next = clamp(nextZoom, .25, 2.5);
     if (Math.abs(next - zoom) < .001) return;
     const rect = workspace.getBoundingClientRect();
     const offsetX = (clientX ?? (rect.left + rect.width / 2)) - rect.left;
     const offsetY = (clientY ?? (rect.top + rect.height / 2)) - rect.top;
-    const worldX = (workspace.scrollLeft + offsetX) / zoom;
-    const worldY = (workspace.scrollTop + offsetY) / zoom;
+    const worldX = anchorWorldPoint ? anchorWorldPoint.x : (workspace.scrollLeft + offsetX) / zoom;
+    const worldY = anchorWorldPoint ? anchorWorldPoint.y : (workspace.scrollTop + offsetY) / zoom;
     zoom = next;
     // Zooming only transforms the existing stage. Rebuilding every node and SVG path
     // on each wheel tick made large graphs unnecessarily expensive.
@@ -1018,9 +1041,15 @@
       element.classList.toggle('link-target', !isPlayback && !!linkDraft && id !== linkDraft.fromId && id !== editingId);
       element.querySelectorAll('.resize-handle, .anchor').forEach(control => control.remove());
 
-      if (!isPlayback && id === selectedId && id !== editingId) addResizeHandles(element, id);
+      const mobileTouchLayout = window.matchMedia('(max-width: 767px)').matches;
+      // On touch screens show one set of large hit targets at a time so 44px
+      // resize handles do not overlap the 44px connection anchors on short nodes.
+      const showResizeHandles = !isPlayback && id === selectedId && id !== editingId &&
+        (!mobileTouchLayout || (mode === 'select' && !linkDraft));
+      if (showResizeHandles) addResizeHandles(element, id);
       const canShowAnchors = !isPlayback && id !== editingId &&
-        (id === selectedId || (!!linkDraft && id !== linkDraft.fromId));
+        (id === selectedId || (!!linkDraft && id !== linkDraft.fromId)) &&
+        (!mobileTouchLayout || mode === 'connect' || !!linkDraft);
       if (canShowAnchors) addNodeAnchors(element, id);
     });
   }
@@ -1032,7 +1061,7 @@
     });
   }
 
-  function suppressImmediateDraggedLinkClick() {
+  function suppressImmediateDraggedLinkClick(timeout = 0) {
     // A browser may emit click after pointerup even though the user dragged the node.
     // Catch only that immediate click in capture phase; auto-remove the guard if no click follows.
     const suppressClick = event => {
@@ -1046,7 +1075,7 @@
     document.addEventListener('click', suppressClick, true);
     window.setTimeout(() => {
       document.removeEventListener('click', suppressClick, true);
-    }, 0);
+    }, Math.max(0, timeout));
   }
 
   function appendTextWithLinks(container, value) {
@@ -1216,10 +1245,20 @@
       }
       if (!isPlayback && n.id !== editingId) {
         el.addEventListener('pointerdown', event => {
-          if (event.button !== 0) return;
-
           const pointerTarget = event.target instanceof Element ? event.target : null;
           const linkTarget = pointerTarget?.closest('a.node-link');
+
+          // ПКМ по уже выделенному узлу начинает перемещение всей выделенной группы.
+          // ПКМ по невыделенному узлу остаётся обычным вызовом контекстного меню.
+          if (event.button === 2) {
+            if (mode === 'select' && selectedIds.includes(n.id)) {
+              event.preventDefault();
+              event.stopPropagation();
+              startNodeDrag(event, n.id);
+            }
+            return;
+          }
+          if (event.button !== 0) return;
 
           // A link can also be the drag handle for its node. Keep the event bubbling
           // (in particular, do not call stopPropagation) while starting the drag here.
@@ -1455,11 +1494,13 @@
   function attachPointerGesture(moveHandler, upHandler) {
     detachPointerGestureListeners();
     window.addEventListener('pointermove', moveHandler);
-    window.addEventListener('pointerup', upHandler, { once: true });
-    window.addEventListener('pointercancel', cancelPointerGesture, { once: true });
+    window.addEventListener('pointerup', upHandler);
+    window.addEventListener('pointercancel', cancelPointerGesture);
   }
 
-  function cancelPointerGesture() {
+  function cancelPointerGesture(event) {
+    if (event && drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
+    if (event && linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
     const activeDrag = drag;
     const activeBox = boxSelect;
     detachPointerGestureListeners();
@@ -1505,20 +1546,34 @@
 
   window.addEventListener('blur', () => {
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
+    clearLongPress();
+    activeTouchPointers.clear();
+    pinchState = null;
   });
 
   function startNodeDrag(event, id) {
-    if (event.button !== 0 || editingId || mode !== 'select' || drag || linkDraft || boxSelect) return;
+    const isRightButton = event.button === 2;
+    const isLeftButton = event.button === 0;
+    if (event.pointerType === 'touch') return;
+    const rightButtonOnSelection = isRightButton && selectedIds.includes(id);
+    if ((!isLeftButton && !rightButtonOnSelection) || editingId || mode !== 'select' || drag || linkDraft || boxSelect) return;
+
     // Each new pointer gesture begins with a clean drag flag. If this is a click,
     // wasDragging will remain false and the link can open normally.
     wasDragging = false;
+    if (isRightButton) event.preventDefault();
+
     const n = nodeById(id); if (!n) return;
     const startedOnLink = event.target instanceof Element && !!event.target.closest('a.node-link');
-    if (selectedIds.length > 1 && selectedIds.includes(id)) {
+
+    // Right-drag on any selected node always moves the complete selection.
+    // The same moveSelection path is used for left-dragging a multi-selection.
+    if (rightButtonOnSelection || (selectedIds.length > 1 && selectedIds.includes(id))) {
       const origins = selectedIds.map(nodeId => nodeById(nodeId)).filter(Boolean).map(node => ({ id: node.id, x: node.x, y: node.y }));
-      drag = { type: 'moveSelection', ids: origins, startX: event.clientX, startY: event.clientY, startZoom: zoom, moved: false, startedOnLink };
+      if (!origins.length) return;
+      drag = { type: 'moveSelection', ids: origins, startX: event.clientX, startY: event.clientY, startZoom: zoom, moved: false, startedOnLink, pointerId: event.pointerId, button: event.button };
     } else {
-      drag = { type: 'move', id, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, moved: false, startedOnLink };
+      drag = { type: 'move', id, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, moved: false, startedOnLink, pointerId: event.pointerId, button: event.button };
     }
     attachPointerGesture(onPointerMove, onPointerUp);
   }
@@ -1535,16 +1590,28 @@
     const originH = n.height;
     const originFontSize = clamp(Number(n.fontSize) || 16, 8, 80);
     n.autoSize = n.type === 'image' ? false : true;
-    drag = { type: 'resize', id, handle, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, originW, originH, originFontSize, originAutoSize, moved: false };
+    drag = { type: 'resize', id, handle, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, originW, originH, originFontSize, originAutoSize, moved: false, pointerId: event.pointerId };
     attachPointerGesture(onPointerMove, onPointerUp);
   }
 
   function startPan(event) {
     if (event.button !== 0 || editingId || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
     wasDragging = false;
+
+    // On desktop, a left-click on empty canvas clears node and edge selections.
+    // Keep the existing touch gesture path unchanged.
+    if (event.pointerType !== 'touch' && (selectedId !== null || selectedIds.length || selectedEdgeIds.length)) {
+      selectedId = null;
+      selectedIds.splice(0);
+      selectedEdgeIds.splice(0);
+      refreshNodeSelectionDecorations(scene, false);
+      refreshEdgeSelectionDecorations(scene, false);
+      updateActionButtons();
+    }
+
     event.preventDefault();
     stage.style.cursor = 'grabbing';
-    drag = { type: 'pan', startX: event.clientX, startY: event.clientY, startZoom: zoom, originScrollLeft: workspace.scrollLeft, originScrollTop: workspace.scrollTop, moved: false };
+    drag = { type: 'pan', startX: event.clientX, startY: event.clientY, startZoom: zoom, originScrollLeft: workspace.scrollLeft, originScrollTop: workspace.scrollTop, moved: false, pointerId: event.pointerId, button: event.button };
     workspace.classList.add('panning');
     attachPointerGesture(onPointerMove, onPointerUp);
   }
@@ -1555,7 +1622,7 @@
     selectedEdgeIds.splice(0);
     selectedId = id; selectedIds.splice(0, selectedIds.length, id);
     const p = getStagePoint(event);
-    linkDraft = { fromId: id, fromSide: side, x: p.x, y: p.y };
+    linkDraft = { fromId: id, fromSide: side, x: p.x, y: p.y, pointerId: event.pointerId };
     // Один рендер для создания пунктирной линии; во время перетаскивания узлы не пересоздаются.
     renderScene();
     attachPointerGesture(onPointerMove, onPointerUp);
@@ -1663,6 +1730,9 @@
   }
 
   function onPointerMove(event) {
+    if (pinchState) return;
+    if (drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
+    if (linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
     if (drag) {
       const dx = event.clientX - drag.startX, dy = event.clientY - drag.startY;
       if (Math.abs(dx) + Math.abs(dy) > 2) {
@@ -1748,6 +1818,9 @@
     }
   }
   function onPointerUp(event) {
+    if (pinchState) return;
+    if (drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
+    if (linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
     // Snapshot the active gesture's movement before clearing its global state.
     const movementWasTracked = wasDragging;
     wasDragging = false;
@@ -1757,6 +1830,11 @@
       const finished = drag;
       const changed = finished.moved;
       const suppressPostDragLinkClick = movementWasTracked && !!finished.startedOnLink;
+      // Browsers may dispatch contextmenu after releasing ПКМ. Suppress it only
+      // after an actual right-button drag so the group does not open a menu on drop.
+      if (changed && finished.button === 2) {
+        suppressContextMenuUntil = Date.now() + 1200;
+      }
       drag = null;
       workspace.classList.remove('panning');
       stage.style.cursor = mode === 'select' ? 'grab' : (mode === 'text' || mode === 'connect' ? 'crosshair' : 'default');
@@ -1976,43 +2054,80 @@
 
   function deleteSelected() {
     if (playback.active) return;
-    const nodeIds = [...new Set(selectedIds.length ? selectedIds : (selectedId ? [selectedId] : []))];
-    const edgeIds = [...new Set(selectedEdgeIds)];
-    if (!nodeIds.length && !edgeIds.length) return;
 
-    closeNodeContextMenu();
-    if (editingId) finishEditing(editingId, true);
+    // Build the selection from both selection representations. selectedId is
+    // the primary/fallback id, while selectedIds holds the full marquee group.
+    const selectedNodeIdSet = new Set(selectedIds);
+    if (selectedId !== null && selectedId !== undefined) {
+      selectedNodeIdSet.add(selectedId);
+    }
 
-    if (nodeIds.length && edgeIds.length) {
-      if (drag || linkDraft || boxSelect) cancelPointerGesture();
-      const removedNodes = new Set(nodeIds);
-      const removedEdges = new Set(edgeIds);
-      const beforeEdgeCount = scene.edges.length;
-      scene.nodes = scene.nodes.filter(node => !removedNodes.has(node.id));
-      scene.edges = scene.edges.filter(edge =>
-        !removedEdges.has(edge.id) &&
-        !removedNodes.has(edge.from) &&
-        !removedNodes.has(edge.to)
-      );
-      const deletedEdges = beforeEdgeCount - scene.edges.length;
+    // Keep only IDs that still exist in the current scene.
+    const nodeIds = scene.nodes
+      .filter(node => selectedNodeIdSet.has(node.id))
+      .map(node => node.id);
+    const selectedEdgeIdSet = new Set(selectedEdgeIds);
+    const edgeIds = scene.edges
+      .filter(edge => selectedEdgeIdSet.has(edge.id))
+      .map(edge => edge.id);
+
+    if (!nodeIds.length && !edgeIds.length) {
       selectedId = null;
       selectedIds.splice(0);
       selectedEdgeIds.splice(0);
-      if (editingId && removedNodes.has(editingId)) {
-        editingId = null;
-        editingOriginalText = null;
-      }
-      // Удаление смешанного выделения тоже закрывает открытое подтверждение.
-      closeConfirm();
-      commitScene(`Удалено узлов: ${nodeIds.length}, связей: ${deletedEdges}`);
+      updateActionButtons();
       return;
     }
 
-    if (nodeIds.length) {
-      removeNodesById(nodeIds, nodeIds.length > 1 ? 'Узлы удалены' : 'Узел удалён');
-    } else {
-      removeEdgesById(edgeIds, edgeIds.length > 1 ? 'Связи удалены' : 'Связь удалена');
+    const removedNodes = new Set(nodeIds);
+    const explicitlyRemovedEdges = new Set(edgeIds);
+
+    // Determine all edges to remove before finishing an active text edit,
+    // because finishing an empty edit can itself remove its node and edges.
+    const removedEdges = new Set(
+      scene.edges
+        .filter(edge =>
+          explicitlyRemovedEdges.has(edge.id) ||
+          removedNodes.has(edge.from) ||
+          removedNodes.has(edge.to)
+        )
+        .map(edge => edge.id)
+    );
+    const deletedNodeCount = scene.nodes.filter(node => removedNodes.has(node.id)).length;
+    const deletedEdgeCount = scene.edges.filter(edge => removedEdges.has(edge.id)).length;
+
+    closeNodeContextMenu();
+    if (drag || linkDraft || boxSelect) cancelPointerGesture();
+    if (editingId) finishEditing(editingId, true);
+
+    // Apply both filters unconditionally so combined node/edge deletion
+    // cannot fall through to an edge-only path.
+    scene.nodes = scene.nodes.filter(node => !removedNodes.has(node.id));
+    scene.edges = scene.edges.filter(edge => !removedEdges.has(edge.id));
+
+    if (connectionSourceId && removedNodes.has(connectionSourceId)) {
+      connectionSourceId = null;
     }
+    if (contextNodeId && removedNodes.has(contextNodeId)) {
+      closeNodeContextMenu();
+    }
+    if (editingId && removedNodes.has(editingId)) {
+      editingId = null;
+      editingOriginalText = null;
+      shouldFocusNewNode = false;
+    }
+    if (linkDraft && removedNodes.has(linkDraft.fromId)) {
+      linkDraft = null;
+    }
+
+    // Clear every selection source, including the single-node fallback.
+    selectedId = null;
+    selectedIds.splice(0);
+    selectedEdgeIds.splice(0);
+
+    closeNodeContextMenu();
+    closeConfirm();
+    commitScene(`Удалено узлов: ${deletedNodeCount}, связей: ${deletedEdgeCount}`);
   }
   function undo() {
     if (undoIndex <= 0 || playback.active) return;
@@ -2158,8 +2273,17 @@
   }
 
   function positionContextMenu(x, y) {
+    if (window.innerWidth < 768) {
+      nodeContextMenu.style.left = '0px';
+      nodeContextMenu.style.right = '0px';
+      nodeContextMenu.style.top = 'auto';
+      nodeContextMenu.style.bottom = '0px';
+      return;
+    }
     const menuWidth = nodeContextMenu.offsetWidth || 216;
     const menuHeight = nodeContextMenu.offsetHeight || 210;
+    nodeContextMenu.style.right = 'auto';
+    nodeContextMenu.style.bottom = 'auto';
     nodeContextMenu.style.left = `${Math.min(x, window.innerWidth - menuWidth - 8)}px`;
     nodeContextMenu.style.top = `${Math.min(y, window.innerHeight - menuHeight - 8)}px`;
   }
@@ -2837,12 +2961,12 @@
     const rect = document.createElement('div'); rect.className = 'selection-rect';
     rect.style.left = `${point.x}px`; rect.style.top = `${point.y}px`; rect.style.width = '0'; rect.style.height = '0';
     stage.appendChild(rect);
-    boxSelect = { startX: point.x, startY: point.y, x: point.x, y: point.y, moved: false, element: rect };
+    boxSelect = { startX: point.x, startY: point.y, x: point.x, y: point.y, moved: false, element: rect, pointerId: event.pointerId };
     attachPointerGesture(onBoxSelectionMove, onBoxSelectionUp);
   }
 
   function onBoxSelectionMove(event) {
-    if (!boxSelect) return;
+    if (!boxSelect || (boxSelect.pointerId != null && event.pointerId !== boxSelect.pointerId)) return;
     const p = getStagePoint(event);
     boxSelect.x = p.x; boxSelect.y = p.y;
     boxSelect.moved = boxSelect.moved || Math.abs(p.x-boxSelect.startX) + Math.abs(p.y-boxSelect.startY) > 4;
@@ -2853,6 +2977,7 @@
   }
 
   function onBoxSelectionUp(event) {
+    if (!boxSelect || (boxSelect.pointerId != null && event.pointerId !== boxSelect.pointerId)) return;
     // Prevent native context-menu behavior immediately, before any DOM updates.
     if (event && event.cancelable) event.preventDefault();
     if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
@@ -2866,12 +2991,10 @@
     if (box.element.isConnected) box.element.remove();
 
     if (!box.moved) {
+      // A right-click on empty canvas is a canvas action, not a command to delete
+      // previously selected edges. Edge actions are opened only from an edge hit.
       contextCanvasPoint = { x: box.startX, y: box.startY };
-      if (selectedEdgeIds.length) {
-        openSelectedEdgesActions(null, event);
-      } else {
-        showCanvasContextMenu(event && event.clientX || 0, event && event.clientY || 0);
-      }
+      showCanvasContextMenu(event && event.clientX || 0, event && event.clientY || 0);
       return;
     }
 
@@ -2901,9 +3024,171 @@
     if (selected.length || selectedEdges.length) {
       showToast(`Выбрано узлов: ${selected.length}, связей: ${selectedEdges.length}`);
     }
-    // Right-button marquee selection of lines opens the actions modal immediately.
-    if (selectedEdges.length) openSelectedEdgesActions(null, event);
+    // Releasing the marquee only commits the selection. Context actions are
+    // opened later by an explicit right-click on a node or edge.
   }
+
+  function clearLongPress() {
+    if (longPressTimer) window.clearTimeout(longPressTimer);
+    longPressTimer = 0;
+    longPressCandidate = null;
+  }
+
+  function midpoint(a, b) {
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+
+  function distanceBetween(a, b) {
+    return Math.max(1, Math.hypot(b.x - a.x, b.y - a.y));
+  }
+
+  function rebasePinchFromActivePointers() {
+    const pointers = [...activeTouchPointers.entries()].slice(0, 2);
+    if (pointers.length < 2) return null;
+    const [firstEntry, secondEntry] = pointers;
+    const center = midpoint(firstEntry[1], secondEntry[1]);
+    const rect = workspace.getBoundingClientRect();
+    const offsetX = center.x - rect.left;
+    const offsetY = center.y - rect.top;
+    return {
+      pointerIds: [firstEntry[0], secondEntry[0]],
+      startDistance: distanceBetween(firstEntry[1], secondEntry[1]),
+      startZoom: zoom,
+      anchorWorld: {
+        x: (workspace.scrollLeft + offsetX) / zoom,
+        y: (workspace.scrollTop + offsetY) / zoom
+      }
+    };
+  }
+
+  function cancelGestureForPinch() {
+    // Revert an in-progress one-finger drag/pan/link before the pinch takes over.
+    // This makes the two-pointer gesture exclusive and prevents accidental node moves.
+    if (drag && drag.startedOnLink) suppressImmediateDraggedLinkClick(1200);
+    if (drag || linkDraft || boxSelect) cancelPointerGesture();
+    clearLongPress();
+  }
+
+  function triggerLongPress(candidate) {
+    if (!candidate || pinchState || activeTouchPointers.size !== 1) return;
+    candidate.triggered = true;
+    suppressContextMenuUntil = Date.now() + 1300;
+
+    if (candidate.startedOnLink) suppressImmediateDraggedLinkClick(1200);
+
+    if (drag && drag.pointerId === candidate.pointerId) {
+      cancelPointerGesture();
+    } else if (linkDraft && linkDraft.pointerId === candidate.pointerId) {
+      cancelPointerGesture();
+    }
+
+    const pointEvent = { clientX: candidate.x, clientY: candidate.y };
+    if (candidate.edgeId) {
+      openSelectedEdgesActions(candidate.edgeId);
+      return;
+    }
+    if (candidate.nodeId) {
+      showNodeContextMenu(candidate.nodeId, candidate.x, candidate.y);
+      return;
+    }
+    contextCanvasPoint = getStagePoint(pointEvent);
+    showCanvasContextMenu(candidate.x, candidate.y);
+  }
+
+  function handleWorkspaceTouchDown(event) {
+    if (event.pointerType !== 'touch' || playback.active) return;
+    const tappedInsideNodeContextMenu =
+      event.target instanceof Element &&
+      event.target.closest('#nodeContextMenu');
+
+    if (
+      nodeContextMenu.classList.contains('visible') &&
+      !tappedInsideNodeContextMenu
+    ) {
+      closeNodeContextMenu();
+    }
+
+    const target = event.target instanceof Element ? event.target : null;
+    activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    if (pinchState) {
+      // Keep the remaining finger from reverting into a pan/drag after a pinch ends.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+
+    if (activeTouchPointers.size >= 2) {
+      cancelGestureForPinch();
+      pinchState = rebasePinchFromActivePointers();
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+
+    if (activeTouchPointers.size !== 1) return;
+
+    const nodeElement = target && target.closest('.node[data-node-id]');
+    const edgeElement = target && target.closest('.edge-hit');
+    longPressCandidate = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      nodeId: nodeElement ? nodeElement.dataset.nodeId : null,
+      edgeId: edgeElement ? edgeElement.dataset.edgeId : null,
+      startedOnLink: !!(target && target.closest('a.node-link')),
+      triggered: false
+    };
+    longPressTimer = window.setTimeout(() => {
+      const candidate = longPressCandidate;
+      if (!candidate || candidate.pointerId !== event.pointerId) return;
+      triggerLongPress(candidate);
+    }, 500);
+  }
+
+  function handleWorkspaceTouchMove(event) {
+    if (event.pointerType !== 'touch' || !activeTouchPointers.has(event.pointerId)) return;
+    activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    if (pinchState) {
+      if (event.cancelable) event.preventDefault();
+      const [firstId, secondId] = pinchState.pointerIds;
+      const first = activeTouchPointers.get(firstId);
+      const second = activeTouchPointers.get(secondId);
+      if (!first || !second) return;
+      const center = midpoint(first, second);
+      const nextZoom = pinchState.startZoom * (distanceBetween(first, second) / pinchState.startDistance);
+      setZoom(nextZoom, center.x, center.y, pinchState.anchorWorld);
+      return;
+    }
+
+    if (longPressCandidate && longPressCandidate.pointerId === event.pointerId) {
+      const movement = Math.hypot(event.clientX - longPressCandidate.x, event.clientY - longPressCandidate.y);
+      if (movement > 10) clearLongPress();
+    }
+  }
+
+  function handleWorkspaceTouchEnd(event) {
+    if (event.pointerType !== 'touch') return;
+    activeTouchPointers.delete(event.pointerId);
+    if (longPressCandidate && longPressCandidate.pointerId === event.pointerId) clearLongPress();
+
+    if (pinchState) {
+      if (activeTouchPointers.size >= 2) {
+        pinchState = rebasePinchFromActivePointers();
+      } else if (activeTouchPointers.size === 0) {
+        pinchState = null;
+      }
+      // When one finger remains, pinchState intentionally stays active until it is lifted.
+      if (event.cancelable) event.preventDefault();
+    }
+  }
+
+  workspace.addEventListener('pointerdown', handleWorkspaceTouchDown, { passive: false });
+  // Track move/up on window as well: a finger may leave the workspace before release.
+  window.addEventListener('pointermove', handleWorkspaceTouchMove, { passive: false });
+  window.addEventListener('pointerup', handleWorkspaceTouchEnd, { passive: false });
+  window.addEventListener('pointercancel', handleWorkspaceTouchEnd, { passive: false });
 
   stage.addEventListener('pointerdown', startBoxSelection);
 
@@ -2923,6 +3208,12 @@
     // Some browsers retarget contextmenu during a right-drag to document/body.
     // While marquee selection is active, block it regardless of event.target.
     if (!canvasTarget && !marqueeSuppressionActive && !marqueeActive) return;
+    if (Date.now() < suppressContextMenuUntil) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      return;
+    }
 
     event.preventDefault();
     event.stopPropagation();
@@ -2952,11 +3243,8 @@
       return;
     }
 
-    if (selectedEdgeIds.length) {
-      openSelectedEdgesActions(null, event);
-      return;
-    }
-
+    // Do not open edge-delete actions merely because some edges are selected.
+    // The modal is invoked above only when the pointer is actually over an edge.
     contextCanvasPoint = getStagePoint(event);
     showCanvasContextMenu(event.clientX, event.clientY);
   }, { capture: true });
@@ -2992,7 +3280,17 @@
     if (editingId) finishEditing(editingId, true);
     startPan(event);
   });
-  document.querySelectorAll('[data-mode]').forEach(btn => btn.addEventListener('click', () => setMode(btn.dataset.mode)));
+  mobileMenuToggle.addEventListener('click', () => {
+    setMobileSidebarOpen(!document.body.classList.contains('sidebar-open'));
+  });
+  sidebarBackdrop.addEventListener('click', closeMobileSidebar);
+  sidebar.addEventListener('click', event => {
+    if (event.target.closest('button')) closeMobileSidebar();
+  });
+  document.querySelectorAll('[data-mode]').forEach(btn => btn.addEventListener('click', () => {
+    setMode(btn.dataset.mode);
+    closeMobileSidebar();
+  }));
   document.getElementById('deleteBtn').addEventListener('click', deleteSelected);
   document.getElementById('undoBtn').addEventListener('click', undo);
   document.getElementById('redoBtn').addEventListener('click', redo);
@@ -3160,6 +3458,7 @@
     const target = event.target;
     const inTextField = target && (target.isContentEditable || ['INPUT','TEXTAREA','SELECT'].includes(target.tagName));
     if (event.key === 'Escape') {
+      if (document.body.classList.contains('sidebar-open')) { closeMobileSidebar(); return; }
       if (projectRenameBackdrop.classList.contains('visible')) { closeRenameProjectModal(); return; }
       if (projectDeleteBackdrop.classList.contains('visible')) { closeDeleteProjectModal(); return; }
       if (projectActionsMenu.classList.contains('visible')) { closeProjectActionsMenu(); return; }
@@ -3219,7 +3518,14 @@
   }
   window.addEventListener('beforeunload', flushBeforeLeavingPage);
   window.addEventListener('pagehide', flushBeforeLeavingPage);
-  window.addEventListener('resize', () => renderScene(currentRenderScene || scene));
+  window.addEventListener('resize', () => {
+    if (nodeContextMenu.classList.contains('visible')) {
+      const rect = nodeContextMenu.getBoundingClientRect();
+      positionContextMenu(rect.left, rect.top);
+    }
+    if (window.innerWidth >= 768) closeMobileSidebar();
+    renderScene(currentRenderScene || scene);
+  });
 
   // Initial state: projects are opened from the start menu, rather than loaded invisibly.
   try {
