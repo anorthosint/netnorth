@@ -71,6 +71,8 @@
   let selectedId = null;
   let editingId = null;
   let editingOriginalText = null;
+  // Protect a newly created empty text node from transient mobile blur events.
+  let lastCreatedNodeTime = 0;
   let mode = 'select';
   let connectionSourceId = null;
   let drag = null;
@@ -1258,6 +1260,9 @@
                 return;
               }
 
+              // Ignore transient blur immediately after creating a node on touch devices.
+              if (Date.now() - lastCreatedNodeTime < 1000) return;
+
               finishEditing(n.id, true);
             }, 100);
           });
@@ -1451,6 +1456,7 @@
     pushUndoSnapshot();
     renderScene();
     saveProject();
+    lastCreatedNodeTime = Date.now();
   }
 
   function finishEditing(id, save) {
@@ -1469,6 +1475,16 @@
     editingOriginalText = null;
     selectedId = null; selectedIds.splice(0);
     if (n && !n.text.trim()) {
+      // Keep a freshly created empty node if mobile focus briefly disappears.
+      if (Date.now() - lastCreatedNodeTime < 1000) {
+        editingId = null;
+        editingOriginalText = null;
+        renderScene();
+        saveProject();
+        updateActionButtons();
+        return;
+      }
+
       scene.nodes = scene.nodes.filter(item => item.id !== id);
       scene.edges = scene.edges.filter(e => e.from !== id && e.to !== id);
       closeNodeContextMenu();
@@ -2378,6 +2394,13 @@
         // Create and focus the editor before hiding the currently focused menu button.
         const point = { ...contextCanvasPoint };
         createNodeAt(point.x, point.y);
+        const newEditor = editingId
+          ? stage.querySelector('[data-node-id="' + editingId + '"] .node-text')
+          : null;
+        if (newEditor) {
+          newEditor.focus({ preventScroll: true });
+          placeCaretAtEnd(newEditor);
+        }
         closeNodeContextMenu();
         return;
       }
