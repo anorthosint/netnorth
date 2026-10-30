@@ -77,6 +77,8 @@
   // Track movement during the active pointer gesture. The flag is cleared on pointerup;
   // a one-shot capture listener separately blocks the synthetic click after dragging a link.
   let wasDragging = false;
+  // Ignore the synthetic/retargeted canvas pointerdown caused by hiding the mobile context sheet.
+  let ignoreNextCanvasPointerDown = false;
   let linkDraft = null;
   // Touch pointers are tracked separately from the existing mouse/pen drag state.
   // A second finger cancels a one-finger gesture and takes exclusive ownership for pinch zoom.
@@ -1239,7 +1241,25 @@
             event.stopPropagation();
           });
           textSpan.addEventListener('blur', () => {
-            if (editingId === n.id) finishEditing(n.id, true);
+            // Mobile browsers can briefly move focus while a context-menu action
+            // is being activated. Wait for that transition before deciding whether
+            // an empty text node should be finalized and removed.
+            window.setTimeout(() => {
+              if (editingId !== n.id) return;
+              if (document.activeElement === textSpan) return;
+
+              const activeElement = document.activeElement;
+              if (
+                activeElement instanceof Element &&
+                activeElement.closest('#nodeContextMenu')
+              ) {
+                textSpan.focus({ preventScroll: true });
+                placeCaretAtEnd(textSpan);
+                return;
+              }
+
+              finishEditing(n.id, true);
+            }, 100);
           });
         }
       }
@@ -1595,6 +1615,11 @@
   }
 
   function startPan(event) {
+    if (ignoreNextCanvasPointerDown) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (event.button !== 0 || editingId || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
     wasDragging = false;
 
@@ -2336,12 +2361,24 @@
   }
 
   nodeContextMenu.addEventListener('click', event => {
-    const canvasButton = event.target.closest('[data-canvas-action]');
+    // Consume menu clicks so the closing/creation action cannot bubble into
+    // workspace-level handlers after the bottom sheet is hidden.
+    event.stopPropagation();
+    event.preventDefault();
+
+    const menuTarget = event.target instanceof Element ? event.target : null;
+    const canvasButton = menuTarget ? menuTarget.closest('[data-canvas-action]') : null;
     if (canvasButton) {
       const action = canvasButton.dataset.canvasAction;
       if (action === 'create-text') {
+        // Ignore a synthetic pointerdown that can land on the canvas after the sheet closes.
+        ignoreNextCanvasPointerDown = true;
+        window.setTimeout(() => { ignoreNextCanvasPointerDown = false; }, 150);
+
+        // Create and focus the editor before hiding the currently focused menu button.
+        const point = { ...contextCanvasPoint };
+        createNodeAt(point.x, point.y);
         closeNodeContextMenu();
-        createNodeAt(contextCanvasPoint.x, contextCanvasPoint.y);
         return;
       }
       if (action === 'upload-image') {
@@ -2351,8 +2388,8 @@
       }
     }
 
-    const swatch = event.target.closest('[data-node-color]');
-    const actionButton = event.target.closest('[data-node-action]');
+    const swatch = menuTarget ? menuTarget.closest('[data-node-color]') : null;
+    const actionButton = menuTarget ? menuTarget.closest('[data-node-action]') : null;
     const n = nodeById(contextNodeId);
     if (swatch) {
       if (!n) { closeNodeContextMenu(); return; }
@@ -2380,9 +2417,11 @@
     commitScene(); updateNodeContextMenu();
   });
   document.addEventListener('pointerdown', event => {
-    if (!event.target.closest) { closeNodeContextMenu(); return; }
-    if (event.target.closest('#nodeContextMenu')) return;
-    const clickedNode = event.target.closest('.node[data-node-id]');
+    const pointerTarget = event.target instanceof Element ? event.target : null;
+    // Interacting with a menu item must not close the sheet or disturb focus.
+    if (pointerTarget && pointerTarget.closest('#nodeContextMenu')) return;
+    if (!pointerTarget) { closeNodeContextMenu(); return; }
+    const clickedNode = pointerTarget.closest('.node[data-node-id]');
     // ЛКМ по другому узлу закрывает старое меню, ПКМ оставляет его до открытия нового.
     if (!clickedNode || event.button === 0) closeNodeContextMenu();
   });
@@ -3265,6 +3304,11 @@
   }, { passive: false });
 
   stage.addEventListener('pointerdown', event => {
+    if (ignoreNextCanvasPointerDown) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (playback.active) return;
     if (event.button !== 0) return;
     if (event.target.closest && (event.target.closest('.node') || event.target.closest('.edge-hit'))) return;
