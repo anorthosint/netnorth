@@ -1243,9 +1243,12 @@
             event.stopPropagation();
           });
           textSpan.addEventListener('blur', () => {
-            // Mobile browsers can briefly move focus while a context-menu action
-            // is being activated. Wait for that transition before deciding whether
-            // an empty text node should be finalized and removed.
+            // Ignore the blur event itself when it occurs during the two-second
+            // protection window after creating a node. Check before scheduling work,
+            // so a 100ms delay cannot push the decision past the protection window.
+            if (Date.now() - lastCreatedNodeTime < 2000) return;
+
+            // For regular edits, allow the browser's focus transition to settle first.
             window.setTimeout(() => {
               if (editingId !== n.id) return;
               if (document.activeElement === textSpan) return;
@@ -1259,9 +1262,6 @@
                 placeCaretAtEnd(textSpan);
                 return;
               }
-
-              // Ignore transient blur immediately after creating a node on touch devices.
-              if (Date.now() - lastCreatedNodeTime < 1000) return;
 
               finishEditing(n.id, true);
             }, 100);
@@ -1452,7 +1452,6 @@
     mode = 'select';
     syncModeButtons();
     modeIndicator.classList.remove('visible'); stage.style.cursor = 'default';
-    shouldFocusNewNode = true;
     pushUndoSnapshot();
     renderScene();
     saveProject();
@@ -1471,20 +1470,16 @@
         n.text = editingOriginalText;
       }
     }
+    if (n && !n.text.trim() && Date.now() - lastCreatedNodeTime < 2000) {
+      // Keep the just-created empty node untouched during the mobile focus transition.
+      // Return before clearing the editing state or rerendering the scene.
+      return;
+    }
+
     editingId = null;
     editingOriginalText = null;
     selectedId = null; selectedIds.splice(0);
     if (n && !n.text.trim()) {
-      // Keep a freshly created empty node if mobile focus briefly disappears.
-      if (Date.now() - lastCreatedNodeTime < 1000) {
-        editingId = null;
-        editingOriginalText = null;
-        renderScene();
-        saveProject();
-        updateActionButtons();
-        return;
-      }
-
       scene.nodes = scene.nodes.filter(item => item.id !== id);
       scene.edges = scene.edges.filter(e => e.from !== id && e.to !== id);
       closeNodeContextMenu();
@@ -2387,20 +2382,22 @@
     if (canvasButton) {
       const action = canvasButton.dataset.canvasAction;
       if (action === 'create-text') {
-        // Ignore a synthetic pointerdown that can land on the canvas after the sheet closes.
+        // Ignore the delayed/synthetic canvas pointerdown caused by closing the bottom sheet.
         ignoreNextCanvasPointerDown = true;
-        window.setTimeout(() => { ignoreNextCanvasPointerDown = false; }, 150);
+        window.setTimeout(() => { ignoreNextCanvasPointerDown = false; }, 500);
 
-        // Create and focus the editor before hiding the currently focused menu button.
         const point = { ...contextCanvasPoint };
         createNodeAt(point.x, point.y);
-        const newEditor = editingId
-          ? stage.querySelector('[data-node-id="' + editingId + '"] .node-text')
-          : null;
-        if (newEditor) {
-          newEditor.focus({ preventScroll: true });
-          placeCaretAtEnd(newEditor);
-        }
+
+        // Let renderScene commit the contenteditable node before focusing it.
+        window.setTimeout(() => {
+          const newEditor = stage.querySelector('[data-node-id="' + editingId + '"] .node-text');
+          if (newEditor) {
+            newEditor.focus({ preventScroll: true });
+            placeCaretAtEnd(newEditor);
+          }
+        }, 100);
+
         closeNodeContextMenu();
         return;
       }
