@@ -1228,6 +1228,9 @@
           el.classList.add('editing');
           textSpan.contentEditable = 'true';
           textSpan.spellcheck = false;
+          textSpan.style.setProperty('-webkit-user-select', 'text');
+          textSpan.style.setProperty('user-select', 'text');
+          textSpan.style.setProperty('-webkit-touch-callout', 'default');
           textSpan.setAttribute('role', 'textbox');
           textSpan.setAttribute('aria-label', 'Текстовый узел');
           textSpan.addEventListener('input', () => {
@@ -1243,9 +1246,9 @@
             event.stopPropagation();
           });
           textSpan.addEventListener('blur', () => {
-            // Ignore the blur event itself when it occurs during the two-second
-            // protection window after creating a node. Check before scheduling work,
-            // so a 100ms delay cannot push the decision past the protection window.
+            // A new empty editor can briefly lose focus while iOS closes its
+            // bottom sheet or transitions to the software keyboard. Do not run
+            // finishEditing during this protection window.
             if (Date.now() - lastCreatedNodeTime < 2000) return;
 
             // For regular edits, allow the browser's focus transition to settle first.
@@ -1258,13 +1261,25 @@
                 activeElement instanceof Element &&
                 activeElement.closest('#nodeContextMenu')
               ) {
-                textSpan.focus({ preventScroll: true });
+                try { textSpan.focus({ preventScroll: true }); } catch (_) { textSpan.focus(); }
                 placeCaretAtEnd(textSpan);
                 return;
               }
 
               finishEditing(n.id, true);
             }, 100);
+          });
+
+          // Empty inline spans have no hit area. After a transient blur, tapping
+          // the visible node/placeholder must focus the editor again on touch devices.
+          el.addEventListener('pointerdown', event => {
+            if (event.button !== 0 || editingId !== n.id) return;
+            if (event.target instanceof Element && event.target.closest('a.node-link')) return;
+            try { textSpan.focus({ preventScroll: true }); } catch (_) { textSpan.focus(); }
+            placeCaretAtEnd(textSpan);
+            // The hit is often on the node/placeholder rather than the empty
+            // inline editor. Prevent the browser from moving focus back to body.
+            if (event.cancelable) event.preventDefault();
           });
         }
       }
@@ -1444,18 +1459,94 @@
 
   function createNodeAt(x, y) {
     if (playback.active) exitPlayback();
-    const n = { id: safeId(), x: Math.max(0, Math.round(x)), y: Math.max(0, Math.round(y)), text: '', width: 120, height: 30, fontSize: 16, autoSize: true, color: '#111111', underline: false, highlight: false };
+
+    // Resolve the requested point before mutating the scene. A malformed or
+    // stale context-menu point falls back to the center of the visible canvas.
+    let nodeX = Number(x);
+    let nodeY = Number(y);
+    if (!Number.isFinite(nodeX) || !Number.isFinite(nodeY)) {
+      const visibleCenter = getVisibleCanvasCenter();
+      nodeX = visibleCenter.x;
+      nodeY = visibleCenter.y;
+    }
+
+    const n = {
+      id: safeId(),
+      x: Math.max(0, Math.round(nodeX)),
+      y: Math.max(0, Math.round(nodeY)),
+      text: '',
+      width: 120,
+      height: 30,
+      fontSize: 16,
+      autoSize: true,
+      color: '#111111',
+      underline: false,
+      highlight: false
+    };
+
+    // Arm the empty-node protection BEFORE renderScene() can replace DOM and
+    // dispatch blur from any previously focused contenteditable element.
+    lastCreatedNodeTime = Date.now();
     scene.nodes.push(n);
-    selectedId = n.id; selectedIds.splice(0, selectedIds.length, n.id);
+    selectedId = n.id;
+    selectedIds.splice(0, selectedIds.length, n.id);
     editingId = n.id;
     editingOriginalText = '';
+    shouldFocusNewNode = false;
     mode = 'select';
     syncModeButtons();
-    modeIndicator.classList.remove('visible'); stage.style.cursor = 'default';
+    modeIndicator.classList.remove('visible');
+    stage.style.cursor = 'default';
+
     pushUndoSnapshot();
     renderScene();
+
+    const createdNodeElement = renderedNodeElements.get(n.id) ||
+      stage.querySelector('[data-node-id="' + n.id + '"]');
+    const newEditor = createdNodeElement && createdNodeElement.querySelector('.node-text');
+
+    // Center the node by scrolling the actual workspace rather than relying on
+    // scrollIntoView(), whose nearest-scroll-container behavior differs in iOS Safari.
+    if (createdNodeElement) {
+      const nodeCenterX = (CANVAS_PAD + n.x + createdNodeElement.offsetWidth / 2) * zoom;
+      const nodeCenterY = (CANVAS_PAD + n.y + createdNodeElement.offsetHeight / 2) * zoom;
+      const maxScrollLeft = Math.max(0, workspace.scrollWidth - workspace.clientWidth);
+      const maxScrollTop = Math.max(0, workspace.scrollHeight - workspace.clientHeight);
+      workspace.scrollLeft = Math.max(0, Math.min(maxScrollLeft, nodeCenterX - workspace.clientWidth / 2));
+      workspace.scrollTop = Math.max(0, Math.min(maxScrollTop, nodeCenterY - workspace.clientHeight / 2));
+    }
+
+    if (newEditor) {
+      // WebKit may inherit the canvas' touch-selection suppression. Explicitly
+      // re-enable selection/editing on the contenteditable node.
+      newEditor.style.setProperty('-webkit-user-select', 'text');
+      newEditor.style.setProperty('user-select', 'text');
+      newEditor.style.setProperty('-webkit-touch-callout', 'default');
+
+      // This focus is deliberately synchronous: iOS Safari only reliably opens
+      // the software keyboard while focus remains in the trusted click stack.
+      try {
+        newEditor.focus({ preventScroll: true });
+      } catch (_) {
+        newEditor.focus();
+      }
+      placeCaretAtEnd(newEditor);
+
+      // Non-blocking fallback for browsers that complete contenteditable layout
+      // after the current frame. It does not replace the synchronous focus above.
+      window.setTimeout(() => {
+        if (editingId !== n.id || !newEditor.isConnected) return;
+        if (document.activeElement !== newEditor) {
+          try { newEditor.focus({ preventScroll: true }); } catch (_) { newEditor.focus(); }
+          placeCaretAtEnd(newEditor);
+        }
+      }, 120);
+    } else {
+      console.warn('[NetNotrh] Created text node has no .node-text editor in DOM', n.id);
+    }
+
     saveProject();
-    lastCreatedNodeTime = Date.now();
+    return n;
   }
 
   function finishEditing(id, save) {
@@ -2372,35 +2463,41 @@
   }
 
   nodeContextMenu.addEventListener('click', event => {
-    // Consume menu clicks so the closing/creation action cannot bubble into
-    // workspace-level handlers after the bottom sheet is hidden.
+    const menuTarget = event.target instanceof Element ? event.target : null;
+    const canvasButton = menuTarget ? menuTarget.closest('[data-canvas-action]') : null;
+    const isCreateTextAction = !!(canvasButton && canvasButton.dataset.canvasAction === 'create-text');
+
+    if (isCreateTextAction) {
+      // Consume the user click synchronously. Deferring preventDefault() until a
+      // timer runs is too late in Safari and can allow native click side effects.
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+
+      // The guard also protects the delayed/retargeted canvas pointerdown that
+      // some mobile browsers can emit while the bottom sheet is being dismissed.
+      ignoreNextCanvasPointerDown = true;
+      window.setTimeout(() => { ignoreNextCanvasPointerDown = false; }, 500);
+
+      const point = { ...contextCanvasPoint };
+      const createdNode = createNodeAt(point.x, point.y);
+      if (!createdNode) {
+        console.error('[NetNotrh] create-text action did not return a node');
+        return;
+      }
+
+      // createNodeAt() has already rendered and synchronously focused the editor
+      // while this trusted click is active. Only now dismiss the bottom sheet.
+      closeNodeContextMenu();
+      return;
+    }
+
+    // Consume all other context-sheet actions synchronously.
     event.stopPropagation();
     event.preventDefault();
 
-    const menuTarget = event.target instanceof Element ? event.target : null;
-    const canvasButton = menuTarget ? menuTarget.closest('[data-canvas-action]') : null;
     if (canvasButton) {
       const action = canvasButton.dataset.canvasAction;
-      if (action === 'create-text') {
-        // Ignore the delayed/synthetic canvas pointerdown caused by closing the bottom sheet.
-        ignoreNextCanvasPointerDown = true;
-        window.setTimeout(() => { ignoreNextCanvasPointerDown = false; }, 500);
-
-        const point = { ...contextCanvasPoint };
-        createNodeAt(point.x, point.y);
-
-        // Let renderScene commit the contenteditable node before focusing it.
-        window.setTimeout(() => {
-          const newEditor = stage.querySelector('[data-node-id="' + editingId + '"] .node-text');
-          if (newEditor) {
-            newEditor.focus({ preventScroll: true });
-            placeCaretAtEnd(newEditor);
-          }
-        }, 100);
-
-        closeNodeContextMenu();
-        return;
-      }
       if (action === 'upload-image') {
         closeNodeContextMenu();
         openImageFilePicker(contextCanvasPoint);
@@ -2438,13 +2535,23 @@
   });
   document.addEventListener('pointerdown', event => {
     const pointerTarget = event.target instanceof Element ? event.target : null;
-    // Interacting with a menu item must not close the sheet or disturb focus.
+    // A menu control owns its pointer sequence; never dismiss the sheet before
+    // its synthesized click is delivered.
     if (pointerTarget && pointerTarget.closest('#nodeContextMenu')) return;
+    if (!nodeContextMenu.classList.contains('visible')) return;
+
+    // On touch, dismissing a fixed bottom sheet can expose the canvas beneath the
+    // same pointer sequence. Arm the stage capture guard before that event reaches it.
+    if (event.pointerType === 'touch') {
+      ignoreNextCanvasPointerDown = true;
+      window.setTimeout(() => { ignoreNextCanvasPointerDown = false; }, 0);
+    }
+
     if (!pointerTarget) { closeNodeContextMenu(); return; }
     const clickedNode = pointerTarget.closest('.node[data-node-id]');
     // ЛКМ по другому узлу закрывает старое меню, ПКМ оставляет его до открытия нового.
     if (!clickedNode || event.button === 0) closeNodeContextMenu();
-  });
+  }, { capture: true });
 
   let confirmCancelCallback = null;
 
@@ -3156,9 +3263,13 @@
 
   function handleWorkspaceTouchDown(event) {
     if (event.pointerType !== 'touch' || playback.active) return;
+    const touchTarget = event.target instanceof Element ? event.target : null;
+    if (touchTarget && touchTarget.closest('#nodeContextMenu')) {
+      clearLongPress();
+      return;
+    }
     const tappedInsideNodeContextMenu =
-      event.target instanceof Element &&
-      event.target.closest('#nodeContextMenu');
+      touchTarget && touchTarget.closest('#nodeContextMenu');
 
     if (
       nodeContextMenu.classList.contains('visible') &&
@@ -3168,6 +3279,14 @@
     }
 
     const target = event.target instanceof Element ? event.target : null;
+
+    // A finger touching a bottom-sheet control must activate that control,
+    // not start another long-press candidate for the canvas.
+    if (target && target.closest('#nodeContextMenu')) {
+      clearLongPress();
+      return;
+    }
+
     activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
 
     if (pinchState) {
@@ -3325,9 +3444,18 @@
 
   stage.addEventListener('pointerdown', event => {
     if (ignoreNextCanvasPointerDown) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
+      // Consume the guard exactly once. A real tap on the newly created node
+      // must still reach its editor; only a retargeted tap on the bare canvas
+      // is treated as the bottom-sheet dismissal ghost event.
+      ignoreNextCanvasPointerDown = false;
+      const pointerTarget = event.target instanceof Element ? event.target : null;
+      const landedOnNode = !!(pointerTarget && pointerTarget.closest('.node[data-node-id]'));
+      if (!landedOnNode) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        return;
+      }
     }
     if (playback.active) return;
     if (event.button !== 0) return;
@@ -3343,7 +3471,7 @@
     if (mode === 'connect') { connectionSourceId = null; showToast('Нажмите на начальный узел, затем на второй'); return; }
     if (editingId) finishEditing(editingId, true);
     startPan(event);
-  });
+  }, { capture: true, passive: false });
   mobileMenuToggle.addEventListener('click', () => {
     setMobileSidebarOpen(!document.body.classList.contains('sidebar-open'));
   });

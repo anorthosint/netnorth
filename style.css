@@ -370,6 +370,7 @@
 #stage {
   touch-action: none;
   overscroll-behavior: contain;
+  -webkit-touch-callout: none;
   -webkit-user-select: none;
   user-select: none;
 }
@@ -381,6 +382,13 @@
 }
 
 @media (max-width: 767px) {
+  #workspace,
+  #stage {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
   #app {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: calc(58px + env(safe-area-inset-top)) minmax(0, 1fr);
