@@ -71,16 +71,14 @@
   let selectedId = null;
   let editingId = null;
   let editingOriginalText = null;
-  // Protect a newly created empty text node from transient mobile blur events.
-  let lastCreatedNodeTime = 0;
   let mode = 'select';
   let connectionSourceId = null;
   let drag = null;
+  let activeMoveHandler = null;
+  let activeUpHandler = null;
   // Track movement during the active pointer gesture. The flag is cleared on pointerup;
   // a one-shot capture listener separately blocks the synthetic click after dragging a link.
   let wasDragging = false;
-  // Ignore the synthetic/retargeted canvas pointerdown caused by hiding the mobile context sheet.
-  let ignoreNextCanvasPointerDown = false;
   let linkDraft = null;
   // Touch pointers are tracked separately from the existing mouse/pen drag state.
   // A second finger cancels a one-finger gesture and takes exclusive ownership for pinch zoom.
@@ -1246,11 +1244,6 @@
             event.stopPropagation();
           });
           textSpan.addEventListener('blur', () => {
-            // A new empty editor can briefly lose focus while iOS closes its
-            // bottom sheet or transitions to the software keyboard. Do not run
-            // finishEditing during this protection window.
-            if (Date.now() - lastCreatedNodeTime < 2000) return;
-
             // For regular edits, allow the browser's focus transition to settle first.
             window.setTimeout(() => {
               if (editingId !== n.id) return;
@@ -1484,9 +1477,6 @@
       highlight: false
     };
 
-    // Arm the empty-node protection BEFORE renderScene() can replace DOM and
-    // dispatch blur from any previously focused contenteditable element.
-    lastCreatedNodeTime = Date.now();
     scene.nodes.push(n);
     selectedId = n.id;
     selectedIds.splice(0, selectedIds.length, n.id);
@@ -1505,15 +1495,14 @@
       stage.querySelector('[data-node-id="' + n.id + '"]');
     const newEditor = createdNodeElement && createdNodeElement.querySelector('.node-text');
 
-    // Center the node by scrolling the actual workspace rather than relying on
-    // scrollIntoView(), whose nearest-scroll-container behavior differs in iOS Safari.
-    if (createdNodeElement) {
-      const nodeCenterX = (CANVAS_PAD + n.x + createdNodeElement.offsetWidth / 2) * zoom;
-      const nodeCenterY = (CANVAS_PAD + n.y + createdNodeElement.offsetHeight / 2) * zoom;
-      const maxScrollLeft = Math.max(0, workspace.scrollWidth - workspace.clientWidth);
-      const maxScrollTop = Math.max(0, workspace.scrollHeight - workspace.clientHeight);
-      workspace.scrollLeft = Math.max(0, Math.min(maxScrollLeft, nodeCenterX - workspace.clientWidth / 2));
-      workspace.scrollTop = Math.max(0, Math.min(maxScrollTop, nodeCenterY - workspace.clientHeight / 2));
+    // Bring the just-created node into the visible workspace area. Browsers
+    // choose the nearest scroll container, which is #workspace in this layout.
+    if (createdNodeElement && typeof createdNodeElement.scrollIntoView === 'function') {
+      try {
+        createdNodeElement.scrollIntoView({ block: 'center', inline: 'center' });
+      } catch (_) {
+        createdNodeElement.scrollIntoView(true);
+      }
     }
 
     if (newEditor) {
@@ -1561,12 +1550,6 @@
         n.text = editingOriginalText;
       }
     }
-    if (n && !n.text.trim() && Date.now() - lastCreatedNodeTime < 2000) {
-      // Keep the just-created empty node untouched during the mobile focus transition.
-      // Return before clearing the editing state or rerendering the scene.
-      return;
-    }
-
     editingId = null;
     editingOriginalText = null;
     selectedId = null; selectedIds.splice(0);
@@ -1605,19 +1588,41 @@
     }
   }
 
+  function attachWorkspaceTouchListeners() {
+    // These listeners are app-level touch tracking, but they share the same
+    // gesture lifecycle as the temporary move/up handlers below. Re-registering
+    // the same callback is idempotent, so a new canvas gesture safely restores them.
+    window.addEventListener('pointermove', handleWorkspaceTouchMove, { passive: false });
+    window.addEventListener('pointerup', handleWorkspaceTouchEnd, { passive: false });
+    window.addEventListener('pointercancel', handleWorkspaceTouchEnd, { passive: false });
+  }
+
   function detachPointerGestureListeners() {
-    window.removeEventListener('pointermove', onPointerMove);
-    window.removeEventListener('pointermove', onBoxSelectionMove);
-    window.removeEventListener('pointerup', onPointerUp);
-    window.removeEventListener('pointerup', onBoxSelectionUp);
+    if (activeMoveHandler) {
+      window.removeEventListener('pointermove', activeMoveHandler);
+      activeMoveHandler = null;
+    }
+    if (activeUpHandler) {
+      window.removeEventListener('pointerup', activeUpHandler);
+      activeUpHandler = null;
+    }
     window.removeEventListener('pointercancel', cancelPointerGesture);
+
+    // Remove the app-level touch listeners together with the active gesture.
+    // handleWorkspaceTouchDown / attachPointerGesture re-arm them for the next one.
+    window.removeEventListener('pointermove', handleWorkspaceTouchMove);
+    window.removeEventListener('pointerup', handleWorkspaceTouchEnd);
+    window.removeEventListener('pointercancel', handleWorkspaceTouchEnd);
   }
 
   function attachPointerGesture(moveHandler, upHandler) {
     detachPointerGestureListeners();
-    window.addEventListener('pointermove', moveHandler);
-    window.addEventListener('pointerup', upHandler);
+    activeMoveHandler = typeof moveHandler === 'function' ? moveHandler : null;
+    activeUpHandler = typeof upHandler === 'function' ? upHandler : null;
+    if (activeMoveHandler) window.addEventListener('pointermove', activeMoveHandler);
+    if (activeUpHandler) window.addEventListener('pointerup', activeUpHandler);
     window.addEventListener('pointercancel', cancelPointerGesture);
+    attachWorkspaceTouchListeners();
   }
 
   function cancelPointerGesture(event) {
@@ -1717,11 +1722,6 @@
   }
 
   function startPan(event) {
-    if (ignoreNextCanvasPointerDown) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
     if (event.button !== 0 || editingId || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
     wasDragging = false;
 
@@ -1858,6 +1858,7 @@
 
   function onPointerMove(event) {
     if (pinchState) return;
+    if (!drag && !linkDraft) return;
     if (drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
     if (linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
     if (drag) {
@@ -2468,16 +2469,11 @@
     const isCreateTextAction = !!(canvasButton && canvasButton.dataset.canvasAction === 'create-text');
 
     if (isCreateTextAction) {
-      // Consume the user click synchronously. Deferring preventDefault() until a
-      // timer runs is too late in Safari and can allow native click side effects.
+      // Consume the trusted menu click synchronously. Do not defer these calls:
+      // Firefox and WebKit may otherwise let the click trigger canvas behavior.
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
-
-      // The guard also protects the delayed/retargeted canvas pointerdown that
-      // some mobile browsers can emit while the bottom sheet is being dismissed.
-      ignoreNextCanvasPointerDown = true;
-      window.setTimeout(() => { ignoreNextCanvasPointerDown = false; }, 500);
 
       const point = { ...contextCanvasPoint };
       const createdNode = createNodeAt(point.x, point.y);
@@ -2486,9 +2482,20 @@
         return;
       }
 
-      // createNodeAt() has already rendered and synchronously focused the editor
-      // while this trusted click is active. Only now dismiss the bottom sheet.
-      closeNodeContextMenu();
+      // Re-assert focus while the click action is still active. createNodeAt()
+      // also focuses synchronously; this lookup verifies that the editor exists.
+      const newEditor = stage.querySelector(
+        '[data-node-id="' + createdNode.id + '"] .node-text'
+      );
+      if (newEditor) {
+        try { newEditor.focus({ preventScroll: true }); } catch (_) { newEditor.focus(); }
+        placeCaretAtEnd(newEditor);
+      }
+
+      // Keep the sheet in place until the created editor has acquired focus.
+      window.setTimeout(() => {
+        closeNodeContextMenu();
+      }, 50);
       return;
     }
 
@@ -2540,13 +2547,6 @@
     if (pointerTarget && pointerTarget.closest('#nodeContextMenu')) return;
     if (!nodeContextMenu.classList.contains('visible')) return;
 
-    // On touch, dismissing a fixed bottom sheet can expose the canvas beneath the
-    // same pointer sequence. Arm the stage capture guard before that event reaches it.
-    if (event.pointerType === 'touch') {
-      ignoreNextCanvasPointerDown = true;
-      window.setTimeout(() => { ignoreNextCanvasPointerDown = false; }, 0);
-    }
-
     if (!pointerTarget) { closeNodeContextMenu(); return; }
     const clickedNode = pointerTarget.closest('.node[data-node-id]');
     // ЛКМ по другому узлу закрывает старое меню, ПКМ оставляет его до открытия нового.
@@ -2567,14 +2567,21 @@
 
   function closeConfirm(runCancelAction = false) {
     const cancelAction = runCancelAction ? confirmCancelCallback : null;
-    modalBackdrop.classList.remove('visible');
+
+    // Сначала закрываем модальное окно и очищаем его состояние.
+    // Отменяющее действие запускаем после обновления DOM, чтобы renderScene()
+    // не перестраивал интерфейс поверх ещё видимой модалки.
     confirmCallback = null;
     confirmCancelCallback = null;
+    modalBackdrop.classList.remove('visible');
     document.getElementById('modalCancel').textContent = 'Отмена';
-    if (cancelAction) cancelAction();
+
+    if (cancelAction) window.setTimeout(cancelAction, 0);
   }
 
   function clearSelection() {
+    confirmCallback = null;
+    confirmCancelCallback = null;
     selectedId = null;
     selectedIds.splice(0);
     selectedEdgeIds.splice(0);
@@ -2662,6 +2669,10 @@
     if (!scene.nodes.length) { showToast('Добавь хотя бы один узел для экспорта'); return; }
 
     try {
+      if (document.fonts) {
+        await document.fonts.ready;
+      }
+
       const PADDING = 100;             // итоговые пиксели с каждой стороны
       const DESIRED_SCALE = 2;         // отрисовка в 2x для чёткого текста и линий
       const MAX_CANVAS_SIDE = 32767;   // технический предел одного измерения canvas
@@ -2741,16 +2752,27 @@
         (MAX_CANVAS_SIDE - PADDING * 2) / contentH,
         Math.sqrt(MAX_CANVAS_PIXELS / (contentW * contentH))
       );
-      let W = Math.ceil(contentW * scale + PADDING * 2);
-      let H = Math.ceil(contentH * scale + PADDING * 2);
+      let W = 0;
+      let H = 0;
 
-      // Account for padding when checking the browser's canvas limits.
-      while ((W > MAX_CANVAS_SIDE || H > MAX_CANVAS_SIDE || W * H > MAX_CANVAS_PIXELS) && scale > 0.01) {
-        scale *= .98;
+      // Recalculate both dimensions after every scale reduction, including padding.
+      while (true) {
         W = Math.ceil(contentW * scale + PADDING * 2);
         H = Math.ceil(contentH * scale + PADDING * 2);
+
+        const exceedsCanvasLimits =
+          W > MAX_CANVAS_SIDE ||
+          H > MAX_CANVAS_SIDE ||
+          W * H > MAX_CANVAS_PIXELS;
+
+        if (!exceedsCanvasLimits || scale <= 0.01) break;
+        scale *= 0.98;
       }
-      if (W > MAX_CANVAS_SIDE || H > MAX_CANVAS_SIDE || W * H > MAX_CANVAS_PIXELS) {
+      const stillExceedsCanvasLimits =
+        W > MAX_CANVAS_SIDE ||
+        H > MAX_CANVAS_SIDE ||
+        W * H > MAX_CANVAS_PIXELS;
+      if (scale <= 0.01 && stillExceedsCanvasLimits) {
         throw new Error('Graph is too large to export safely');
       }
 
@@ -2876,22 +2898,56 @@
     const reader = new FileReader();
     reader.onload = () => {
       try {
+        // Полностью разбираем и подготавливаем импортируемые данные до любых
+        // операций, способных сохранить или изменить текущий проект.
         const data = JSON.parse(String(reader.result || ''));
-        if (!data || !data.scene || !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) throw new Error('Некорректный формат');
+        if (!data || !data.scene || !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) {
+          throw new Error('Некорректный формат');
+        }
+
+        const importedScene = sanitizeScene(data.scene);
+        const importedTitle = typeof data.title === 'string' && data.title.trim()
+          ? data.title.slice(0, 90)
+          : 'Импортированная схема';
+        let importedTimeline = Array.isArray(data.timeline)
+          ? data.timeline
+              .filter(frame => frame && frame.scene)
+              .map(frame => ({
+                at: Math.max(0, Number(frame.at) || 0),
+                scene: sanitizeScene(frame.scene)
+              }))
+          : [];
+        const importedProjectStartedAt = Number(data.projectStartedAt) || Date.now();
+
+        if (!importedTimeline.length) {
+          importedTimeline = [
+            { at: 0, scene: freshScene() },
+            { at: 1, scene: sanitizeScene(importedScene) }
+          ];
+        }
+
+        // Текущий проект сохраняется только после успешной проверки всего импорта.
         if (editingId) finishEditing(editingId, true);
         flushPendingSave();
-        scene = sanitizeScene(data.scene);
+
+        scene = importedScene;
         currentProjectId = makeProjectId();
-        projectTitle.value = typeof data.title === 'string' && data.title.trim() ? data.title.slice(0,90) : 'Импортированная схема';
-        timeline = Array.isArray(data.timeline) ? data.timeline.filter(f => f && f.scene).map(f => ({ at: Math.max(0, Number(f.at) || 0), scene: sanitizeScene(f.scene) })) : [];
-        projectStartedAt = Number(data.projectStartedAt) || Date.now();
-        if (!timeline.length) timeline = [{ at: 0, scene: freshScene() }, { at: 1, scene: snapshot() }];
-        selectedId = editingId = null; selectedIds.splice(0); mode = 'select';
-        undoStack = [snapshot()]; undoIndex = 0;
+        projectTitle.value = importedTitle;
+        timeline = importedTimeline;
+        projectStartedAt = importedProjectStartedAt;
+        selectedId = editingId = null;
+        selectedIds.splice(0);
+        mode = 'select';
+        undoStack = [snapshot()];
+        undoIndex = 0;
         syncModeButtons();
         startScreen.classList.remove('visible');
-        renderScene(); saveProject(); updateActionButtons(); showToast('Проект открыт');
+        renderScene();
+        saveProject();
+        updateActionButtons();
+        showToast('Проект открыт');
       } catch (error) {
+        console.warn('Project import failed:', error);
         showToast('Не удалось открыть файл проекта');
       }
       importFile.value = '';
@@ -3262,6 +3318,9 @@
   }
 
   function handleWorkspaceTouchDown(event) {
+    // A previous pointerup/cancel may have detached the global touch trackers.
+    // Restore them before processing this new pointer sequence.
+    attachWorkspaceTouchListeners();
     if (event.pointerType !== 'touch' || playback.active) return;
     const touchTarget = event.target instanceof Element ? event.target : null;
     if (touchTarget && touchTarget.closest('#nodeContextMenu')) {
@@ -3362,11 +3421,11 @@
     }
   }
 
+  // Install global touch trackers during initialization and re-arm them before
+  // each new pointer sequence (including node controls that stop bubbling).
+  attachWorkspaceTouchListeners();
+  window.addEventListener('pointerdown', attachWorkspaceTouchListeners, { capture: true, passive: true });
   workspace.addEventListener('pointerdown', handleWorkspaceTouchDown, { passive: false });
-  // Track move/up on window as well: a finger may leave the workspace before release.
-  window.addEventListener('pointermove', handleWorkspaceTouchMove, { passive: false });
-  window.addEventListener('pointerup', handleWorkspaceTouchEnd, { passive: false });
-  window.addEventListener('pointercancel', handleWorkspaceTouchEnd, { passive: false });
 
   stage.addEventListener('pointerdown', startBoxSelection);
 
@@ -3411,6 +3470,7 @@
 
     const edgeHit = targetElement && targetElement.closest('.edge-hit');
     if (edgeHit) {
+      closeNodeContextMenu();
       openSelectedEdgesActions(edgeHit.dataset.edgeId, event);
       return;
     }
@@ -3421,8 +3481,10 @@
       return;
     }
 
+    // A right-click on empty canvas replaces any previously opened node/edge menu.
     // Do not open edge-delete actions merely because some edges are selected.
     // The modal is invoked above only when the pointer is actually over an edge.
+    closeNodeContextMenu();
     contextCanvasPoint = getStagePoint(event);
     showCanvasContextMenu(event.clientX, event.clientY);
   }, { capture: true });
@@ -3443,35 +3505,38 @@
   }, { passive: false });
 
   stage.addEventListener('pointerdown', event => {
-    if (ignoreNextCanvasPointerDown) {
-      // Consume the guard exactly once. A real tap on the newly created node
-      // must still reach its editor; only a retargeted tap on the bare canvas
-      // is treated as the bottom-sheet dismissal ghost event.
-      ignoreNextCanvasPointerDown = false;
-      const pointerTarget = event.target instanceof Element ? event.target : null;
-      const landedOnNode = !!(pointerTarget && pointerTarget.closest('.node[data-node-id]'));
-      if (!landedOnNode) {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-        return;
-      }
-    }
     if (playback.active) return;
     if (event.button !== 0) return;
-    if (event.target.closest && (event.target.closest('.node') || event.target.closest('.edge-hit'))) return;
+
+    const pointerTarget = event.target instanceof Element ? event.target : null;
+    const hitNode = pointerTarget && pointerTarget.closest('.node');
+    const hitEdge = pointerTarget && pointerTarget.closest('.edge-hit');
+
+    // A tap on bare canvas dismisses any open sheet, but is still allowed to
+    // continue through the normal canvas tool logic (text creation, pan, etc.).
+    if (!hitNode && !hitEdge && nodeContextMenu.classList.contains('visible')) {
+      closeNodeContextMenu();
+    }
+
+    if (hitNode || hitEdge) return;
     if (selectedEdgeIds.length) {
       selectedEdgeIds.splice(0);
       refreshEdgeSelectionDecorations(scene, false);
       updateActionButtons();
     }
     if (mode === 'text') {
-      const p = getStagePoint(event); createNodeAt(p.x, p.y); return;
+      const p = getStagePoint(event);
+      createNodeAt(p.x, p.y);
+      return;
     }
-    if (mode === 'connect') { connectionSourceId = null; showToast('Нажмите на начальный узел, затем на второй'); return; }
+    if (mode === 'connect') {
+      connectionSourceId = null;
+      showToast('Нажмите на начальный узел, затем на второй');
+      return;
+    }
     if (editingId) finishEditing(editingId, true);
     startPan(event);
-  }, { capture: true, passive: false });
+  }, { passive: false });
   mobileMenuToggle.addEventListener('click', () => {
     setMobileSidebarOpen(!document.body.classList.contains('sidebar-open'));
   });

@@ -384,9 +384,21 @@
 @media (max-width: 767px) {
   #workspace,
   #stage {
+    touch-action: none;
     -webkit-touch-callout: none;
     -webkit-user-select: none;
     user-select: none;
+  }
+
+  .node-text[contenteditable="true"] {
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
+    touch-action: manipulation;
+  }
+
+  .node.editing {
+    z-index: 1200;
   }
 
   #app {
