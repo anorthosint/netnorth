@@ -128,7 +128,28 @@
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
         <h2 id="modalTitle">Очистить рабочее поле?</h2>
         <p id="modalText">Все узлы и связи будут удалены из текущей схемы. Это действие можно отменить.</p>
-        <div class="modal-actions"><button id="modalCancel">Отмена</button><button class="danger" id="modalConfirm">Очистить</button></div>
+        <div class="edge-style-options" id="edgeStyleOptions" hidden>
+          <div class="edge-style-title">Стиль связи</div>
+          <div class="edge-style-grid" role="group" aria-label="Выбор стиля связи">
+            <button type="button" class="edge-style-button" data-edge-style="curved" aria-label="Мягкая" title="Мягкая" aria-pressed="false">
+              <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 23 C11 23 11 9 28 9"/></svg>
+              <span class="edge-style-label">Мягкая</span>
+            </button>
+            <button type="button" class="edge-style-button" data-edge-style="straight" aria-label="Прямая" title="Прямая" aria-pressed="false">
+              <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 24 L28 8"/></svg>
+              <span class="edge-style-label">Прямая</span>
+            </button>
+            <button type="button" class="edge-style-button" data-edge-style="square" aria-label="Квадратная" title="Квадратная" aria-pressed="false">
+              <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M4 24 H15 V8 H28"/></svg>
+              <span class="edge-style-label">Квадратная</span>
+            </button>
+            <button type="button" class="edge-style-button" data-edge-style="dashed" aria-label="Пунктирная" title="Пунктирная" aria-pressed="false">
+              <svg class="dashed-preview" viewBox="0 0 32 32" aria-hidden="true"><path d="M4 23 C11 23 11 9 28 9"/></svg>
+              <span class="edge-style-label">Пунктирная</span>
+            </button>
+          </div>
+        </div>
+        <div class="modal-actions"><button id="modalCancel">Удалить</button><button class="danger" id="modalConfirm">Сохранить</button></div>
       </div>
     </div>
   </main>

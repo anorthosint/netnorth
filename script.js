@@ -36,6 +36,7 @@
   const importFile = document.getElementById('importFile');
   const imageFile = document.getElementById('imageFile');
   const modalBackdrop = document.getElementById('modalBackdrop');
+  const edgeStyleOptions = document.getElementById('edgeStyleOptions');
   const exitConfirmBackdrop = document.getElementById('exitConfirmBackdrop');
   const exitSaveBtn = document.getElementById('exitSaveBtn');
   const exitWithoutSaveBtn = document.getElementById('exitWithoutSaveBtn');
@@ -72,6 +73,7 @@
   let editingId = null;
   let editingOriginalText = null;
   let mode = 'select';
+  let lastCreatedNodeTime = 0;
   let connectionSourceId = null;
   let drag = null;
   let activeMoveHandler = null;
@@ -888,7 +890,8 @@
     const edges = Array.isArray(input && input.edges) ? input.edges.slice(0, 2000).filter(e => e && ids.has(e.from) && ids.has(e.to) && e.from !== e.to).map(e => ({
       id: String(e.id || safeId()), from: String(e.from), to: String(e.to),
       fromSide: validSide(e.fromSide) ? e.fromSide : 'right',
-      toSide: validSide(e.toSide) ? e.toSide : 'left'
+      toSide: validSide(e.toSide) ? e.toSide : 'left',
+      style: ['curved', 'straight', 'square', 'dashed'].includes(e.style) ? e.style : 'curved'
     })) : [];
     return { nodes, edges };
   }
@@ -941,8 +944,15 @@
   }
 
   function getStagePoint(event) {
+    // getBoundingClientRect() already includes the current workspace scroll and
+    // transformed stage offset. Dividing by zoom converts viewport pixels back
+    // to the stage's local scene coordinates without changing camera position.
     const rect = stage.getBoundingClientRect();
-    return { x: Math.max(0, (event.clientX - rect.left) / zoom), y: Math.max(0, (event.clientY - rect.top) / zoom) };
+    const safeZoom = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+    return {
+      x: Math.max(0, (event.clientX - rect.left) / safeZoom),
+      y: Math.max(0, (event.clientY - rect.top) / safeZoom)
+    };
   }
   function syncZoomLayout(baseWidth, baseHeight) {
     stage.style.left = `${CANVAS_PAD * zoom}px`;
@@ -987,18 +997,255 @@
     if (side === 'bottom') return { x: n.x + width / 2, y: n.y + height };
     return { x: n.x, y: n.y + height / 2 };
   }
-  function chooseSides(a, b) {
+  function chooseSides(a, b, preferredFromSide = null) {
     const ea = renderedNodeElements.get(a.id);
     const eb = renderedNodeElements.get(b.id);
     const aw = ea ? ea.offsetWidth : a.width, ah = ea ? ea.offsetHeight : a.height;
     const bw = eb ? eb.offsetWidth : b.width, bh = eb ? eb.offsetHeight : b.height;
-    const dx = (b.x + bw/2) - (a.x + aw/2);
-    const dy = (b.y + bh/2) - (a.y + ah/2);
-    if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? { fromSide: 'right', toSide: 'left' } : { fromSide: 'left', toSide: 'right' };
-    return dy >= 0 ? { fromSide: 'bottom', toSide: 'top' } : { fromSide: 'top', toSide: 'bottom' };
+    const dx = (b.x + bw / 2) - (a.x + aw / 2);
+    const dy = (b.y + bh / 2) - (a.y + ah / 2);
+
+    // Keep siblings attached to the same side of their parent. Pairwise
+    // geometry alone can otherwise send a vertically displaced child to top
+    // or bottom even though the parent's branch is predominantly on the right.
+    const outgoing = scene.edges.filter(edge =>
+      edge.from === a.id && validSide(edge.fromSide)
+    );
+    let preferredSide = null;
+
+    if (outgoing.length) {
+      const counts = new Map();
+      outgoing.forEach(edge => {
+        counts.set(edge.fromSide, (counts.get(edge.fromSide) || 0) + 1);
+      });
+      const maxCount = Math.max(...counts.values());
+      const leaders = [...counts.entries()]
+        .filter(([, count]) => count === maxCount)
+        .map(([side]) => side);
+
+      if (validSide(preferredFromSide) && leaders.includes(preferredFromSide)) {
+        preferredSide = preferredFromSide;
+      } else {
+        preferredSide = leaders[0] || null;
+      }
+    }
+
+    const oppositeSide = {
+      top: 'bottom',
+      right: 'left',
+      bottom: 'top',
+      left: 'right'
+    };
+
+    if (preferredSide) {
+      return { fromSide: preferredSide, toSide: oppositeSide[preferredSide] };
+    }
+
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      return dx >= 0
+        ? { fromSide: 'right', toSide: 'left' }
+        : { fromSide: 'left', toSide: 'right' };
+    }
+
+    return dy >= 0
+      ? { fromSide: 'bottom', toSide: 'top' }
+      : { fromSide: 'top', toSide: 'bottom' };
   }
-  function pathFor(aPoint, bPoint, fromSide, toSide) {
-    const curve = Math.max(28, Math.min(110, Math.max(Math.abs(bPoint.x - aPoint.x), Math.abs(bPoint.y - aPoint.y)) * .42));
+
+  function edgeSideVector(side) {
+    const vectors = {
+      top: { x: 0, y: -1 },
+      right: { x: 1, y: 0 },
+      bottom: { x: 0, y: 1 },
+      left: { x: -1, y: 0 }
+    };
+    return vectors[side] || vectors.right;
+  }
+
+  function buildSquareRouteContexts(edges, nodesById, pointForNode) {
+    const groups = new Map();
+    const getNode = id => nodesById && typeof nodesById.get === 'function'
+      ? nodesById.get(id)
+      : null;
+
+    edges.forEach(edge => {
+      if (edge.style !== 'square' || !validSide(edge.fromSide) || !validSide(edge.toSide)) return;
+      const key = `${edge.from}::${edge.fromSide}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(edge);
+    });
+
+    const contexts = new Map();
+    const median = values => {
+      if (!values.length) return 0;
+      const ordered = [...values].sort((a, b) => a - b);
+      const middle = Math.floor(ordered.length / 2);
+      return ordered.length % 2
+        ? ordered[middle]
+        : (ordered[middle - 1] + ordered[middle]) / 2;
+    };
+
+    groups.forEach(groupEdges => {
+      if (groupEdges.length < 2) return;
+      const firstEdge = groupEdges[0];
+      const source = getNode(firstEdge.from);
+      if (!source) return;
+
+      const sourcePoint = pointForNode(source, firstEdge.fromSide);
+      const horizontalSource = firstEdge.fromSide === 'left' || firstEdge.fromSide === 'right';
+      const direction = firstEdge.fromSide === 'right' || firstEdge.fromSide === 'bottom' ? 1 : -1;
+      const sourceCoordinate = horizontalSource ? sourcePoint.x : sourcePoint.y;
+      const outwardDistances = [];
+
+      groupEdges.forEach(edge => {
+        const target = getNode(edge.to);
+        if (!target) return;
+        const targetPoint = pointForNode(target, edge.toSide);
+        const targetCoordinate = horizontalSource ? targetPoint.x : targetPoint.y;
+        const distance = (targetCoordinate - sourceCoordinate) * direction;
+        if (distance > 0.5) outwardDistances.push(distance);
+      });
+
+      // One median-based axis is shared by every edge from this parent side.
+      // It avoids a different bend point for each child and is less affected
+      // by a single unusually distant node than a mean-based calculation.
+      const fallbackDistances = groupEdges.map(edge => {
+        const target = getNode(edge.to);
+        if (!target) return 0;
+        const targetPoint = pointForNode(target, edge.toSide);
+        const coordinate = horizontalSource ? targetPoint.x : targetPoint.y;
+        return Math.abs(coordinate - sourceCoordinate);
+      }).filter(distance => distance > 0.5);
+      const distanceToBranch = median(outwardDistances.length ? outwardDistances : fallbackDistances);
+      const axis = sourceCoordinate + direction * distanceToBranch * 0.5;
+
+      groupEdges.forEach(edge => {
+        contexts.set(edge.id, {
+          axis,
+          horizontalSource,
+          fromSide: firstEdge.fromSide,
+          siblingCount: groupEdges.length
+        });
+      });
+    });
+
+    return contexts;
+  }
+
+  function squarePathPoints(aPoint, bPoint, fromSide, toSide, routeContext = null) {
+    const fromVector = edgeSideVector(fromSide);
+    const toVector = edgeSideVector(toSide);
+    const fromIsHorizontal = fromVector.x !== 0;
+    const toIsHorizontal = toVector.x !== 0;
+
+    const compactPoints = points => points.filter((point, index) => {
+      if (!index) return true;
+      const previous = points[index - 1];
+      return Math.abs(point.x - previous.x) > 0.001 || Math.abs(point.y - previous.y) > 0.001;
+    });
+
+    if (routeContext && Number.isFinite(routeContext.axis)) {
+      const axis = routeContext.axis;
+      let points;
+
+      if (fromIsHorizontal) {
+        if (toIsHorizontal) {
+          // Shared vertical trunk: parent-to-trunk segments overlap exactly,
+          // and each child branches horizontally at its own anchor height.
+          points = [
+            aPoint,
+            { x: axis, y: aPoint.y },
+            { x: axis, y: bPoint.y },
+            bPoint
+          ];
+        } else {
+          // Preserve the same vertical trunk even when a child is attached
+          // from its top/bottom. The final short segment approaches that side.
+          const sideDirection = toSide === 'top' ? -1 : 1;
+          const stub = Math.min(24, Math.max(8, Math.abs(bPoint.y - aPoint.y) * 0.2));
+          const branchY = bPoint.y + sideDirection * stub;
+          points = [
+            aPoint,
+            { x: axis, y: aPoint.y },
+            { x: axis, y: branchY },
+            { x: bPoint.x, y: branchY },
+            bPoint
+          ];
+        }
+      } else if (!toIsHorizontal) {
+        // Shared horizontal trunk for top/bottom parent branches.
+        points = [
+          aPoint,
+          { x: aPoint.x, y: axis },
+          { x: bPoint.x, y: axis },
+          bPoint
+        ];
+      } else {
+        // A child connected through its left/right side gets a small approach
+        // stub while still branching from the parent's common horizontal rail.
+        const sideDirection = toSide === 'left' ? -1 : 1;
+        const stub = Math.min(24, Math.max(8, Math.abs(bPoint.x - aPoint.x) * 0.2));
+        const branchX = bPoint.x + sideDirection * stub;
+        points = [
+          aPoint,
+          { x: aPoint.x, y: axis },
+          { x: branchX, y: axis },
+          { x: branchX, y: bPoint.y },
+          bPoint
+        ];
+      }
+
+      return compactPoints(points);
+    }
+
+    // For a standalone edge, scale the stubs to the separation along the
+    // parent's exit axis. A fixed 24px minimum made close nodes overshoot and
+    // created loops or sharp kinks when their anchors were nearly aligned.
+    const axisDistance = fromIsHorizontal
+      ? Math.abs(bPoint.x - aPoint.x)
+      : Math.abs(bPoint.y - aPoint.y);
+    const span = Math.max(0, Math.min(
+      80,
+      Math.max(8, axisDistance * 0.25),
+      axisDistance * 0.45
+    ));
+
+    const start = {
+      x: aPoint.x + fromVector.x * span,
+      y: aPoint.y + fromVector.y * span
+    };
+    const end = {
+      x: bPoint.x + toVector.x * span,
+      y: bPoint.y + toVector.y * span
+    };
+
+    let bends;
+    if (fromIsHorizontal && toIsHorizontal) {
+      const middleX = (start.x + end.x) / 2;
+      bends = [{ x: middleX, y: start.y }, { x: middleX, y: end.y }];
+    } else if (!fromIsHorizontal && !toIsHorizontal) {
+      const middleY = (start.y + end.y) / 2;
+      bends = [{ x: start.x, y: middleY }, { x: end.x, y: middleY }];
+    } else if (fromIsHorizontal) {
+      bends = [{ x: end.x, y: start.y }];
+    } else {
+      bends = [{ x: start.x, y: end.y }];
+    }
+
+    return compactPoints([aPoint, start, ...bends, end, bPoint]);
+  }
+
+  function edgeRouteFor(aPoint, bPoint, fromSide, toSide, style = 'curved', routeContext = null) {
+    if (style === 'straight') {
+      return { type: 'line', points: [aPoint, bPoint] };
+    }
+    if (style === 'square') {
+      return { type: 'polyline', points: squarePathPoints(aPoint, bPoint, fromSide, toSide, routeContext) };
+    }
+
+    // Both curved and dashed use the same cubic Bézier geometry.
+    const curve = Math.max(28, Math.min(110,
+      Math.max(Math.abs(bPoint.x - aPoint.x), Math.abs(bPoint.y - aPoint.y)) * 0.42));
     let c1x = aPoint.x, c1y = aPoint.y, c2x = bPoint.x, c2y = bPoint.y;
     if (fromSide === 'right') c1x += curve;
     if (fromSide === 'left') c1x -= curve;
@@ -1008,7 +1255,24 @@
     if (toSide === 'left') c2x -= curve;
     if (toSide === 'top') c2y -= curve;
     if (toSide === 'bottom') c2y += curve;
-    return `M ${aPoint.x} ${aPoint.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${bPoint.x} ${bPoint.y}`;
+    return {
+      type: 'bezier',
+      c1: { x: c1x, y: c1y },
+      c2: { x: c2x, y: c2y }
+    };
+  }
+
+  function pathFor(aPoint, bPoint, fromSide, toSide, style = 'curved', routeContext = null) {
+    const route = edgeRouteFor(aPoint, bPoint, fromSide, toSide, style, routeContext);
+    if (route.type === 'line') {
+      return `M ${aPoint.x} ${aPoint.y} L ${bPoint.x} ${bPoint.y}`;
+    }
+    if (route.type === 'polyline') {
+      return route.points.map((point, index) =>
+        `${index ? 'L' : 'M'} ${point.x} ${point.y}`
+      ).join(' ');
+    }
+    return `M ${aPoint.x} ${aPoint.y} C ${route.c1.x} ${route.c1.y}, ${route.c2.x} ${route.c2.y}, ${bPoint.x} ${bPoint.y}`;
   }
 
   function addResizeHandles(element, nodeId) {
@@ -1377,12 +1641,20 @@
     const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     arrow.setAttribute('d', 'M 0 1 L 9 5 L 0 9 z'); arrow.setAttribute('fill', '#171717');
     marker.appendChild(arrow); defs.appendChild(marker); svg.appendChild(defs);
+    const squareRouteContexts = buildSquareRouteContexts(
+      model.edges,
+      modelNodesById,
+      (node, side) => getStageNodePoint(node, side)
+    );
     model.edges.forEach(edge => {
       const a = modelNodesById.get(edge.from), b = modelNodesById.get(edge.to);
       if (!a || !b) return;
       const aPoint = getStageNodePoint(a, edge.fromSide);
       const bPoint = getStageNodePoint(b, edge.toSide);
-      const d = pathFor(aPoint, bPoint, edge.fromSide, edge.toSide);
+      const d = pathFor(
+        aPoint, bPoint, edge.fromSide, edge.toSide, edge.style,
+        squareRouteContexts.get(edge.id)
+      );
       const hit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       hit.setAttribute('class', 'edge-hit');
       hit.setAttribute('d', d);
@@ -1405,7 +1677,10 @@
         openSelectedEdgesActions(edge.id, event);
       });
       const p = document.createElementNS('http://www.w3.org/2000/svg','path');
-      p.setAttribute('class', !isPlayback && selectedEdgeIds.includes(edge.id) ? 'edge selected' : 'edge');
+      const edgeClasses = ['edge'];
+      if (!isPlayback && selectedEdgeIds.includes(edge.id)) edgeClasses.push('selected');
+      if (edge.style === 'dashed') edgeClasses.push('dashed');
+      p.setAttribute('class', edgeClasses.join(' '));
       p.setAttribute('d', d);
       p.dataset.edgeId = edge.id;
       p.setAttribute('marker-end', 'url(#edgeArrow)');
@@ -1465,6 +1740,7 @@
 
     const n = {
       id: safeId(),
+      createdAt: Date.now(),
       x: Math.max(0, Math.round(nodeX)),
       y: Math.max(0, Math.round(nodeY)),
       text: '',
@@ -1495,15 +1771,7 @@
       stage.querySelector('[data-node-id="' + n.id + '"]');
     const newEditor = createdNodeElement && createdNodeElement.querySelector('.node-text');
 
-    // Bring the just-created node into the visible workspace area. Browsers
-    // choose the nearest scroll container, which is #workspace in this layout.
-    if (createdNodeElement && typeof createdNodeElement.scrollIntoView === 'function') {
-      try {
-        createdNodeElement.scrollIntoView({ block: 'center', inline: 'center' });
-      } catch (_) {
-        createdNodeElement.scrollIntoView(true);
-      }
-    }
+    // Keep the camera fixed: node placement uses the stage-local x/y passed in.
 
     if (newEditor) {
       // WebKit may inherit the canvas' touch-selection suppression. Explicitly
@@ -1549,6 +1817,9 @@
       } else if (!save && editingOriginalText !== null) {
         n.text = editingOriginalText;
       }
+    }
+    if (n && !n.text.trim() && n.createdAt && (Date.now() - n.createdAt < 1500)) {
+      return;
     }
     editingId = null;
     editingOriginalText = null;
@@ -1608,11 +1879,9 @@
     }
     window.removeEventListener('pointercancel', cancelPointerGesture);
 
-    // Remove the app-level touch listeners together with the active gesture.
-    // handleWorkspaceTouchDown / attachPointerGesture re-arm them for the next one.
-    window.removeEventListener('pointermove', handleWorkspaceTouchMove);
-    window.removeEventListener('pointerup', handleWorkspaceTouchEnd);
-    window.removeEventListener('pointercancel', handleWorkspaceTouchEnd);
+    // App-level touch tracking listeners remain registered for the lifetime
+    // of the application. Only the temporary active gesture callbacks above
+    // are detached here.
   }
 
   function attachPointerGesture(moveHandler, upHandler) {
@@ -1777,7 +2046,32 @@
 
   function updateRenderedEdgesForNodes(nodeIds) {
     const edgeIds = new Set();
-    nodeIds.forEach(id => (renderedNodeToEdges.get(id) || []).forEach(edgeId => edgeIds.add(edgeId)));
+    const affectedSquareGroups = new Set();
+
+    nodeIds.forEach(id => {
+      (renderedNodeToEdges.get(id) || []).forEach(edgeId => {
+        edgeIds.add(edgeId);
+        const edge = scene.edges.find(item => item.id === edgeId);
+        if (edge && edge.style === 'square') {
+          affectedSquareGroups.add(`${edge.from}::${edge.fromSide}`);
+        }
+      });
+    });
+
+    if (affectedSquareGroups.size) {
+      scene.edges.forEach(edge => {
+        if (edge.style === 'square' && affectedSquareGroups.has(`${edge.from}::${edge.fromSide}`)) {
+          edgeIds.add(edge.id);
+        }
+      });
+    }
+
+    const squareRouteContexts = buildSquareRouteContexts(
+      scene.edges,
+      renderedNodeModels,
+      (node, side) => getStageNodePoint(node, side)
+    );
+
     edgeIds.forEach(edgeId => {
       const bundle = renderedEdgeElements.get(edgeId);
       if (!bundle) return;
@@ -1785,7 +2079,14 @@
       const from = renderedNodeModels.get(edge.from);
       const to = renderedNodeModels.get(edge.to);
       if (!from || !to) return;
-      const d = pathFor(getStageNodePoint(from, edge.fromSide), getStageNodePoint(to, edge.toSide), edge.fromSide, edge.toSide);
+      const d = pathFor(
+        getStageNodePoint(from, edge.fromSide),
+        getStageNodePoint(to, edge.toSide),
+        edge.fromSide,
+        edge.toSide,
+        edge.style,
+        squareRouteContexts.get(edge.id)
+      );
       bundle.hit.setAttribute('d', d);
       bundle.line.setAttribute('d', d);
     });
@@ -2023,27 +2324,25 @@
       .filter(Boolean);
     if (targets.length < 2) return false;
 
-    // Arrange around the siblings' existing center, not around the parent.
-    // This removes small placement inconsistencies while preserving the
-    // approximate location the user chose for the whole branch.
-    const horizontalGap = 56;
-    const verticalGap = 13.5;
+    const horizontalGap = 24;
+    const verticalGap = 4;
     const before = new Map(targets.map(node => [node.id, { x: node.x, y: node.y }]));
     const widthOf = node => Math.max(10, Number(node.width) || 10);
     const heightOf = node => Math.max(10, Number(node.height) || 10);
     let ordered;
 
     if (side === 'right' || side === 'left') {
-      // Keep the existing vertical order. Snap siblings to a shared vertical
-      // alignment and compact the gaps around their current vertical centroid.
-      ordered = [...targets].sort((a, b) => (a.y + heightOf(a) / 2) - (b.y + heightOf(b) / 2));
+      // Keep the sibling order but center the complete column on the parent's
+      // vertical midpoint, not on the children's previous average position.
+      ordered = [...targets].sort((a, b) =>
+        (a.y + heightOf(a) / 2) - (b.y + heightOf(b) / 2)
+      );
       const totalHeight = ordered.reduce((sum, node) => sum + heightOf(node), 0)
         + verticalGap * (ordered.length - 1);
-      const currentCenterY = ordered.reduce((sum, node) => sum + node.y + heightOf(node) / 2, 0) / ordered.length;
-      let y = Math.max(0, currentCenterY - totalHeight / 2);
+      const sourceCenterY = source.y + heightOf(source) / 2;
+      let y = sourceCenterY - totalHeight / 2;
 
-      // Align the edge facing the parent, but derive the position from the
-      // nodes' existing coordinates instead of imposing a parent-relative offset.
+      // Keep the existing branch depth while aligning all sibling faces.
       const alignedEdge = side === 'right'
         ? ordered.reduce((sum, node) => sum + node.x, 0) / ordered.length
         : ordered.reduce((sum, node) => sum + node.x + widthOf(node), 0) / ordered.length;
@@ -2057,13 +2356,15 @@
         y += heightOf(node) + verticalGap;
       });
     } else {
-      // For top/bottom branches, retain left-to-right order, align siblings
-      // horizontally and compact them around their current horizontal centroid.
-      ordered = [...targets].sort((a, b) => (a.x + widthOf(a) / 2) - (b.x + widthOf(b) / 2));
+      // For top/bottom branches, keep left-to-right order and center the row
+      // on the parent's horizontal midpoint.
+      ordered = [...targets].sort((a, b) =>
+        (a.x + widthOf(a) / 2) - (b.x + widthOf(b) / 2)
+      );
       const totalWidth = ordered.reduce((sum, node) => sum + widthOf(node), 0)
         + horizontalGap * (ordered.length - 1);
-      const currentCenterX = ordered.reduce((sum, node) => sum + node.x + widthOf(node) / 2, 0) / ordered.length;
-      let x = Math.max(0, currentCenterX - totalWidth / 2);
+      const sourceCenterX = source.x + widthOf(source) / 2;
+      let x = sourceCenterX - totalWidth / 2;
 
       const alignedEdge = side === 'bottom'
         ? ordered.reduce((sum, node) => sum + node.y, 0) / ordered.length
@@ -2079,12 +2380,16 @@
       });
     }
 
-    // Keep arrowheads attached to the side facing the source branch.
-    const targetSide = ({ right: 'left', left: 'right', top: 'bottom', bottom: 'top' })[side];
-    const arrangedIds = new Set(targets.map(node => node.id));
+    // Recalculate both sides against the final positions. The current side is
+    // passed as a tie-breaker; chooseSides still promotes a clear majority side
+    // for all siblings of the same parent.
     scene.edges.forEach(edge => {
-      if (edge.from === sourceId && edge.fromSide === side && arrangedIds.has(edge.to)) {
-        edge.toSide = targetSide;
+      const sourceNode = nodeById(edge.from);
+      const targetNode = nodeById(edge.to);
+      if (sourceNode && targetNode) {
+        const dynamicSides = chooseSides(sourceNode, targetNode, edge.fromSide);
+        edge.fromSide = dynamicSides.fromSide;
+        edge.toSide = dynamicSides.toSide;
       }
     });
 
@@ -2096,11 +2401,40 @@
 
   function addEdge(from, to, fromSide, toSide) {
     if (from === to) { renderScene(); return; }
-    const exists = scene.edges.some(e => e.from === from && e.to === to && e.fromSide === fromSide && e.toSide === toSide);
-    if (exists) { renderScene(); showToast('Такая связь уже существует'); return; }
-    scene.edges.push({ id: safeId(), from, to, fromSide, toSide });
-    const autoArranged = autoArrangeEnabled ? autoArrangeBranch(from, fromSide) : false;
-    selectedId = from; selectedIds.splice(0, selectedIds.length, from);
+
+    const exists = scene.edges.some(edge =>
+      edge.from === from &&
+      edge.to === to &&
+      edge.fromSide === fromSide &&
+      edge.toSide === toSide
+    );
+
+    if (exists) {
+      renderScene();
+      showToast('Такая связь уже существует');
+      return;
+    }
+
+    const currentGlobalStyle =
+      scene.edges.length > 0 && scene.edges[0].style
+        ? scene.edges[0].style
+        : 'curved';
+
+    scene.edges.push({
+      id: safeId(),
+      from,
+      to,
+      fromSide,
+      toSide,
+      style: currentGlobalStyle
+    });
+
+    const autoArranged = autoArrangeEnabled
+      ? autoArrangeBranch(from, fromSide)
+      : false;
+
+    selectedId = from;
+    selectedIds.splice(0, selectedIds.length, from);
     commitScene(autoArranged ? 'Ветки выровнены с равными отступами' : 'Связь добавлена');
   }
 
@@ -2463,39 +2797,25 @@
     });
   }
 
-  nodeContextMenu.addEventListener('click', event => {
+  nodeContextMenu.addEventListener('pointerdown', event => {
     const menuTarget = event.target instanceof Element ? event.target : null;
     const canvasButton = menuTarget ? menuTarget.closest('[data-canvas-action]') : null;
     const isCreateTextAction = !!(canvasButton && canvasButton.dataset.canvasAction === 'create-text');
 
     if (isCreateTextAction) {
-      // Consume the trusted menu click synchronously. Do not defer these calls:
-      // Firefox and WebKit may otherwise let the click trigger canvas behavior.
+      // Handle the trusted pointerdown directly so mobile browsers can open
+      // the software keyboard while the user activation is still active.
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
 
       const point = { ...contextCanvasPoint };
-      const createdNode = createNodeAt(point.x, point.y);
-      if (!createdNode) {
-        console.error('[NetNotrh] create-text action did not return a node');
-        return;
-      }
 
-      // Re-assert focus while the click action is still active. createNodeAt()
-      // also focuses synchronously; this lookup verifies that the editor exists.
-      const newEditor = stage.querySelector(
-        '[data-node-id="' + createdNode.id + '"] .node-text'
-      );
-      if (newEditor) {
-        try { newEditor.focus({ preventScroll: true }); } catch (_) { newEditor.focus(); }
-        placeCaretAtEnd(newEditor);
-      }
+      // Dismiss the sheet before creating/focusing the editor so it cannot
+      // cover the new node or steal the pointer sequence.
+      closeNodeContextMenu();
 
-      // Keep the sheet in place until the created editor has acquired focus.
-      window.setTimeout(() => {
-        closeNodeContextMenu();
-      }, 50);
+      createNodeAt(point.x, point.y);
       return;
     }
 
@@ -2566,22 +2886,47 @@
   }
 
   function closeConfirm(runCancelAction = false) {
-    const cancelAction = runCancelAction ? confirmCancelCallback : null;
+    // Выполняем отмену только если обе функции относятся к актуальному модальному окну.
+    const cancelAction = (
+      runCancelAction &&
+      typeof confirmCancelCallback === 'function' &&
+      typeof confirmCallback === 'function'
+    ) ? confirmCancelCallback : null;
 
-    // Сначала закрываем модальное окно и очищаем его состояние.
-    // Отменяющее действие запускаем после обновления DOM, чтобы renderScene()
-    // не перестраивал интерфейс поверх ещё видимой модалки.
+    // Сначала отсоединяем callbacks, чтобы повторное закрытие не вызвало их снова.
     confirmCallback = null;
     confirmCancelCallback = null;
+
     modalBackdrop.classList.remove('visible');
+
+    if (edgeStyleOptions) {
+      edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
+        button.classList.remove('active');
+        button.setAttribute('aria-pressed', 'false');
+        button.onclick = null;
+      });
+      edgeStyleOptions.hidden = true;
+    }
+
+    tempSelectedStyle = null;
     document.getElementById('modalCancel').textContent = 'Отмена';
 
-    if (cancelAction) window.setTimeout(cancelAction, 0);
+    // Отложенный вызов не позволяет callback вмешаться в текущую очистку модалки.
+    if (cancelAction) window.setTimeout(() => cancelAction(), 0);
   }
 
   function clearSelection() {
+    tempSelectedStyle = null;
     confirmCallback = null;
     confirmCancelCallback = null;
+    if (edgeStyleOptions) {
+      edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
+        button.classList.remove('active');
+        button.setAttribute('aria-pressed', 'false');
+        button.onclick = null;
+      });
+      edgeStyleOptions.hidden = true;
+    }
     selectedId = null;
     selectedIds.splice(0);
     selectedEdgeIds.splice(0);
@@ -2590,12 +2935,44 @@
     updateActionButtons();
   }
 
+  function getEdgePropertyTargets() {
+    // Edge appearance is a document-wide setting: every change in this modal
+    // is applied to every connection in the current scene.
+    return scene.edges;
+  }
+
+  let tempSelectedStyle = null;
+
+  function applyEdgeProperty(property, value) {
+    if (property !== 'style') return;
+    if (!['curved', 'straight', 'square', 'dashed'].includes(value)) return;
+    tempSelectedStyle = value;
+    if (!edgeStyleOptions) return;
+    edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
+      const active = button.dataset.edgeStyle === tempSelectedStyle;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  }
+
+  function updateEdgeStyleOptionsActive() {
+    if (!edgeStyleOptions) return;
+    const styles = scene.edges.map(edge => edge.style || 'curved');
+    const commonStyle = styles.length && styles.every(style => style === styles[0])
+      ? styles[0]
+      : null;
+
+    edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
+      const active = button.dataset.edgeStyle === commonStyle;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  }
+
   function openSelectedEdgesActions(edgeId = null, sourceEvent = null) {
-    // Pointerup/contextmenu handlers pass their event so native browser actions
-    // are suppressed before opening the application modal.
     if (sourceEvent) {
       if (sourceEvent.cancelable) sourceEvent.preventDefault();
-      if (typeof sourceEvent.stopPropagation === 'function') sourceEvent.stopPropagation();
+      if (sourceEvent.stopPropagation) sourceEvent.stopPropagation();
     }
 
     if (edgeId && !selectedEdgeIds.includes(edgeId)) {
@@ -2604,21 +2981,46 @@
       selectedEdgeIds.splice(0, selectedEdgeIds.length, edgeId);
       renderScene();
     }
+
     if (!selectedEdgeIds.length) return;
 
     closeNodeContextMenu();
+
     const selectedEdgeSnapshot = [...selectedEdgeIds];
     const edgeCount = selectedEdgeSnapshot.length;
+    const initialEdge = scene.edges.find(e => e.id === selectedEdgeIds[0]);
+    tempSelectedStyle = initialEdge && initialEdge.style ? initialEdge.style : 'curved';
+
     openConfirm(
       edgeCount > 1 ? `Выбрано связей: ${edgeCount}` : 'Выбрана связь',
-      'Можно отменить выделение или удалить выбранные связи.',
+      'Выберите стиль для всех связей или удалите выбранные связи.',
+      'Сохранить',
+      () => {
+        scene.edges.forEach(edge => {
+          edge.style = tempSelectedStyle || 'curved';
+        });
+        commitScene('Стиль связей обновлен');
+      },
       'Удалить',
-      () => removeEdgesById(selectedEdgeSnapshot, edgeCount > 1 ? 'Связи удалены' : 'Связь удалена'),
-      'Отменить выделение',
-      clearSelection
+      () => removeEdgesById(
+        selectedEdgeSnapshot,
+        edgeCount > 1 ? 'Связи удалены' : 'Связь удалена'
+      )
     );
-  }
 
+    if (edgeStyleOptions) {
+      edgeStyleOptions.hidden = false;
+      edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
+        button.onclick = () => {
+          applyEdgeProperty('style', button.dataset.edgeStyle);
+        };
+
+        const active = button.dataset.edgeStyle === tempSelectedStyle;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', String(active));
+      });
+    }
+  }
   function exportProject() {
     if (editingId) finishEditing(editingId, true);
     if (!scene.nodes.length) { showToast('Добавь хотя бы один узел для экспорта'); return; }
@@ -2696,15 +3098,6 @@
         return { x, y: y + h / 2 };
       }
 
-      function edgeCurve(point, side, curve) {
-        const result = { x: point.x, y: point.y };
-        if (side === 'right') result.x += curve;
-        if (side === 'left') result.x -= curve;
-        if (side === 'top') result.y -= curve;
-        if (side === 'bottom') result.y += curve;
-        return result;
-      }
-
       // Bounds start with every node's rectangle, then include curve control
       // points and arrowheads so links at the outside of a graph aren't clipped.
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -2724,18 +3117,24 @@
       });
 
       const edgeGeometry = [];
+      const exportNodesById = new Map(nodes.map(node => [node.id, node]));
+      const squareRouteContexts = buildSquareRouteContexts(scene.edges, exportNodesById, nodePoint);
       scene.edges.forEach(edge => {
         const a = nodeById(edge.from), b = nodeById(edge.to);
         if (!a || !b) return;
         const ap = nodePoint(a, edge.fromSide);
         const bp = nodePoint(b, edge.toSide);
-        const curve = Math.max(28, Math.min(110,
-          Math.max(Math.abs(bp.x - ap.x), Math.abs(bp.y - ap.y)) * .42));
-        const c1 = edgeCurve(ap, edge.fromSide, curve);
-        const c2 = edgeCurve(bp, edge.toSide, curve);
-        edgeGeometry.push({ edge, ap, bp, c1, c2 });
-        includePoint(c1.x, c1.y);
-        includePoint(c2.x, c2.y);
+        const route = edgeRouteFor(
+          ap, bp, edge.fromSide, edge.toSide, edge.style,
+          squareRouteContexts.get(edge.id)
+        );
+        edgeGeometry.push({ edge, ap, bp, route });
+        if (route.type === 'bezier') {
+          includePoint(route.c1.x, route.c1.y);
+          includePoint(route.c2.x, route.c2.y);
+        } else {
+          route.points.forEach(point => includePoint(point.x, point.y));
+        }
         // Exported arrowhead has a 7px tip length and 4.2px wings in scene units.
         includePoint(bp.x, bp.y, 12);
       });
@@ -2790,20 +3189,34 @@
       ctx.fillStyle = background;
       ctx.fillRect(0, 0, W, H);
 
-      edgeGeometry.forEach(({ edge, ap, bp, c1, c2 }) => {
+      edgeGeometry.forEach(({ edge, ap, bp, route }) => {
         ctx.beginPath();
         ctx.moveTo(tx + ap.x * scale, ty + ap.y * scale);
-        ctx.bezierCurveTo(
-          tx + c1.x * scale, ty + c1.y * scale,
-          tx + c2.x * scale, ty + c2.y * scale,
-          tx + bp.x * scale, ty + bp.y * scale
-        );
+        if (route.type === 'bezier') {
+          ctx.bezierCurveTo(
+            tx + route.c1.x * scale, ty + route.c1.y * scale,
+            tx + route.c2.x * scale, ty + route.c2.y * scale,
+            tx + bp.x * scale, ty + bp.y * scale
+          );
+        } else {
+          route.points.slice(1).forEach(point => {
+            ctx.lineTo(tx + point.x * scale, ty + point.y * scale);
+          });
+        }
         ctx.strokeStyle = dark ? '#e7e7e7' : '#111111';
         ctx.lineWidth = Math.max(1, 1.7 * scale);
+        ctx.setLineDash(edge.style === 'dashed' ? [6, 6] : []);
         ctx.stroke();
+        ctx.setLineDash([]);
 
         const angles = { left: 0, right: Math.PI, top: Math.PI / 2, bottom: -Math.PI / 2 };
-        const angle = angles[edge.toSide] ?? 0;
+        let angle = angles[edge.toSide] ?? 0;
+        if (route.type === 'line') {
+          angle = Math.atan2(bp.y - ap.y, bp.x - ap.x);
+        } else if (route.type === 'polyline' && route.points.length > 1) {
+          const previous = route.points[route.points.length - 2];
+          angle = Math.atan2(bp.y - previous.y, bp.x - previous.x);
+        }
         const tipX = tx + bp.x * scale, tipY = ty + bp.y * scale;
         // Keep arrowheads proportional to export scale while limiting extremes.
         const arrowSize = Math.max(4, Math.min(14, 7 * scale));
@@ -3597,8 +4010,8 @@
     commitScene('Рабочее поле очищено');
   }));
   document.getElementById('modalCancel').addEventListener('click', () => closeConfirm(true));
-  document.getElementById('modalConfirm').addEventListener('click', () => { const fn = confirmCallback; closeConfirm(false); if (fn) fn(); });
-  modalBackdrop.addEventListener('pointerdown', event => { if (event.target === modalBackdrop) closeConfirm(true); });
+  document.getElementById('modalConfirm').addEventListener('click', () => { const fn = confirmCallback; try { if (fn) fn(); } finally { closeConfirm(false); } });
+  modalBackdrop.addEventListener('pointerdown', event => { if (event.target === modalBackdrop) closeConfirm(false); });
 
   exitSaveBtn.addEventListener('click', saveAndExitToStartScreen);
   exitWithoutSaveBtn.addEventListener('click', exitWithoutSavingToStartScreen);
