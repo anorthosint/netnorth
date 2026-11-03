@@ -37,6 +37,12 @@
   const imageFile = document.getElementById('imageFile');
   const modalBackdrop = document.getElementById('modalBackdrop');
   const edgeStyleOptions = document.getElementById('edgeStyleOptions');
+  const edgeColorToggle = document.getElementById('edgeColorToggle');
+  const edgeColorPalette = document.getElementById('edgeColorPalette');
+  const edgeColorPreview = document.getElementById('edgeColorPreview');
+  const edgeBidirectionalInput = document.getElementById('edgeBidirectional');
+  const edgeArrowheadInput = document.getElementById('edgeArrowhead');
+  const EDGE_COLORS = ['#111111', '#4b4b4b', '#888888', '#bf2929', '#185abc', '#267344', '#7a35a2'];
   const exitConfirmBackdrop = document.getElementById('exitConfirmBackdrop');
   const exitSaveBtn = document.getElementById('exitSaveBtn');
   const exitWithoutSaveBtn = document.getElementById('exitWithoutSaveBtn');
@@ -891,7 +897,10 @@
       id: String(e.id || safeId()), from: String(e.from), to: String(e.to),
       fromSide: validSide(e.fromSide) ? e.fromSide : 'right',
       toSide: validSide(e.toSide) ? e.toSide : 'left',
-      style: ['curved', 'straight', 'square', 'dashed'].includes(e.style) ? e.style : 'curved'
+      style: ['curved', 'straight', 'square', 'dashed'].includes(e.style) ? e.style : 'curved',
+      color: typeof e.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(e.color) ? e.color.toLowerCase() : '#171717',
+      bidirectional: e.bidirectional === true,
+      arrowhead: e.arrowhead !== false
     })) : [];
     return { nodes, edges };
   }
@@ -1633,20 +1642,13 @@
       nodeToEdges.get(nodeId).push(edgeId);
     };
     const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-    const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-    marker.setAttribute('id', 'edgeArrow'); marker.setAttribute('viewBox', '0 0 10 10');
-    marker.setAttribute('refX', '8'); marker.setAttribute('refY', '5');
-    marker.setAttribute('markerWidth', '6'); marker.setAttribute('markerHeight', '6');
-    marker.setAttribute('orient', 'auto-start-reverse'); marker.setAttribute('markerUnits', 'userSpaceOnUse');
-    const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    arrow.setAttribute('d', 'M 0 1 L 9 5 L 0 9 z'); arrow.setAttribute('fill', '#171717');
-    marker.appendChild(arrow); defs.appendChild(marker); svg.appendChild(defs);
+    svg.appendChild(defs);
     const squareRouteContexts = buildSquareRouteContexts(
       model.edges,
       modelNodesById,
       (node, side) => getStageNodePoint(node, side)
     );
-    model.edges.forEach(edge => {
+    model.edges.forEach((edge, edgeIndex) => {
       const a = modelNodesById.get(edge.from), b = modelNodesById.get(edge.to);
       if (!a || !b) return;
       const aPoint = getStageNodePoint(a, edge.fromSide);
@@ -1683,7 +1685,34 @@
       p.setAttribute('class', edgeClasses.join(' '));
       p.setAttribute('d', d);
       p.dataset.edgeId = edge.id;
-      p.setAttribute('marker-end', 'url(#edgeArrow)');
+      const edgeColor = typeof edge.color === 'string' && /^#[0-9a-f]{6}$/i.test(edge.color)
+        ? edge.color
+        : '#171717';
+      p.style.setProperty('stroke', edgeColor);
+
+      // Marker IDs are unique per edge so each arrowhead can use its own color.
+      // arrowhead=false disables both ends; bidirectional adds the start marker too.
+      if (edge.arrowhead !== false) {
+        const markerId = `edgeArrow-${edgeIndex}`;
+        const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+        marker.setAttribute('id', markerId);
+        marker.setAttribute('viewBox', '0 0 10 10');
+        marker.setAttribute('refX', '8');
+        marker.setAttribute('refY', '5');
+        marker.setAttribute('markerWidth', '6');
+        marker.setAttribute('markerHeight', '6');
+        marker.setAttribute('orient', 'auto-start-reverse');
+        marker.setAttribute('markerUnits', 'userSpaceOnUse');
+        const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        arrow.setAttribute('d', 'M 0 1 L 9 5 L 0 9 z');
+        arrow.setAttribute('fill', edgeColor);
+        marker.appendChild(arrow);
+        defs.appendChild(marker);
+        p.setAttribute('marker-end', `url(#${markerId})`);
+        if (edge.bidirectional === true) {
+          p.setAttribute('marker-start', `url(#${markerId})`);
+        }
+      }
       svg.appendChild(hit); svg.appendChild(p);
       edgeElements.set(edge.id, { edge, hit, line: p });
       addNodeEdgeIndex(edge.from, edge.id);
@@ -2426,7 +2455,10 @@
       to,
       fromSide,
       toSide,
-      style: currentGlobalStyle
+      style: currentGlobalStyle,
+      color: '#171717',
+      bidirectional: false,
+      arrowhead: true
     });
 
     const autoArranged = autoArrangeEnabled
@@ -2885,33 +2917,56 @@
     modalBackdrop.classList.add('visible');
   }
 
-  function closeConfirm(runCancelAction = false) {
-    // Выполняем отмену только если обе функции относятся к актуальному модальному окну.
-    const cancelAction = (
-      runCancelAction &&
-      typeof confirmCancelCallback === 'function' &&
-      typeof confirmCallback === 'function'
-    ) ? confirmCancelCallback : null;
-
-    // Сначала отсоединяем callbacks, чтобы повторное закрытие не вызвало их снова.
-    confirmCallback = null;
-    confirmCancelCallback = null;
-
-    modalBackdrop.classList.remove('visible');
-
+  function cleanupEdgeEditor() {
     if (edgeStyleOptions) {
       edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
         button.classList.remove('active');
         button.setAttribute('aria-pressed', 'false');
         button.onclick = null;
       });
+      edgeStyleOptions.querySelectorAll('[data-edge-color]').forEach(button => {
+        button.classList.remove('active');
+        button.setAttribute('aria-pressed', 'false');
+        button.onclick = null;
+      });
       edgeStyleOptions.hidden = true;
     }
+    if (edgeColorToggle) {
+      edgeColorToggle.onclick = null;
+      edgeColorToggle.setAttribute('aria-expanded', 'false');
+    }
+    if (edgeColorPalette) edgeColorPalette.hidden = true;
+    if (edgeBidirectionalInput) {
+      edgeBidirectionalInput.onchange = null;
+      edgeBidirectionalInput.indeterminate = false;
+    }
+    if (edgeArrowheadInput) {
+      edgeArrowheadInput.onchange = null;
+      edgeArrowheadInput.indeterminate = false;
+    }
+    if (edgeColorPreview) edgeColorPreview.style.backgroundColor = '#171717';
 
+    // Never let a stale edge-editor save action leak into the next modal.
+    confirmCallback = null;
+  }
+
+  function closeConfirm(runCancelAction = false) {
+    // Cancel callbacks run only for a live modal that still has its confirm action.
+    const cancelAction = (
+      runCancelAction &&
+      typeof confirmCancelCallback === 'function' &&
+      typeof confirmCallback === 'function'
+    ) ? confirmCancelCallback : null;
+
+    // Detach callbacks before closing so duplicate events cannot run the action twice.
+    confirmCallback = null;
+    confirmCancelCallback = null;
+    modalBackdrop.classList.remove('visible');
+    cleanupEdgeEditor();
     tempSelectedStyle = null;
     document.getElementById('modalCancel').textContent = 'Отмена';
 
-    // Отложенный вызов не позволяет callback вмешаться в текущую очистку модалки.
+    // Defer cancellation until modal cleanup and the current pointer event have completed.
     if (cancelAction) window.setTimeout(() => cancelAction(), 0);
   }
 
@@ -2919,14 +2974,7 @@
     tempSelectedStyle = null;
     confirmCallback = null;
     confirmCancelCallback = null;
-    if (edgeStyleOptions) {
-      edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
-        button.classList.remove('active');
-        button.setAttribute('aria-pressed', 'false');
-        button.onclick = null;
-      });
-      edgeStyleOptions.hidden = true;
-    }
+    cleanupEdgeEditor();
     selectedId = null;
     selectedIds.splice(0);
     selectedEdgeIds.splice(0);
@@ -2935,10 +2983,9 @@
     updateActionButtons();
   }
 
-  function getEdgePropertyTargets() {
-    // Edge appearance is a document-wide setting: every change in this modal
-    // is applied to every connection in the current scene.
-    return scene.edges;
+  function getEdgePropertyTargets(edgeIds = selectedEdgeIds) {
+    const ids = new Set(edgeIds || []);
+    return scene.edges.filter(edge => ids.has(edge.id));
   }
 
   let tempSelectedStyle = null;
@@ -2955,18 +3002,71 @@
     });
   }
 
-  function updateEdgeStyleOptionsActive() {
+  function updateEdgeEditorState(edgeIds = selectedEdgeIds) {
     if (!edgeStyleOptions) return;
-    const styles = scene.edges.map(edge => edge.style || 'curved');
-    const commonStyle = styles.length && styles.every(style => style === styles[0])
-      ? styles[0]
-      : null;
+    const targets = getEdgePropertyTargets(edgeIds);
 
+    // The editor can outlive the selection for a moment while pointer/modal
+    // events are being processed. Reset every control before returning.
+    if (!targets.length) {
+      edgeStyleOptions.querySelectorAll('[data-edge-style], [data-edge-color]').forEach(button => {
+        button.classList.remove('active');
+        button.setAttribute('aria-pressed', 'false');
+      });
+      if (edgeColorPreview) edgeColorPreview.style.backgroundColor = '#171717';
+      if (edgeBidirectionalInput) {
+        edgeBidirectionalInput.checked = false;
+        edgeBidirectionalInput.indeterminate = false;
+      }
+      if (edgeArrowheadInput) {
+        edgeArrowheadInput.checked = false;
+        edgeArrowheadInput.indeterminate = false;
+      }
+      return;
+    }
+
+    const styles = targets.map(edge => edge.style || 'curved');
+    const commonStyle = styles.length && styles.every(style => style === styles[0]) ? styles[0] : null;
     edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
       const active = button.dataset.edgeStyle === commonStyle;
       button.classList.toggle('active', active);
       button.setAttribute('aria-pressed', String(active));
     });
+
+    const colors = targets.map(edge => edge.color || '#171717');
+    const commonColor = colors.length && colors.every(color => color === colors[0]) ? colors[0] : null;
+    edgeStyleOptions.querySelectorAll('[data-edge-color]').forEach(button => {
+      const active = button.dataset.edgeColor === commonColor;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    if (edgeColorPreview) edgeColorPreview.style.backgroundColor = commonColor || colors[0] || '#171717';
+
+    const bidirectionalValues = targets.map(edge => edge.bidirectional === true);
+    const allBidirectional = bidirectionalValues.length > 0 && bidirectionalValues.every(Boolean);
+    const someBidirectional = bidirectionalValues.some(Boolean);
+    if (edgeBidirectionalInput) {
+      edgeBidirectionalInput.checked = allBidirectional;
+      edgeBidirectionalInput.indeterminate = someBidirectional && !allBidirectional;
+    }
+
+    const arrowheadValues = targets.map(edge => edge.arrowhead !== false);
+    const allArrowheads = arrowheadValues.length > 0 && arrowheadValues.every(Boolean);
+    const someArrowheads = arrowheadValues.some(Boolean);
+    if (edgeArrowheadInput) {
+      edgeArrowheadInput.checked = allArrowheads;
+      edgeArrowheadInput.indeterminate = someArrowheads && !allArrowheads;
+    }
+  }
+
+  function updateSelectedEdgeProperty(edgeIds, property, value, message) {
+    const targets = getEdgePropertyTargets(edgeIds);
+    if (!targets.length) return;
+    const changed = targets.some(edge => edge[property] !== value);
+    if (!changed) return;
+    targets.forEach(edge => { edge[property] = value; });
+    commitScene(message);
+    updateEdgeEditorState(edgeIds);
   }
 
   function openSelectedEdgesActions(edgeId = null, sourceEvent = null) {
@@ -2988,14 +3088,15 @@
 
     const selectedEdgeSnapshot = [...selectedEdgeIds];
     const edgeCount = selectedEdgeSnapshot.length;
-    const initialEdge = scene.edges.find(e => e.id === selectedEdgeIds[0]);
+    const initialEdge = scene.edges.find(edge => edge.id === selectedEdgeSnapshot[0]);
     tempSelectedStyle = initialEdge && initialEdge.style ? initialEdge.style : 'curved';
 
     openConfirm(
       edgeCount > 1 ? `Выбрано связей: ${edgeCount}` : 'Выбрана связь',
-      'Выберите стиль для всех связей или удалите выбранные связи.',
+      'Настройте стиль, цвет и направление выбранных связей.',
       'Сохранить',
       () => {
+        // Keep the established global style behavior: style changes apply to every edge.
         scene.edges.forEach(edge => {
           edge.style = tempSelectedStyle || 'curved';
         });
@@ -3010,15 +3111,53 @@
 
     if (edgeStyleOptions) {
       edgeStyleOptions.hidden = false;
-      edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
-        button.onclick = () => {
-          applyEdgeProperty('style', button.dataset.edgeStyle);
+      if (edgeColorPalette) edgeColorPalette.hidden = true;
+      if (edgeColorToggle) {
+        edgeColorToggle.setAttribute('aria-expanded', 'false');
+        edgeColorToggle.onclick = event => {
+          event.preventDefault();
+          event.stopPropagation();
+          const open = edgeColorPalette ? edgeColorPalette.hidden : false;
+          if (edgeColorPalette) edgeColorPalette.hidden = !open;
+          edgeColorToggle.setAttribute('aria-expanded', String(open));
         };
+      }
 
-        const active = button.dataset.edgeStyle === tempSelectedStyle;
-        button.classList.toggle('active', active);
-        button.setAttribute('aria-pressed', String(active));
+      edgeStyleOptions.querySelectorAll('[data-edge-style]').forEach(button => {
+        button.onclick = () => applyEdgeProperty('style', button.dataset.edgeStyle);
       });
+      edgeStyleOptions.querySelectorAll('[data-edge-color]').forEach(button => {
+        button.onclick = () => {
+          const color = button.dataset.edgeColor;
+          if (!EDGE_COLORS.includes(color)) return;
+          updateSelectedEdgeProperty(
+            selectedEdgeSnapshot,
+            'color',
+            color,
+            'Цвет связи обновлён'
+          );
+          if (edgeColorPalette) edgeColorPalette.hidden = false;
+          if (edgeColorToggle) edgeColorToggle.setAttribute('aria-expanded', 'true');
+        };
+      });
+
+      if (edgeBidirectionalInput) {
+        edgeBidirectionalInput.onchange = () => updateSelectedEdgeProperty(
+          selectedEdgeSnapshot,
+          'bidirectional',
+          edgeBidirectionalInput.checked,
+          'Направление связи обновлено'
+        );
+      }
+      if (edgeArrowheadInput) {
+        edgeArrowheadInput.onchange = () => updateSelectedEdgeProperty(
+          selectedEdgeSnapshot,
+          'arrowhead',
+          edgeArrowheadInput.checked,
+          'Наконечник связи обновлён'
+        );
+      }
+      updateEdgeEditorState(selectedEdgeSnapshot);
     }
   }
   function exportProject() {
@@ -3135,8 +3274,11 @@
         } else {
           route.points.forEach(point => includePoint(point.x, point.y));
         }
-        // Exported arrowhead has a 7px tip length and 4.2px wings in scene units.
-        includePoint(bp.x, bp.y, 12);
+        // Arrowheads must be included in the export bounds at both ends when enabled.
+        if (edge.arrowhead !== false) {
+          includePoint(bp.x, bp.y, 12);
+          if (edge.bidirectional === true) includePoint(ap.x, ap.y, 12);
+        }
       });
 
       if (![minX, minY, maxX, maxY].every(Number.isFinite)) {
@@ -3189,6 +3331,21 @@
       ctx.fillStyle = background;
       ctx.fillRect(0, 0, W, H);
 
+      function drawExportArrowhead(tip, angle, color) {
+        // Keep arrowheads proportional to export scale while limiting extremes.
+        const arrowSize = Math.max(4, Math.min(14, 7 * scale));
+        const wing = arrowSize * 0.6;
+        const baseX = tip.x - Math.cos(angle) * arrowSize;
+        const baseY = tip.y - Math.sin(angle) * arrowSize;
+        ctx.beginPath();
+        ctx.moveTo(tip.x, tip.y);
+        ctx.lineTo(baseX - Math.sin(angle) * wing, baseY + Math.cos(angle) * wing);
+        ctx.lineTo(baseX + Math.sin(angle) * wing, baseY - Math.cos(angle) * wing);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
+
       edgeGeometry.forEach(({ edge, ap, bp, route }) => {
         ctx.beginPath();
         ctx.moveTo(tx + ap.x * scale, ty + ap.y * scale);
@@ -3203,33 +3360,39 @@
             ctx.lineTo(tx + point.x * scale, ty + point.y * scale);
           });
         }
-        ctx.strokeStyle = dark ? '#e7e7e7' : '#111111';
+        const edgeColor = edge.color || '#111111';
+        ctx.strokeStyle = edgeColor;
         ctx.lineWidth = Math.max(1, 1.7 * scale);
         ctx.setLineDash(edge.style === 'dashed' ? [6, 6] : []);
         ctx.stroke();
         ctx.setLineDash([]);
 
-        const angles = { left: 0, right: Math.PI, top: Math.PI / 2, bottom: -Math.PI / 2 };
-        let angle = angles[edge.toSide] ?? 0;
-        if (route.type === 'line') {
-          angle = Math.atan2(bp.y - ap.y, bp.x - ap.x);
-        } else if (route.type === 'polyline' && route.points.length > 1) {
-          const previous = route.points[route.points.length - 2];
-          angle = Math.atan2(bp.y - previous.y, bp.x - previous.x);
+        if (edge.arrowhead !== false) {
+          let endAngle;
+          let startAngle;
+          if (route.type === 'bezier') {
+            endAngle = Math.atan2(bp.y - route.c2.y, bp.x - route.c2.x);
+            startAngle = Math.atan2(route.c1.y - ap.y, route.c1.x - ap.x) + Math.PI;
+          } else {
+            const points = route.points && route.points.length > 1 ? route.points : [ap, bp];
+            const previous = points[points.length - 2];
+            const next = points[1];
+            endAngle = Math.atan2(bp.y - previous.y, bp.x - previous.x);
+            startAngle = Math.atan2(next.y - ap.y, next.x - ap.x) + Math.PI;
+          }
+          drawExportArrowhead(
+            { x: tx + bp.x * scale, y: ty + bp.y * scale },
+            endAngle,
+            edgeColor
+          );
+          if (edge.bidirectional === true) {
+            drawExportArrowhead(
+              { x: tx + ap.x * scale, y: ty + ap.y * scale },
+              startAngle,
+              edgeColor
+            );
+          }
         }
-        const tipX = tx + bp.x * scale, tipY = ty + bp.y * scale;
-        // Keep arrowheads proportional to export scale while limiting extremes.
-        const arrowSize = Math.max(4, Math.min(14, 7 * scale));
-        const wing = arrowSize * 0.6;
-        const baseX = tipX - Math.cos(angle) * arrowSize;
-        const baseY = tipY - Math.sin(angle) * arrowSize;
-        ctx.beginPath();
-        ctx.moveTo(tipX, tipY);
-        ctx.lineTo(baseX - Math.sin(angle) * wing, baseY + Math.cos(angle) * wing);
-        ctx.lineTo(baseX + Math.sin(angle) * wing, baseY - Math.cos(angle) * wing);
-        ctx.closePath();
-        ctx.fillStyle = dark ? '#e7e7e7' : '#111111';
-        ctx.fill();
       });
 
       const imageAssets = new Map();

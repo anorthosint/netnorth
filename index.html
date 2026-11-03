@@ -148,6 +148,32 @@
               <span class="edge-style-label">Пунктирная</span>
             </button>
           </div>
+          <div class="edge-property-controls">
+            <div class="edge-color-control">
+              <button type="button" class="edge-color-toggle" id="edgeColorToggle" aria-haspopup="grid" aria-expanded="false" aria-controls="edgeColorPalette">
+                <span>Цвет</span><span class="edge-color-preview" id="edgeColorPreview" aria-hidden="true"></span>
+              </button>
+              <div class="edge-color-palette" id="edgeColorPalette" role="group" aria-label="Цвет связи" hidden>
+                <button type="button" class="edge-color-swatch" data-edge-color="#111111" style="--swatch-color:#111111" aria-label="Чёрный" title="Чёрный" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#4b4b4b" style="--swatch-color:#4b4b4b" aria-label="Тёмно-серый" title="Тёмно-серый" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#888888" style="--swatch-color:#888888" aria-label="Серый" title="Серый" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#bf2929" style="--swatch-color:#bf2929" aria-label="Красный" title="Красный" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#185abc" style="--swatch-color:#185abc" aria-label="Синий" title="Синий" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#267344" style="--swatch-color:#267344" aria-label="Зелёный" title="Зелёный" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#7a35a2" style="--swatch-color:#7a35a2" aria-label="Фиолетовый" title="Фиолетовый" aria-pressed="false"></button>
+              </div>
+            </div>
+            <div class="edge-direction-controls">
+              <label class="edge-option" title="Стрелки с обеих сторон">
+                <input type="checkbox" id="edgeBidirectional">
+                <span>Двусторонняя</span>
+              </label>
+              <label class="edge-option" title="Показывать стрелку на конце">
+                <input type="checkbox" id="edgeArrowhead" checked>
+                <span>Наконечник</span>
+              </label>
+            </div>
+          </div>
         </div>
         <div class="modal-actions"><button id="modalCancel">Удалить</button><button class="danger" id="modalConfirm">Сохранить</button></div>
       </div>
