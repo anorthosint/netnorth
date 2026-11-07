@@ -1818,15 +1818,6 @@
       }
       placeCaretAtEnd(newEditor);
 
-      // Non-blocking fallback for browsers that complete contenteditable layout
-      // after the current frame. It does not replace the synchronous focus above.
-      window.setTimeout(() => {
-        if (editingId !== n.id || !newEditor.isConnected) return;
-        if (document.activeElement !== newEditor) {
-          try { newEditor.focus({ preventScroll: true }); } catch (_) { newEditor.focus(); }
-          placeCaretAtEnd(newEditor);
-        }
-      }, 120);
     } else {
       console.warn('[NetNotrh] Created text node has no .node-text editor in DOM', n.id);
     }
@@ -1924,6 +1915,9 @@
   }
 
   function cancelPointerGesture(event) {
+    // Keep the active pointer sequence intact while a two-finger pinch is in progress.
+    // Rendering here would rebuild the stage DOM and invalidate active touch tracking.
+    if (pinchState) return;
     if (event && drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
     if (event && linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
     const activeDrag = drag;
@@ -1979,14 +1973,16 @@
   function startNodeDrag(event, id) {
     const isRightButton = event.button === 2;
     const isLeftButton = event.button === 0;
-    if (event.pointerType === 'touch') return;
+    const pointerId = typeof event.pointerId === 'number' ? event.pointerId : null;
+    const pointerType = event.pointerType || 'mouse';
     const rightButtonOnSelection = isRightButton && selectedIds.includes(id);
     if ((!isLeftButton && !rightButtonOnSelection) || editingId || mode !== 'select' || drag || linkDraft || boxSelect) return;
 
-    // Each new pointer gesture begins with a clean drag flag. If this is a click,
-    // wasDragging will remain false and the link can open normally.
+    // Touch pointers use the same pointerId-filtered gesture pipeline as mouse
+    // pointers. Do not discard touch here: anchors own connection gestures,
+    // while touches on the node body move the node or its current selection.
     wasDragging = false;
-    if (isRightButton) event.preventDefault();
+    if (isRightButton && event.cancelable) event.preventDefault();
 
     const n = nodeById(id); if (!n) return;
     const startedOnLink = event.target instanceof Element && !!event.target.closest('a.node-link');
@@ -1996,9 +1992,9 @@
     if (rightButtonOnSelection || (selectedIds.length > 1 && selectedIds.includes(id))) {
       const origins = selectedIds.map(nodeId => nodeById(nodeId)).filter(Boolean).map(node => ({ id: node.id, x: node.x, y: node.y }));
       if (!origins.length) return;
-      drag = { type: 'moveSelection', ids: origins, startX: event.clientX, startY: event.clientY, startZoom: zoom, moved: false, startedOnLink, pointerId: event.pointerId, button: event.button };
+      drag = { type: 'moveSelection', ids: origins, startX: event.clientX, startY: event.clientY, startZoom: zoom, moved: false, startedOnLink, pointerId, pointerType, button: event.button };
     } else {
-      drag = { type: 'move', id, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, moved: false, startedOnLink, pointerId: event.pointerId, button: event.button };
+      drag = { type: 'move', id, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, moved: false, startedOnLink, pointerId, pointerType, button: event.button };
     }
     attachPointerGesture(onPointerMove, onPointerUp);
   }
@@ -2021,11 +2017,13 @@
 
   function startPan(event) {
     if (event.button !== 0 || editingId || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
+    const pointerId = typeof event.pointerId === 'number' ? event.pointerId : null;
+    const pointerType = event.pointerType || 'mouse';
     wasDragging = false;
 
     // On desktop, a left-click on empty canvas clears node and edge selections.
-    // Keep the existing touch gesture path unchanged.
-    if (event.pointerType !== 'touch' && (selectedId !== null || selectedIds.length || selectedEdgeIds.length)) {
+    // Touch gestures preserve selection but still keep their own pointer identity.
+    if (pointerType !== 'touch' && (selectedId !== null || selectedIds.length || selectedEdgeIds.length)) {
       selectedId = null;
       selectedIds.splice(0);
       selectedEdgeIds.splice(0);
@@ -2034,9 +2032,9 @@
       updateActionButtons();
     }
 
-    event.preventDefault();
+    if (event.cancelable) event.preventDefault();
     stage.style.cursor = 'grabbing';
-    drag = { type: 'pan', startX: event.clientX, startY: event.clientY, startZoom: zoom, originScrollLeft: workspace.scrollLeft, originScrollTop: workspace.scrollTop, moved: false, pointerId: event.pointerId, button: event.button };
+    drag = { type: 'pan', startX: event.clientX, startY: event.clientY, startZoom: zoom, originScrollLeft: workspace.scrollLeft, originScrollTop: workspace.scrollTop, moved: false, pointerId, pointerType, button: event.button };
     workspace.classList.add('panning');
     attachPointerGesture(onPointerMove, onPointerUp);
   }
@@ -2829,31 +2827,36 @@
     });
   }
 
-  nodeContextMenu.addEventListener('pointerdown', event => {
+  nodeContextMenu.addEventListener('click', event => {
     const menuTarget = event.target instanceof Element ? event.target : null;
     const canvasButton = menuTarget ? menuTarget.closest('[data-canvas-action]') : null;
     const isCreateTextAction = !!(canvasButton && canvasButton.dataset.canvasAction === 'create-text');
 
     if (isCreateTextAction) {
-      // Handle the trusted pointerdown directly so mobile browsers can open
-      // the software keyboard while the user activation is still active.
-      event.preventDefault();
+      // A trusted click keeps mobile user activation alive for the synchronous
+      // contenteditable focus in createNodeAt(), allowing the software keyboard
+      // to open on iOS Safari and Android browsers.
       event.stopPropagation();
       event.stopImmediatePropagation();
 
       const point = { ...contextCanvasPoint };
-
-      // Dismiss the sheet before creating/focusing the editor so it cannot
-      // cover the new node or steal the pointer sequence.
       closeNodeContextMenu();
-
       createNodeAt(point.x, point.y);
       return;
     }
 
-    // Consume all other context-sheet actions synchronously.
-    event.stopPropagation();
-    event.preventDefault();
+    // Color swatches must not cancel the trusted click's default behavior:
+    // on mobile Safari preventDefault() here can blur the active text editor
+    // and dismiss the software keyboard. Stopping propagation is sufficient.
+    const swatch = menuTarget ? menuTarget.closest('[data-node-color]') : null;
+    if (swatch) {
+      event.stopPropagation();
+    } else {
+      // All other controls and empty menu space must stay isolated from the
+      // canvas underneath the context sheet.
+      event.stopPropagation();
+      event.preventDefault();
+    }
 
     if (canvasButton) {
       const action = canvasButton.dataset.canvasAction;
@@ -2864,7 +2867,6 @@
       }
     }
 
-    const swatch = menuTarget ? menuTarget.closest('[data-node-color]') : null;
     const actionButton = menuTarget ? menuTarget.closest('[data-node-action]') : null;
     const n = nodeById(contextNodeId);
     if (swatch) {
@@ -2894,15 +2896,22 @@
   });
   document.addEventListener('pointerdown', event => {
     const pointerTarget = event.target instanceof Element ? event.target : null;
-    // A menu control owns its pointer sequence; never dismiss the sheet before
-    // its synthesized click is delivered.
+
+    // The context sheet owns every pointer sequence that begins inside it.
+    // Let the native trusted click reach its controls before considering dismissal.
     if (pointerTarget && pointerTarget.closest('#nodeContextMenu')) return;
     if (!nodeContextMenu.classList.contains('visible')) return;
 
-    if (!pointerTarget) { closeNodeContextMenu(); return; }
-    const clickedNode = pointerTarget.closest('.node[data-node-id]');
-    // ЛКМ по другому узлу закрывает старое меню, ПКМ оставляет его до открытия нового.
-    if (!clickedNode || event.button === 0) closeNodeContextMenu();
+    // Dismiss the sheet only when the pointer lands on genuinely empty canvas.
+    // Clicks on application chrome, nodes, edges, resize handles, and anchors
+    // must not be interpreted as outside taps.
+    if (!pointerTarget || !pointerTarget.closest('#stage')) return;
+    const hitNode = pointerTarget.closest('.node[data-node-id]');
+    const hitEdge = pointerTarget.closest('.edge-hit');
+    const hitControl = pointerTarget.closest('.resize-handle, .anchor');
+    if (hitNode || hitEdge || hitControl) return;
+
+    closeNodeContextMenu();
   }, { capture: true });
 
   let confirmCancelCallback = null;
@@ -4010,6 +4019,15 @@
   // native menu never appears over the canvas. We route the intended app action
   // here as well, because stopPropagation() prevents later stage/node listeners.
   document.addEventListener('contextmenu', event => {
+    // While the app's mobile context sheet is open, suppress the browser menu
+    // everywhere on the screen, not only over the canvas element.
+    if (nodeContextMenu.classList.contains('visible')) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      return;
+    }
+
     const target = event.target;
     const targetElement = target instanceof Element ? target : null;
     const canvasTarget = targetElement && targetElement.closest(
@@ -4087,14 +4105,26 @@
     const pointerTarget = event.target instanceof Element ? event.target : null;
     const hitNode = pointerTarget && pointerTarget.closest('.node');
     const hitEdge = pointerTarget && pointerTarget.closest('.edge-hit');
+    const hitControl = pointerTarget && (
+      pointerTarget.closest('.resize-handle') || pointerTarget.closest('.anchor')
+    );
 
-    // A tap on bare canvas dismisses any open sheet, but is still allowed to
-    // continue through the normal canvas tool logic (text creation, pan, etc.).
-    if (!hitNode && !hitEdge && nodeContextMenu.classList.contains('visible')) {
+    // Finish the previous editor synchronously when the user taps another node.
+    // The node hit is still excluded from all canvas-level gestures below.
+    if (editingId && hitNode && hitNode.dataset.nodeId !== editingId) {
+      finishEditing(editingId, true);
+    }
+
+    // Nodes, edges, and their controls own their own pointer gestures. In
+    // particular, never let an anchor or resize handle bubble into startPan().
+    if (hitNode || hitEdge || hitControl) return;
+
+    // A tap on bare canvas dismisses the sheet, but may continue into the
+    // selected canvas tool (text creation, connect mode, or panning).
+    if (nodeContextMenu.classList.contains('visible')) {
       closeNodeContextMenu();
     }
 
-    if (hitNode || hitEdge) return;
     if (selectedEdgeIds.length) {
       selectedEdgeIds.splice(0);
       refreshEdgeSelectionDecorations(scene, false);
