@@ -2385,7 +2385,7 @@
       }, 50);
 
     } else {
-      console.warn('[NetNotrh] Created text node has no .node-text editor in DOM', n.id);
+      console.warn('[NetNorth] Created text node has no .node-text editor in DOM', n.id);
     }
 
     saveProject();
@@ -3938,7 +3938,7 @@
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    const name = (data.title || 'NetNotrh').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNotrh';
+    const name = (data.title || 'NetNorth').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNorth';
     a.href = url; a.download = `${name}.json`; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     showToast('Проект сохранён в JSON');
@@ -4239,7 +4239,7 @@
         }
       });
 
-      const name = (projectTitle.value.trim() || 'NetNotrh').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNotrh';
+      const name = (projectTitle.value.trim() || 'NetNorth').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNorth';
       canvas.toBlob(blob => {
         if (!blob) { showToast(`Не удалось подготовить ${formatLabel}`); return; }
         const url = URL.createObjectURL(blob);
