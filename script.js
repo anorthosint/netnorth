@@ -115,7 +115,12 @@
   let renderedEdgeElements = new Map();
   let renderedNodeToEdges = new Map();
   let renderedConnectionsSvg = null;
+  let renderedLinkPreviewEl = null;
   let dragPaintRaf = 0;
+  let viewportCullRaf = 0;
+  let resizeRenderTimer = 0;
+  // Base64 payloads stay in one shared store; undo/timeline snapshots keep only imageKey.
+  const imageStore = new Map();
   let undoStack = [];
   let undoIndex = -1;
   let timeline = [];
@@ -143,7 +148,149 @@
     return 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   }
   function nodeById(id, model = scene) { return model.nodes.find(n => n.id === id); }
-  function snapshot(model = scene) { return clone({ nodes: model.nodes, edges: model.edges }); }
+
+  function ensureNodeImageKey(node) {
+    if (!node || node.type !== 'image') return '';
+    let key = typeof node.imageKey === 'string' && node.imageKey
+      ? node.imageKey
+      : `image:${String(node.id || safeId())}`;
+    const inlineImageData = typeof node.image === 'string' && node.image ? node.image : '';
+    let imageData = inlineImageData || imageStore.get(key) || '';
+
+    // If an image node's payload changes, give the new payload its own key.
+    // Earlier undo/timeline snapshots keep pointing at the previous immutable asset.
+    if (inlineImageData && imageStore.has(key) && imageStore.get(key) !== inlineImageData) {
+      key = `image:${String(node.id || safeId())}:${safeId()}`;
+      imageData = inlineImageData;
+    }
+
+    if (imageData) {
+      imageStore.set(key, imageData);
+      node.imageKey = key;
+      return key;
+    }
+    return '';
+  }
+
+  // Lightweight snapshots intentionally omit large data URLs. Immutable strings
+  // remain in imageStore and snapshots retain only a short stable imageKey.
+  function snapshot(model = scene) {
+    return {
+      nodes: (model.nodes || []).map(node => {
+        const copy = { ...node };
+        if (copy.type === 'image') {
+          const imageKey = ensureNodeImageKey(node);
+          if (imageKey) copy.imageKey = imageKey;
+          else delete copy.imageKey;
+        } else {
+          delete copy.imageKey;
+        }
+        delete copy.image;
+        return copy;
+      }),
+      edges: (model.edges || []).map(edge => ({ ...edge }))
+    };
+  }
+
+  function materializeSceneSnapshot(model) {
+    if (!model || !Array.isArray(model.nodes)) return freshScene();
+    return {
+      nodes: model.nodes.map(node => {
+        const copy = { ...node };
+        if (copy.type === 'image') {
+          const imageKey = typeof copy.imageKey === 'string' && copy.imageKey
+            ? copy.imageKey
+            : `image:${String(copy.id || '')}`;
+          const imageData = typeof copy.image === 'string' && copy.image
+            ? copy.image
+            : (imageStore.get(imageKey) || '');
+          if (imageData) imageStore.set(imageKey, imageData);
+          copy.imageKey = imageKey;
+          copy.image = imageData;
+        }
+        return copy;
+      }),
+      edges: (model.edges || []).map(edge => ({ ...edge }))
+    };
+  }
+
+  function collectProjectImageAssets(scenes) {
+    const assets = {};
+    const keys = new Set();
+    (scenes || []).filter(Boolean).forEach(model => {
+      (model.nodes || []).forEach(node => {
+        if (node && node.type === 'image' && typeof node.imageKey === 'string' && node.imageKey) {
+          keys.add(node.imageKey);
+        }
+      });
+    });
+    keys.forEach(key => {
+      const imageData = imageStore.get(key);
+      if (typeof imageData === 'string' && imageData) assets[key] = imageData;
+    });
+    return assets;
+  }
+
+  function normalizeProjectImageAssets(input) {
+    if (input == null) return {};
+    if (typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid image asset dictionary');
+    const assets = {};
+    Object.entries(input).forEach(([key, value]) => {
+      if (typeof value !== 'string' || value.length > 12000000 ||
+          !/^data:image\/(?:png|jpeg);base64,/i.test(value)) {
+        throw new Error('Invalid project image asset');
+      }
+      assets[key] = value;
+    });
+    return assets;
+  }
+
+  function clearProjectRuntimeCaches(clearImages = false) {
+    if (dragPaintRaf) cancelAnimationFrame(dragPaintRaf);
+    dragPaintRaf = 0;
+    if (playback.raf) cancelAnimationFrame(playback.raf);
+    playback.raf = 0;
+    playback.generation += 1;
+    if (viewportCullRaf) cancelAnimationFrame(viewportCullRaf);
+    viewportCullRaf = 0;
+    if (resizeRenderTimer) clearTimeout(resizeRenderTimer);
+    resizeRenderTimer = 0;
+    detachPointerGestureListeners();
+    clearLongPress();
+    drag = null;
+    linkDraft = null;
+    boxSelect = null;
+    wasDragging = false;
+    pinchState = null;
+    workspace.classList.remove('panning', 'pinching');
+    renderedNodeElements.clear();
+    renderedNodeModels.clear();
+    renderedEdgeElements.clear();
+    renderedNodeToEdges.clear();
+    renderedConnectionsSvg = null;
+    renderedLinkPreviewEl = null;
+    currentRenderScene = null;
+    activeTouchPointers.clear();
+    if (clearImages) imageStore.clear();
+  }
+
+  function pruneImageStore() {
+    const referenced = new Set();
+    const collect = model => {
+      if (!model || !Array.isArray(model.nodes)) return;
+      model.nodes.forEach(node => {
+        if (node && node.type === 'image' && typeof node.imageKey === 'string' && node.imageKey) {
+          referenced.add(node.imageKey);
+        }
+      });
+    };
+    collect(scene);
+    undoStack.forEach(collect);
+    timeline.forEach(frame => collect(frame && frame.scene));
+    collect(currentRenderScene);
+    imageStore.forEach((value, key) => { if (!referenced.has(key)) imageStore.delete(key); });
+  }
+
   function sameJson(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
   function nowRelative() { return Math.max(0, Date.now() - projectStartedAt); }
 
@@ -428,12 +575,15 @@
       if (String(stored.notes || '') !== projectNotes) return true;
       if (!sameJson(sanitizeProjectChecklist(stored.checklist), projectChecklist)) return true;
       // Normalize legacy snapshots so added model defaults do not look like user edits.
-      if (!sameJson(sanitizeScene(stored.scene), snapshot())) return true;
+      if (!sameJson(snapshot(sanitizeScene(stored.scene)), snapshot())) return true;
 
-      if (Array.isArray(stored.timeline) && stored.timeline.length) {
+      // Version 1 projects may not contain the image asset dictionary. Their
+      // timeline snapshots can have a legacy shape even when the current scene
+      // and all user-facing project data are identical, so ignore that mismatch.
+      if (stored.images && Array.isArray(stored.timeline) && stored.timeline.length) {
         const storedTimeline = stored.timeline
           .filter(frame => frame && frame.scene && Array.isArray(frame.scene.nodes) && Array.isArray(frame.scene.edges))
-          .map(frame => ({ at: Math.max(0, Number(frame.at) || 0), scene: sanitizeScene(frame.scene) }));
+          .map(frame => ({ at: Math.max(0, Number(frame.at) || 0), scene: snapshot(sanitizeScene(frame.scene)) }));
         if (storedTimeline.length && !sameJson(storedTimeline, timeline)) return true;
       }
 
@@ -461,13 +611,23 @@
 
     // Фиксируем все данные прямо сейчас. Таймер ниже только записывает готовый
     // снимок и больше не читает изменившиеся currentProjectId или scene.
+    const sceneSnapshot = snapshot();
+    const timelineSnapshot = timeline.map(frame => ({
+      at: Math.max(0, Number(frame.at) || 0),
+      scene: snapshot(frame.scene)
+    }));
+    const imageAssets = collectProjectImageAssets([
+      sceneSnapshot,
+      ...timelineSnapshot.map(frame => frame.scene)
+    ]);
     const payload = {
       id: currentProjectId,
       data: {
-        version: 1,
+        version: 2,
         title: projectTitle.value.trim() || 'Новая схема',
-        scene: snapshot(),
-        timeline: clone(timeline),
+        scene: sceneSnapshot,
+        timeline: timelineSnapshot,
+        images: imageAssets,
         projectStartedAt,
         workedMs: currentProjectWorkedMs(),
         notes: projectNotes,
@@ -485,7 +645,10 @@
     if (undoIndex >= 0 && sameJson(undoStack[undoIndex], snap)) return;
     undoStack = undoStack.slice(0, undoIndex + 1);
     undoStack.push(snap);
-    if (undoStack.length > 100) undoStack.shift();
+    if (undoStack.length > 100) {
+      undoStack.shift();
+      pruneImageStore();
+    }
     undoIndex = undoStack.length - 1;
   }
 
@@ -494,7 +657,10 @@
     const last = timeline[timeline.length - 1];
     if (last && sameJson(last.scene, snap)) return;
     timeline.push({ at: nowRelative(), scene: snap });
-    if (timeline.length > 500) timeline.splice(1, timeline.length - 500);
+    if (timeline.length > 500) {
+      timeline.splice(1, timeline.length - 500);
+      pruneImageStore();
+    }
   }
 
   function commitScene(message) {
@@ -781,6 +947,7 @@
     }
 
     const isActiveProject = currentProjectId === id;
+    if (isActiveProject && playback.active) exitPlayback();
 
     // Cancel the pending debounced write before deleting storage or clearing scene.
     cancelPendingProjectSave(id);
@@ -791,6 +958,7 @@
     }
 
     if (isActiveProject) {
+      clearProjectRuntimeCaches(true);
       projectTitle.value = 'Новая схема';
       currentProjectId = null;
       projectSessionStartedAt = 0;
@@ -873,10 +1041,12 @@
   }
 
   function beginNewProject() {
+    if (playback.active) exitPlayback();
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     if (editingId) finishEditing(editingId, true);
     // Сбрасываем последнее сохранение старого проекта до смены ID.
     flushPendingSave();
+    clearProjectRuntimeCaches(true);
     const newTitle = generateNewProjectTitle();
     currentProjectId = makeProjectId();
     scene = freshScene(); selectedId = null; selectedIds.splice(0); editingId = null; editingOriginalText = null;
@@ -892,14 +1062,17 @@
     mode = 'select'; syncModeButtons();
     startScreen.classList.remove('visible'); closeNodeContextMenu(); closeConfirm();
     renderScene();
-    requestAnimationFrame(() => { workspace.scrollLeft = CANVAS_PAD * zoom; workspace.scrollTop = CANVAS_PAD * zoom; });
+    requestAnimationFrame(() => { workspace.scrollLeft = CANVAS_PAD * zoom; workspace.scrollTop = CANVAS_PAD * zoom; scheduleViewportCulling(); });
     // Do not persist an empty canvas. The first real node creation will save it.
     updateActionButtons();
   }
 
   function openSavedProject(id) {
+    if (playback.active) exitPlayback();
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     if (!localStorageAvailable) { showToast('Локальные проекты недоступны в этом браузере'); return; }
+    const previousImageStore = new Map(imageStore);
+    let imageStoreReplaced = false;
     try {
       if (editingId) finishEditing(editingId, true);
       // Важно сбросить изменения текущего проекта до чтения/переключения на другой.
@@ -908,24 +1081,44 @@
       if (!raw) { showToast('Проект не найден'); renderProjectList(); return; }
       const data = JSON.parse(raw);
       if (!data || !data.scene || !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) throw new Error('Invalid project');
-      currentProjectId = id;
+      const imageAssets = normalizeProjectImageAssets(data.images);
+
+      clearProjectRuntimeCaches(false);
+      imageStore.clear();
+      Object.entries(imageAssets).forEach(([key, value]) => imageStore.set(key, value));
+      imageStoreReplaced = true;
+
       scene = sanitizeScene(data.scene);
       projectTitle.value = typeof data.title === 'string' && data.title.trim() ? data.title : 'Новая схема';
-      timeline = Array.isArray(data.timeline) ? data.timeline.filter(f => f && f.scene && Array.isArray(f.scene.nodes) && Array.isArray(f.scene.edges)).map(f => ({ at: Math.max(0, Number(f.at) || 0), scene: sanitizeScene(f.scene) })) : [];
+      timeline = Array.isArray(data.timeline)
+        ? data.timeline
+            .filter(frame => frame && frame.scene && Array.isArray(frame.scene.nodes) && Array.isArray(frame.scene.edges))
+            .map(frame => ({ at: Math.max(0, Number(frame.at) || 0), scene: snapshot(sanitizeScene(frame.scene)) }))
+        : [];
       projectStartedAt = Number(data.projectStartedAt) || Date.now();
       projectNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
       projectChecklist = sanitizeProjectChecklist(data.checklist);
       projectWorkedMs = Math.max(0, Number(data.workedMs) || 0);
       projectSessionStartedAt = Date.now();
       syncProjectNotesPanel();
-      if (!timeline.length) timeline = [{ at: 0, scene: freshScene() }, { at: 1, scene: snapshot() }];
+      if (!timeline.length) timeline = [{ at: 0, scene: snapshot(freshScene()) }, { at: 1, scene: snapshot() }];
       if (!sameJson(timeline[timeline.length - 1].scene, snapshot())) timeline.push({ at: nowRelative(), scene: snapshot() });
       selectedId = null; selectedIds.splice(0); editingId = null; editingOriginalText = null; linkDraft = null; connectionSourceId = null;
       undoStack = [snapshot()]; undoIndex = 0;
+      currentRenderScene = null;
       mode = 'select'; syncModeButtons();
       startScreen.classList.remove('visible'); renderScene(); updateActionButtons();
-      requestAnimationFrame(() => { workspace.scrollLeft = CANVAS_PAD * zoom; workspace.scrollTop = CANVAS_PAD * zoom; });
-    } catch (error) { console.warn('Project could not be opened:', error); showToast('Не удалось открыть проект'); }
+      requestAnimationFrame(() => { workspace.scrollLeft = CANVAS_PAD * zoom; workspace.scrollTop = CANVAS_PAD * zoom; scheduleViewportCulling(); });
+    } catch (error) {
+      if (imageStoreReplaced) {
+        imageStore.clear();
+        previousImageStore.forEach((value, key) => imageStore.set(key, value));
+        currentRenderScene = null;
+        try { renderScene(scene); } catch (_) {}
+      }
+      console.warn('Project could not be opened:', error);
+      showToast('Не удалось открыть проект');
+    }
   }
 
   function completeExitToStartScreen() {
@@ -1035,8 +1228,24 @@
   }
 
   function sanitizeNode(n) {
+    const id = String(n && n.id || safeId());
+    const type = n && n.type === 'image' ? 'image' : 'text';
+    let imageKey = type === 'image'
+      ? (typeof (n && n.imageKey) === 'string' && n.imageKey ? n.imageKey : `image:${id}`)
+      : '';
+    const imageData = type === 'image'
+      ? (typeof (n && n.image) === 'string' && n.image
+          ? n.image.slice(0, 12000000)
+          : (imageStore.get(imageKey) || ''))
+      : '';
+    // Older imported timelines may contain different image payloads for the same
+    // node id. Keep each payload immutable so snapshots never alias the wrong image.
+    if (imageData && imageStore.has(imageKey) && imageStore.get(imageKey) !== imageData) {
+      imageKey = `image:${id}:${safeId()}`;
+    }
+    if (imageData) imageStore.set(imageKey, imageData);
     const clean = {
-      id: String(n && n.id || safeId()),
+      id,
       x: clamp(Number(n && n.x) || 0, 0, 100000),
       y: clamp(Number(n && n.y) || 0, 0, 100000),
       text: String(n && n.text || '').slice(0, 10000),
@@ -1047,8 +1256,9 @@
       color: typeof (n && n.color) === 'string' && /^#[0-9a-fA-F]{6}$/.test(n.color.trim()) ? n.color.trim().toLowerCase() : '#111111',
       underline: !!(n && n.underline),
       highlight: !!(n && n.highlight),
-      type: n && n.type === 'image' ? 'image' : 'text',
-      image: n && n.type === 'image' && typeof n.image === 'string' ? n.image.slice(0, 12000000) : '',
+      type,
+      image: imageData,
+      imageKey: imageData ? imageKey : '',
       aspectRatio: n && n.type === 'image' && Number(n.aspectRatio) > 0
         ? clamp(Number(n.aspectRatio), 0.01, 100)
         : (n && n.type === 'image' && Number(n.width) > 0 && Number(n.height) > 0 ? clamp(Number(n.width) / Number(n.height), 0.01, 100) : 1)
@@ -1162,6 +1372,7 @@
     }
     workspace.scrollLeft = worldX * zoom - offsetX;
     workspace.scrollTop = worldY * zoom - offsetY;
+    scheduleViewportCulling();
   }
   function getStageNodePoint(n, side) {
     const el = renderedNodeElements.get(n.id);
@@ -1172,13 +1383,21 @@
     if (side === 'bottom') return { x: n.x + width / 2, y: n.y + height };
     return { x: n.x, y: n.y + height / 2 };
   }
-  function chooseSides(a, b, preferredFromSide = null) {
+  function chooseSides(a, b, preferredFromSide = null, cachedGeometry = null) {
     const ea = renderedNodeElements.get(a.id);
     const eb = renderedNodeElements.get(b.id);
-    const aw = ea ? ea.offsetWidth : a.width, ah = ea ? ea.offsetHeight : a.height;
-    const bw = eb ? eb.offsetWidth : b.width, bh = eb ? eb.offsetHeight : b.height;
-    const dx = (b.x + bw / 2) - (a.x + aw / 2);
-    const dy = (b.y + bh / 2) - (a.y + ah / 2);
+    const aGeometry = cachedGeometry && cachedGeometry.a;
+    const bGeometry = cachedGeometry && cachedGeometry.b;
+    const aw = aGeometry ? aGeometry.width : (ea ? ea.offsetWidth : a.width);
+    const ah = aGeometry ? aGeometry.height : (ea ? ea.offsetHeight : a.height);
+    const bw = bGeometry ? bGeometry.width : (eb ? eb.offsetWidth : b.width);
+    const bh = bGeometry ? bGeometry.height : (eb ? eb.offsetHeight : b.height);
+    const ax = aGeometry && Number.isFinite(aGeometry.x) ? aGeometry.x : a.x;
+    const ay = aGeometry && Number.isFinite(aGeometry.y) ? aGeometry.y : a.y;
+    const bx = bGeometry && Number.isFinite(bGeometry.x) ? bGeometry.x : b.x;
+    const by = bGeometry && Number.isFinite(bGeometry.y) ? bGeometry.y : b.y;
+    const dx = (bx + bw / 2) - (ax + aw / 2);
+    const dy = (by + bh / 2) - (ay + ah / 2);
 
     const oppositeSide = {
       top: 'bottom',
@@ -1563,13 +1782,58 @@
     emptyState.setAttribute('aria-hidden', String(isHidden));
   }
 
+  function updateViewportCulling() {
+    if (!workspace || !workspace.clientWidth || !workspace.clientHeight) return;
+    if (!renderedNodeElements.size) return;
+    const scale = Math.max(0.01, Number(zoom) || 1);
+    const margin = 300 / scale;
+    // Stage is offset from the world's top-left by CANVAS_PAD at every zoom level.
+    const viewLeft = workspace.scrollLeft / scale - CANVAS_PAD;
+    const viewTop = workspace.scrollTop / scale - CANVAS_PAD;
+    const viewRight = (workspace.scrollLeft + workspace.clientWidth) / scale - CANVAS_PAD;
+    const viewBottom = (workspace.scrollTop + workspace.clientHeight) / scale - CANVAS_PAD;
+
+    renderedNodeElements.forEach((element, id) => {
+      if (!element) return;
+      if (id === editingId || id === selectedId || selectedIds.includes(id)) {
+        element.style.visibility = 'visible';
+        return;
+      }
+      const node = renderedNodeModels.get(id);
+      if (!node) return;
+      const width = Math.max(10, Number(node.width) || element.offsetWidth || 10);
+      const height = Math.max(10, Number(node.height) || element.offsetHeight || 10);
+      const outside = node.x + width < viewLeft - margin ||
+        node.x > viewRight + margin ||
+        node.y + height < viewTop - margin ||
+        node.y > viewBottom + margin;
+      element.style.visibility = outside ? 'hidden' : 'visible';
+    });
+  }
+
+  function scheduleViewportCulling() {
+    if (viewportCullRaf) return;
+    viewportCullRaf = requestAnimationFrame(() => {
+      viewportCullRaf = 0;
+      updateViewportCulling();
+    });
+  }
+
   function renderScene(model = scene, options = {}) {
+    if (model !== scene) model = materializeSceneSnapshot(model);
     currentRenderScene = model;
     const isPlayback = !!options.playback;
     if (!isPlayback && model === scene) {
       const validEdgeIds = new Set(model.edges.map(edge => edge.id));
       selectedEdgeIds.splice(0, selectedEdgeIds.length, ...selectedEdgeIds.filter(id => validEdgeIds.has(id)));
     }
+    // Drop detached DOM references before rebuilding the render tree.
+    renderedNodeElements.clear();
+    renderedNodeModels.clear();
+    renderedEdgeElements.clear();
+    renderedNodeToEdges.clear();
+    renderedConnectionsSvg = null;
+    renderedLinkPreviewEl = null;
     const modelNodesById = new Map(model.nodes.map(node => [node.id, node]));
     const maxX = model.nodes.reduce((max, n) => Math.max(max, n.x + n.width), 0);
     const maxY = model.nodes.reduce((max, n) => Math.max(max, n.y + n.height), 0);
@@ -1675,7 +1939,9 @@
             event.stopPropagation();
           });
           textSpan.addEventListener('blur', () => {
-            // For regular edits, allow the browser's focus transition to settle first.
+            // Mobile browsers can emit a transient blur while the software
+            // keyboard is animating in. Give the trusted input/focus sequence
+            // more time to settle before deciding that editing has ended.
             window.setTimeout(() => {
               if (editingId !== n.id) return;
               if (document.activeElement === textSpan) return;
@@ -1690,8 +1956,26 @@
                 return;
               }
 
+              const liveNode = nodeById(n.id);
+              const liveText = liveNode ? String(liveNode.text || '').trim() : '';
+              const recentlyCreatedEmptyNode = !!(
+                liveNode && liveNode.createdAt &&
+                Date.now() - liveNode.createdAt < 2000 &&
+                !liveText
+              );
+              if (recentlyCreatedEmptyNode) {
+                const liveNodeElement = renderedNodeElements.get(n.id) ||
+                  stage.querySelector(`[data-node-id="${CSS.escape(n.id)}"]`);
+                const liveEditor = liveNodeElement && liveNodeElement.querySelector('.node-text');
+                if (liveEditor && liveEditor.isConnected) {
+                  try { liveEditor.focus({ preventScroll: true }); } catch (_) { liveEditor.focus(); }
+                  placeCaretAtEnd(liveEditor);
+                }
+                return;
+              }
+
               finishEditing(n.id, true);
-            }, 100);
+            }, 350);
           });
 
           // Empty inline spans have no hit area. After a transient blur, tapping
@@ -1894,6 +2178,7 @@
         p.setAttribute('class', 'edge-preview');
         p.setAttribute('id', 'linkPreview');
         p.setAttribute('d', pathFor(aPoint, bPoint, linkDraft.fromSide, previewSide));
+        renderedLinkPreviewEl = p;
         svg.appendChild(p);
       }
     }
@@ -1912,6 +2197,7 @@
     }
     updateEmptyState(model, isPlayback);
     updateActionButtons();
+    updateViewportCulling();
   }
 
   function placeCaretAtEnd(el) {
@@ -1954,7 +2240,7 @@
     selectedIds.splice(0, selectedIds.length, n.id);
     editingId = n.id;
     editingOriginalText = '';
-    shouldFocusNewNode = false;
+    shouldFocusNewNode = true;
     mode = 'select';
     syncModeButtons();
     modeIndicator.classList.remove('visible');
@@ -1976,19 +2262,9 @@
       newEditor.style.setProperty('user-select', 'text');
       newEditor.style.setProperty('-webkit-touch-callout', 'default');
 
-      // This focus is deliberately synchronous: iOS Safari only reliably opens
-      // the software keyboard while focus remains in the trusted click stack.
-      try {
-        newEditor.focus({ preventScroll: true });
-      } catch (_) {
-        newEditor.focus();
-      }
-      placeCaretAtEnd(newEditor);
-
-      // Re-assert focus on the next frame after the canvas pointerdown/click
-      // sequence has settled. Re-rendering can detach the original target and
-      // some browsers briefly move focus back to the canvas/body.
-      window.requestAnimationFrame(() => {
+      // Wait until the freshly rendered node is attached and the current
+      // pointer sequence has settled before restoring editor focus.
+      window.setTimeout(() => {
         if (editingId !== n.id || !newEditor.isConnected) return;
         try {
           newEditor.focus({ preventScroll: true });
@@ -1996,7 +2272,7 @@
           newEditor.focus();
         }
         placeCaretAtEnd(newEditor);
-      });
+      }, 50);
 
     } else {
       console.warn('[NetNotrh] Created text node has no .node-text editor in DOM', n.id);
@@ -2230,23 +2506,54 @@
     attachPointerGesture(onPointerMove, onPointerUp);
   }
 
+  function cacheLinkSnapTargets(draft) {
+    if (!draft) return;
+    const cacheNodeGeometry = node => {
+      const element = renderedNodeElements.get(node.id);
+      return {
+        id: node.id,
+        node,
+        x: Number(node.x) || 0,
+        y: Number(node.y) || 0,
+        width: Math.max(10, element ? element.offsetWidth : (Number(node.width) || 10)),
+        height: Math.max(10, element ? element.offsetHeight : (Number(node.height) || 10))
+      };
+    };
+    const origin = nodeById(draft.fromId);
+    draft.fromNode = origin || null;
+    draft.fromGeometry = origin ? cacheNodeGeometry(origin) : null;
+    // Read every target's layout dimensions once at gesture start, never per pointermove.
+    draft.snapTargets = scene.nodes
+      .filter(node => node && node.id !== draft.fromId)
+      .map(cacheNodeGeometry);
+  }
+
+  function getCachedStageNodePoint(node, side, geometry) {
+    const box = geometry || { x: node.x, y: node.y, width: node.width, height: node.height };
+    if (side === 'top') return { x: box.x + box.width / 2, y: box.y };
+    if (side === 'right') return { x: box.x + box.width, y: box.y + box.height / 2 };
+    if (side === 'bottom') return { x: box.x + box.width / 2, y: box.y + box.height };
+    return { x: box.x, y: box.y + box.height / 2 };
+  }
+
   function findLinkSnapCandidate(point, draft) {
     if (!point || !draft) return null;
-    const origin = nodeById(draft.fromId);
+    const origin = draft.fromNode || nodeById(draft.fromId);
     if (!origin) return null;
 
     // point is in stage coordinates, so convert the screen-space snap radius
     // into model coordinates to keep the magnetic distance visually constant.
     const snapRadius = 65 / Math.max(0.01, zoom || 1);
     let best = null;
+    const candidates = Array.isArray(draft.snapTargets) ? draft.snapTargets : [];
 
-    scene.nodes.forEach(targetNode => {
-      if (!targetNode || targetNode.id === draft.fromId) return;
-      const element = renderedNodeElements.get(targetNode.id);
-      const width = Math.max(10, element ? element.offsetWidth : (Number(targetNode.width) || 10));
-      const height = Math.max(10, element ? element.offsetHeight : (Number(targetNode.height) || 10));
-      const left = Number(targetNode.x) || 0;
-      const top = Number(targetNode.y) || 0;
+    candidates.forEach(cachedTarget => {
+      const targetNode = cachedTarget.node || nodeById(cachedTarget.id);
+      if (!targetNode) return;
+      const left = cachedTarget.x;
+      const top = cachedTarget.y;
+      const width = cachedTarget.width;
+      const height = cachedTarget.height;
       const right = left + width;
       const bottom = top + height;
       const nearestX = clamp(point.x, left, right);
@@ -2264,9 +2571,13 @@
         (Math.abs(boundaryDistance - best.boundaryDistance) <= 0.001 && centerDistance >= best.centerDistance)
       )) return;
 
-      const sides = chooseSides(origin, targetNode, draft.fromSide);
+      const sides = chooseSides(origin, targetNode, draft.fromSide, {
+        a: draft.fromGeometry,
+        b: cachedTarget
+      });
       best = {
         node: targetNode,
+        geometry: cachedTarget,
         snapSide: sides.toSide,
         boundaryDistance,
         centerDistance
@@ -2310,6 +2621,7 @@
     };
     // Один рендер для создания пунктирной линии; во время перетаскивания узлы не пересоздаются.
     renderScene();
+    cacheLinkSnapTargets(linkDraft);
     attachPointerGesture(onPointerMove, onPointerUp);
   }
 
@@ -2437,6 +2749,7 @@
 
     ensureStageBoundsForDrag();
     updateRenderedEdgesForNodes(ids);
+    scheduleViewportCulling();
   }
 
   function scheduleDragGeometryPaint() {
@@ -2466,6 +2779,7 @@
       if (drag.type === 'pan') {
         workspace.scrollLeft = drag.originScrollLeft - dx;
         workspace.scrollTop = drag.originScrollTop - dy;
+        scheduleViewportCulling();
         return;
       }
       // Use the zoom captured when this gesture started. This keeps model-space movement
@@ -2538,13 +2852,13 @@
       const snapCandidate = findLinkSnapCandidate(point, linkDraft);
       setLinkSnapTarget(linkDraft, snapCandidate);
 
-      const preview = stage.querySelector('#linkPreview');
-      const origin = nodeById(linkDraft.fromId);
+      const preview = renderedLinkPreviewEl;
+      const origin = linkDraft.fromNode || nodeById(linkDraft.fromId);
       if (preview && origin) {
-        const aPoint = getStageNodePoint(origin, linkDraft.fromSide);
+        const aPoint = getCachedStageNodePoint(origin, linkDraft.fromSide, linkDraft.fromGeometry);
         const previewSide = snapCandidate ? snapCandidate.snapSide : 'left';
         const previewPoint = snapCandidate
-          ? getStageNodePoint(snapCandidate.node, snapCandidate.snapSide)
+          ? getCachedStageNodePoint(snapCandidate.node, snapCandidate.snapSide, snapCandidate.geometry)
           : point;
         preview.setAttribute('d', pathFor(aPoint, previewPoint, linkDraft.fromSide, previewSide));
       }
@@ -2910,14 +3224,14 @@
     if (undoIndex <= 0 || playback.active) return;
     if (editingId) finishEditing(editingId, true);
     undoIndex--;
-    scene = snapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
+    scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
     recordTimeline(); renderScene(); saveProject(); updateActionButtons();
     showToast('Действие отменено');
   }
   function redo() {
     if (undoIndex >= undoStack.length - 1 || playback.active) return;
     undoIndex++;
-    scene = snapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
+    scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
     recordTimeline(); renderScene(); saveProject(); updateActionButtons();
     showToast('Действие повторено');
   }
@@ -3010,13 +3324,17 @@
         if (playback.active) exitPlayback();
         if (editingId) finishEditing(editingId, true);
 
+        const nodeId = safeId();
+        const nodeImageKey = `image:${nodeId}`;
+        imageStore.set(nodeImageKey, imageData);
         const node = {
-          id: safeId(),
+          id: nodeId,
           x: insertAt.x,
           y: insertAt.y,
           text: '',
           type: 'image',
           image: imageData,
+          imageKey: nodeImageKey,
           aspectRatio,
           width: displayWidth,
           height: displayHeight,
@@ -3132,7 +3450,7 @@
 
       const point = { ...contextCanvasPoint };
       closeNodeContextMenu();
-      createNodeAt(point.x, point.y);
+      window.setTimeout(() => createNodeAt(point.x, point.y), 60);
       return;
     }
 
@@ -3487,10 +3805,18 @@
   }
 
   function exportProjectJSON() {
+    const sceneSnapshot = snapshot();
+    const timelineSnapshot = timeline.map(frame => ({
+      at: Math.max(0, Number(frame.at) || 0),
+      scene: snapshot(frame.scene)
+    }));
     const data = {
-      format: 'osint-visualization', version: 1,
+      format: 'osint-visualization', version: 2,
       title: projectTitle.value.trim() || 'Новая схема',
-      scene: snapshot(), timeline, projectStartedAt,
+      scene: sceneSnapshot,
+      timeline: timelineSnapshot,
+      images: collectProjectImageAssets([sceneSnapshot, ...timelineSnapshot.map(frame => frame.scene)]),
+      projectStartedAt,
       workedMs: currentProjectWorkedMs(),
       notes: projectNotes,
       checklist: clone(projectChecklist)
@@ -3823,41 +4149,46 @@
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     const reader = new FileReader();
     reader.onload = () => {
+      const previousImageStore = new Map(imageStore);
+      let imageStoreReplaced = false;
       try {
-        // Полностью разбираем и подготавливаем импортируемые данные до любых
-        // операций, способных сохранить или изменить текущий проект.
+        // Validate the envelope before switching away from the current project.
         const data = JSON.parse(String(reader.result || ''));
         if (!data || !data.scene || !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) {
           throw new Error('Некорректный формат');
         }
-
-        const importedScene = sanitizeScene(data.scene);
+        const imageAssets = normalizeProjectImageAssets(data.images);
         const importedTitle = typeof data.title === 'string' && data.title.trim()
           ? data.title.slice(0, 90)
           : 'Импортированная схема';
-        let importedTimeline = Array.isArray(data.timeline)
-          ? data.timeline
-              .filter(frame => frame && frame.scene)
-              .map(frame => ({
-                at: Math.max(0, Number(frame.at) || 0),
-                scene: sanitizeScene(frame.scene)
-              }))
+        const timelineInput = Array.isArray(data.timeline)
+          ? data.timeline.filter(frame => frame && frame.scene && Array.isArray(frame.scene.nodes) && Array.isArray(frame.scene.edges))
           : [];
         const importedProjectStartedAt = Number(data.projectStartedAt) || Date.now();
         const importedNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
         const importedChecklist = sanitizeProjectChecklist(data.checklist);
         const importedWorkedMs = Math.max(0, Number(data.workedMs) || 0);
 
-        if (!importedTimeline.length) {
-          importedTimeline = [
-            { at: 0, scene: freshScene() },
-            { at: 1, scene: sanitizeScene(importedScene) }
-          ];
-        }
-
-        // Текущий проект сохраняется только после успешной проверки всего импорта.
+        // Commit the previous project while its image cache is still available.
+        if (playback.active) exitPlayback();
         if (editingId) finishEditing(editingId, true);
         flushPendingSave();
+        clearProjectRuntimeCaches(false);
+        imageStore.clear();
+        Object.entries(imageAssets).forEach(([key, value]) => imageStore.set(key, value));
+        imageStoreReplaced = true;
+
+        const importedScene = sanitizeScene(data.scene);
+        let importedTimeline = timelineInput.map(frame => ({
+          at: Math.max(0, Number(frame.at) || 0),
+          scene: snapshot(sanitizeScene(frame.scene))
+        }));
+        if (!importedTimeline.length) {
+          importedTimeline = [
+            { at: 0, scene: snapshot(freshScene()) },
+            { at: 1, scene: snapshot(importedScene) }
+          ];
+        }
 
         scene = importedScene;
         currentProjectId = makeProjectId();
@@ -3874,6 +4205,7 @@
         mode = 'select';
         undoStack = [snapshot()];
         undoIndex = 0;
+        currentRenderScene = null;
         syncModeButtons();
         startScreen.classList.remove('visible');
         renderScene();
@@ -3881,6 +4213,12 @@
         updateActionButtons();
         showToast('Проект открыт');
       } catch (error) {
+        if (imageStoreReplaced) {
+          imageStore.clear();
+          previousImageStore.forEach((value, key) => imageStore.set(key, value));
+          currentRenderScene = null;
+          try { renderScene(scene); } catch (_) {}
+        }
         console.warn('Project import failed:', error);
         showToast('Не удалось открыть файл проекта');
       }
@@ -4283,6 +4621,10 @@
       return;
     }
 
+    // Tool taps create nodes or initiate explicit connection selection; they
+    // must not be converted into long-press candidates or canvas pan tracking.
+    if (mode === 'text' || mode === 'connect') return;
+
     activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
 
     if (pinchState) {
@@ -4486,9 +4828,8 @@
       updateActionButtons();
     }
     if (mode === 'text') {
-      // Keep this pointer action from falling through to workspace/canvas
-      // defaults after createNodeAt() focuses the freshly rendered editor.
-      if (event.cancelable) event.preventDefault();
+      // Preserve the browser's trusted pointer activation so mobile browsers
+      // can focus the new editor and open the software keyboard.
       event.stopPropagation();
       const p = getStagePoint(event);
       createNodeAt(p.x, p.y);
@@ -4611,7 +4952,10 @@
     }
   });
   document.getElementById('clearBtn').addEventListener('click', () => openConfirm('Очистить рабочее поле?', 'Все узлы и связи будут удалены из текущей схемы. Это действие можно отменить.', 'Очистить', () => {
+    if (playback.active) exitPlayback();
+    if (drag || linkDraft || boxSelect) cancelPointerGesture();
     if (editingId) finishEditing(editingId, true);
+    clearProjectRuntimeCaches(false);
     scene = freshScene(); selectedId = editingId = null; selectedIds.splice(0); linkDraft = null; connectionSourceId = null;
     commitScene('Рабочее поле очищено');
   }));
@@ -4804,8 +5148,17 @@
       positionContextMenu(rect.left, rect.top);
     }
     if (window.innerWidth >= 768) closeMobileSidebar();
-    renderScene(currentRenderScene || scene);
+    if (resizeRenderTimer) clearTimeout(resizeRenderTimer);
+    resizeRenderTimer = window.setTimeout(() => {
+      resizeRenderTimer = 0;
+      // Mobile virtual keyboards resize the visual viewport. Rebuilding the
+      // scene while a contenteditable node is active detaches its editor and
+      // drops the software-keyboard focus, so defer rendering until editing ends.
+      if (editingId !== null) return;
+      renderScene(currentRenderScene || scene);
+    }, 150);
   });
+  workspace.addEventListener('scroll', scheduleViewportCulling, { passive: true });
 
   // Initial state: projects are opened from the start menu, rather than loaded invisibly.
   try {

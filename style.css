@@ -160,12 +160,13 @@
   }
   .playback-track::-moz-range-thumb {
     width: 9px; height: 9px; border-radius: 50%; background: #242424; border: 0;
-    transition: width 180ms ease, height 180ms ease, box-shadow 180ms ease;
+    transform: scale(1); transform-origin: center;
+    transition: transform 180ms ease, box-shadow 180ms ease;
   }
   .playback-track:hover::-moz-range-thumb,
   .playback-track:focus-visible::-moz-range-thumb,
   .playback-track:active::-moz-range-thumb {
-    width: 13px; height: 13px; box-shadow: 0 0 0 4px rgba(36,36,36,.12);
+    transform: scale(1.45); box-shadow: 0 0 0 4px rgba(36,36,36,.12);
   }
   .playback-track:focus-visible { outline: none; }
   .dark-theme .playback-track { background: #414141; }
