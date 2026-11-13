@@ -54,6 +54,9 @@
     <button class="tool-button" id="playHistoryBtn" title="Ускоренно воспроизвести процесс создания схемы">
       <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg></span><span class="label">Анимация создания</span>
     </button>
+    <button class="tool-button" id="projectNotesToggle" type="button" aria-controls="projectNotesPanel" aria-expanded="false" title="Заметки и задачи проекта">
+      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M6 3.5h9l3 3V20.5H6zM15 3.5v4h3M9 11h6M9 14.5h6M9 18h4"/></svg></span><span class="label">Заметки</span>
+    </button>
     <button class="tool-button" id="exportJsonBtn" title="Сохранить проект для последующего импорта">
       <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M12 3v11m-4-4 4 4 4-4M5 16v4h14v-4"/></svg></span><span class="label">Экспорт проекта JSON</span>
     </button>
@@ -161,6 +164,16 @@
                 <button type="button" class="edge-color-swatch" data-edge-color="#185abc" style="--swatch-color:#185abc" aria-label="Синий" title="Синий" aria-pressed="false"></button>
                 <button type="button" class="edge-color-swatch" data-edge-color="#267344" style="--swatch-color:#267344" aria-label="Зелёный" title="Зелёный" aria-pressed="false"></button>
                 <button type="button" class="edge-color-swatch" data-edge-color="#7a35a2" style="--swatch-color:#7a35a2" aria-label="Фиолетовый" title="Фиолетовый" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#e67e22" style="--swatch-color:#e67e22" aria-label="Оранжевый" title="Оранжевый" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#ff9f1c" style="--swatch-color:#ff9f1c" aria-label="Янтарный" title="Янтарный" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#25a9e0" style="--swatch-color:#25a9e0" aria-label="Голубой" title="Голубой" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#00a6a6" style="--swatch-color:#00a6a6" aria-label="Циан" title="Циан" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#2ec4b6" style="--swatch-color:#2ec4b6" aria-label="Бирюзовый" title="Бирюзовый" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#e64980" style="--swatch-color:#e64980" aria-label="Розовый" title="Розовый" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#f1c40f" style="--swatch-color:#f1c40f" aria-label="Жёлтый" title="Жёлтый" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#8d5a3b" style="--swatch-color:#8d5a3b" aria-label="Коричневый" title="Коричневый" aria-pressed="false"></button>
+                <button type="button" class="edge-color-swatch" data-edge-color="#c65d3a" style="--swatch-color:#c65d3a" aria-label="Терракотовый" title="Терракотовый" aria-pressed="false"></button>
+                <label class="edge-custom-color" title="Выбрать произвольный цвет"><span>Свой цвет</span><input type="color" id="edgeCustomColor" value="#171717" aria-label="Произвольный цвет связи"></label>
               </div>
             </div>
             <div class="edge-direction-controls">
@@ -178,6 +191,35 @@
         <div class="modal-actions"><button id="modalCancel">Удалить</button><button class="danger" id="modalConfirm">Сохранить</button></div>
       </div>
     </div>
+    <div class="project-notes-backdrop" id="projectNotesBackdrop" aria-hidden="true"></div>
+    <aside class="project-notes-panel" id="projectNotesPanel" aria-label="Заметки и задачи проекта" aria-hidden="true">
+      <header class="project-notes-header">
+        <div class="project-notes-heading">
+          <h2>Заметки и задачи</h2>
+        </div>
+        <button class="project-notes-close" id="projectNotesClose" type="button" aria-label="Закрыть панель заметок" title="Закрыть">×</button>
+      </header>
+      <div class="project-notes-meta" aria-live="polite">
+        <div class="project-notes-meta-item"><span>Создана</span><strong id="projectCreatedDate">—</strong></div>
+        <div class="project-notes-meta-item"><span>Время работы</span><strong id="projectWorkedTime">0 мин</strong></div>
+      </div>
+      <section class="project-notes-section">
+        <div class="project-notes-section-heading">
+          <h3>Заметки по схеме</h3>
+        </div>
+        <textarea id="projectNotesInput" class="project-notes-textarea" maxlength="100000" placeholder="Записывайте наблюдения, гипотезы, ссылки и важные детали…" spellcheck="true"></textarea>
+      </section>
+      <section class="project-notes-section project-checklist-section">
+        <div class="project-checklist-progress-row">
+          <span id="projectChecklistProgress">0 / 0</span>
+        </div>
+        <form class="project-checklist-form" id="projectChecklistForm">
+          <input id="projectChecklistInput" type="text" maxlength="240" placeholder="Добавить задачу…" autocomplete="off" aria-label="Новая задача">
+          <button type="submit" aria-label="Добавить задачу" title="Добавить задачу">+</button>
+        </form>
+        <div class="project-checklist-list" id="projectChecklistList"></div>
+      </section>
+    </aside>
   </main>
 </div>
 <div class="start-screen visible" id="startScreen" role="dialog" aria-modal="true" aria-label="Главное меню NetNotrh">

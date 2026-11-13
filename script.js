@@ -40,9 +40,10 @@
   const edgeColorToggle = document.getElementById('edgeColorToggle');
   const edgeColorPalette = document.getElementById('edgeColorPalette');
   const edgeColorPreview = document.getElementById('edgeColorPreview');
+  const edgeCustomColorInput = document.getElementById('edgeCustomColor');
   const edgeBidirectionalInput = document.getElementById('edgeBidirectional');
   const edgeArrowheadInput = document.getElementById('edgeArrowhead');
-  const EDGE_COLORS = ['#111111', '#4b4b4b', '#888888', '#bf2929', '#185abc', '#267344', '#7a35a2'];
+  const EDGE_COLORS = ['#111111', '#4b4b4b', '#888888', '#bf2929', '#185abc', '#267344', '#7a35a2', '#e67e22', '#ff9f1c', '#25a9e0', '#00a6a6', '#2ec4b6', '#e64980', '#f1c40f', '#8d5a3b', '#c65d3a'];
   const exitConfirmBackdrop = document.getElementById('exitConfirmBackdrop');
   const exitSaveBtn = document.getElementById('exitSaveBtn');
   const exitWithoutSaveBtn = document.getElementById('exitWithoutSaveBtn');
@@ -60,6 +61,18 @@
   const mobileMenuToggle = document.getElementById('mobileMenuToggle');
   const sidebarBackdrop = document.getElementById('sidebarBackdrop');
   const sidebar = document.querySelector('.sidebar');
+  const mainArea = document.getElementById('mainArea');
+  const projectNotesToggle = document.getElementById('projectNotesToggle');
+  const projectNotesPanel = document.getElementById('projectNotesPanel');
+  const projectNotesBackdrop = document.getElementById('projectNotesBackdrop');
+  const projectNotesClose = document.getElementById('projectNotesClose');
+  const projectNotesInput = document.getElementById('projectNotesInput');
+  const projectChecklistForm = document.getElementById('projectChecklistForm');
+  const projectChecklistInput = document.getElementById('projectChecklistInput');
+  const projectChecklistList = document.getElementById('projectChecklistList');
+  const projectCreatedDate = document.getElementById('projectCreatedDate');
+  const projectWorkedTime = document.getElementById('projectWorkedTime');
+  const projectChecklistProgress = document.getElementById('projectChecklistProgress');
   const selectedIds = [];
   const selectedEdgeIds = [];
   let currentProjectId = null;
@@ -107,6 +120,10 @@
   let undoIndex = -1;
   let timeline = [];
   let projectStartedAt = Date.now();
+  let projectNotes = '';
+  let projectChecklist = [];
+  let projectWorkedMs = 0;
+  let projectSessionStartedAt = 0;
   let playback = { active: false, playing: false, completed: false, generation: 0, startedAt: 0, pausedAt: 0, duration: 8000, frameIndex: 0, raf: 0, savedScrollLeft: 0, savedScrollTop: 0 };
   let toastTimer = 0;
   // Снимок ожидающей записи захватывается в момент saveProject(), а не внутри таймера.
@@ -129,6 +146,120 @@
   function snapshot(model = scene) { return clone({ nodes: model.nodes, edges: model.edges }); }
   function sameJson(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
   function nowRelative() { return Math.max(0, Date.now() - projectStartedAt); }
+
+
+  function hasProjectContent() {
+    return scene.nodes.length > 0 || Boolean(String(projectNotes || '').trim()) || projectChecklist.length > 0;
+  }
+
+  function currentProjectWorkedMs() {
+    const activeMs = currentProjectId && projectSessionStartedAt
+      ? Math.max(0, Date.now() - projectSessionStartedAt)
+      : 0;
+    return Math.max(0, Number(projectWorkedMs) || 0) + activeMs;
+  }
+
+  function checkpointProjectWorkTime() {
+    if (!currentProjectId || !projectSessionStartedAt) return;
+    projectWorkedMs = currentProjectWorkedMs();
+    projectSessionStartedAt = Date.now();
+    updateProjectNotesMeta();
+  }
+
+  function sanitizeProjectChecklist(input) {
+    if (!Array.isArray(input)) return [];
+    return input.slice(0, 300).map(item => ({
+      id: item && typeof item.id === 'string' && item.id ? item.id : safeId(),
+      text: String(item && item.text || '').trim().slice(0, 240),
+      done: Boolean(item && item.done === true)
+    })).filter(item => item.text);
+  }
+
+  function formatProjectDuration(milliseconds) {
+    const totalMinutes = Math.max(0, Math.floor((Number(milliseconds) || 0) / 60000));
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    const minutes = totalMinutes % 60;
+    if (days) return `${days} д ${hours} ч`;
+    if (hours) return `${hours} ч ${minutes} мин`;
+    return `${totalMinutes} мин`;
+  }
+
+  function updateProjectNotesMeta() {
+    if (projectCreatedDate) {
+      const created = new Date(Number(projectStartedAt) || Date.now());
+      projectCreatedDate.textContent = created.toLocaleDateString('ru-RU', {
+        day: 'numeric', month: 'long', year: 'numeric'
+      });
+    }
+    if (projectWorkedTime) projectWorkedTime.textContent = formatProjectDuration(currentProjectWorkedMs());
+  }
+
+  function renderProjectChecklist() {
+    if (!projectChecklistList) return;
+    projectChecklistList.replaceChildren();
+    const completed = projectChecklist.filter(item => item.done).length;
+    if (projectChecklistProgress) projectChecklistProgress.textContent = `${completed} / ${projectChecklist.length}`;
+
+    if (!projectChecklist.length) {
+      const empty = document.createElement('p');
+      empty.className = 'project-checklist-empty';
+      empty.textContent = 'Пока нет задач. Добавьте первый пункт выше.';
+      projectChecklistList.appendChild(empty);
+      return;
+    }
+
+    projectChecklist.forEach(task => {
+      const row = document.createElement('div');
+      row.className = `project-checklist-item${task.done ? ' is-done' : ''}`;
+      row.dataset.taskId = task.id;
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = task.done;
+      checkbox.className = 'project-checklist-checkbox';
+      checkbox.dataset.checklistToggle = task.id;
+      checkbox.setAttribute('aria-label', `Отметить задачу: ${task.text}`);
+
+      const text = document.createElement('span');
+      text.className = 'project-checklist-text';
+      text.textContent = task.text;
+
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'project-checklist-delete';
+      remove.dataset.checklistDelete = task.id;
+      remove.setAttribute('aria-label', `Удалить задачу: ${task.text}`);
+      remove.title = 'Удалить задачу';
+      remove.textContent = '×';
+
+      row.append(checkbox, text, remove);
+      projectChecklistList.appendChild(row);
+    });
+  }
+
+  function syncProjectNotesPanel() {
+    if (projectNotesInput && projectNotesInput.value !== projectNotes) projectNotesInput.value = projectNotes;
+    updateProjectNotesMeta();
+    renderProjectChecklist();
+  }
+
+  function setProjectNotesOpen(open) {
+    const isOpen = Boolean(open);
+    if (!mainArea || !projectNotesPanel) return;
+    if (isOpen) {
+      closeNodeContextMenu();
+      closeProjectActionsMenu();
+    }
+    mainArea.classList.toggle('project-notes-open', isOpen);
+    projectNotesPanel.setAttribute('aria-hidden', String(!isOpen));
+    if (projectNotesBackdrop) projectNotesBackdrop.setAttribute('aria-hidden', String(!isOpen));
+    if (projectNotesToggle) {
+      projectNotesToggle.setAttribute('aria-expanded', String(isOpen));
+      projectNotesToggle.classList.toggle('active', isOpen);
+    }
+    if (isOpen) syncProjectNotesPanel();
+  }
 
   function showToast(message) {
     toastEl.textContent = message;
@@ -249,11 +380,15 @@
         if (legacyRaw) {
           try {
             const legacy = JSON.parse(legacyRaw);
-            legacyIsEmpty = Boolean(legacy && legacy.scene && Array.isArray(legacy.scene.nodes) && legacy.scene.nodes.length === 0);
+            const hasNodes = Array.isArray(legacy?.scene?.nodes) && legacy.scene.nodes.length > 0;
+            const hasNotes = Boolean(String(legacy?.notes || '').trim());
+            const hasTasks = Array.isArray(legacy?.checklist) && legacy.checklist.length > 0;
+            legacyIsEmpty = Boolean(legacy && !hasNodes && !hasNotes && !hasTasks);
           } catch (_) { legacyIsEmpty = false; }
         }
-        // If the index is now empty, the untagged legacy mirror can only be a stale duplicate.
-        if (legacyIsEmpty || updatedIndex.length === 0) {
+        // Preserve the legacy mirror whenever it still contains meaningful project content.
+        // Remove an absent mirror's dangling id, or a mirror confirmed to be truly empty.
+        if (!legacyRaw || legacyIsEmpty) {
           localStorage.removeItem(STORAGE_KEY);
           localStorage.removeItem(STORAGE_PROJECT_ID_KEY);
         }
@@ -278,8 +413,8 @@
   }
 
   function hasUnsavedChanges() {
-    // Empty canvases are handled separately and never produce a save prompt.
-    if (!scene.nodes.length) return false;
+    // A notes-only or checklist-only project is still meaningful project content.
+    if (!hasProjectContent()) return false;
     if (!currentProjectId || !localStorageAvailable) return true;
 
     try {
@@ -290,6 +425,8 @@
 
       const currentTitle = projectTitle.value.trim() || 'Новая схема';
       if ((stored.title || 'Новая схема') !== currentTitle) return true;
+      if (String(stored.notes || '') !== projectNotes) return true;
+      if (!sameJson(sanitizeProjectChecklist(stored.checklist), projectChecklist)) return true;
       // Normalize legacy snapshots so added model defaults do not look like user edits.
       if (!sameJson(sanitizeScene(stored.scene), snapshot())) return true;
 
@@ -311,9 +448,9 @@
   function saveProject() {
     if (!localStorageAvailable || !currentProjectId) return;
 
-    // A blank canvas is not a project yet. Cancel any older queued write for this ID
-    // so an outdated non-empty snapshot cannot bring the project back later.
-    if (!scene.nodes.length) {
+    // Do not persist a truly blank canvas, but preserve projects that contain
+    // notes or checklist items even before the first graph node is created.
+    if (!hasProjectContent()) {
       cancelPendingProjectSave(currentProjectId);
       return;
     }
@@ -332,6 +469,9 @@
         scene: snapshot(),
         timeline: clone(timeline),
         projectStartedAt,
+        workedMs: currentProjectWorkedMs(),
+        notes: projectNotes,
+        checklist: clone(projectChecklist),
         updatedAt: Date.now()
       }
     };
@@ -550,7 +690,7 @@
 
     // A new empty canvas exists only in memory. Rename it there, but do not
     // create a project record or an index entry until the first node is added.
-    if (isActiveProject && scene.nodes.length === 0) {
+    if (isActiveProject && !hasProjectContent()) {
       projectTitle.value = cleanTitle;
       closeRenameProjectModal();
       renderProjectList();
@@ -653,6 +793,12 @@
     if (isActiveProject) {
       projectTitle.value = 'Новая схема';
       currentProjectId = null;
+      projectSessionStartedAt = 0;
+      projectNotes = '';
+      projectChecklist = [];
+      projectWorkedMs = 0;
+      projectStartedAt = Date.now();
+      syncProjectNotesPanel();
       scene = freshScene();
       selectedId = null;
       selectedIds.splice(0);
@@ -684,6 +830,7 @@
     if (persist && localStorageAvailable) {
       try { localStorage.setItem(THEME_KEY, normalized); } catch (_) {}
     }
+    // Rebuild every node after the theme class changes so default text colors are recalculated.
     if (stage) renderScene(currentRenderScene || scene);
   }
 
@@ -735,6 +882,11 @@
     scene = freshScene(); selectedId = null; selectedIds.splice(0); editingId = null; editingOriginalText = null;
     connectionSourceId = null; linkDraft = null; drag = null; boxSelect = null; contextNodeId = null;
     projectTitle.value = newTitle; projectStartedAt = Date.now();
+    projectNotes = '';
+    projectChecklist = [];
+    projectWorkedMs = 0;
+    projectSessionStartedAt = Date.now();
+    syncProjectNotesPanel();
     timeline = [{ at: 0, scene: snapshot() }];
     undoStack = [snapshot()]; undoIndex = 0;
     mode = 'select'; syncModeButtons();
@@ -761,6 +913,11 @@
       projectTitle.value = typeof data.title === 'string' && data.title.trim() ? data.title : 'Новая схема';
       timeline = Array.isArray(data.timeline) ? data.timeline.filter(f => f && f.scene && Array.isArray(f.scene.nodes) && Array.isArray(f.scene.edges)).map(f => ({ at: Math.max(0, Number(f.at) || 0), scene: sanitizeScene(f.scene) })) : [];
       projectStartedAt = Number(data.projectStartedAt) || Date.now();
+      projectNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
+      projectChecklist = sanitizeProjectChecklist(data.checklist);
+      projectWorkedMs = Math.max(0, Number(data.workedMs) || 0);
+      projectSessionStartedAt = Date.now();
+      syncProjectNotesPanel();
       if (!timeline.length) timeline = [{ at: 0, scene: freshScene() }, { at: 1, scene: snapshot() }];
       if (!sameJson(timeline[timeline.length - 1].scene, snapshot())) timeline.push({ at: nowRelative(), scene: snapshot() });
       selectedId = null; selectedIds.splice(0); editingId = null; editingOriginalText = null; linkDraft = null; connectionSourceId = null;
@@ -776,6 +933,8 @@
     // The start menu is no longer editing an active project. Keeping the scene in
     // memory is harmless; clearing its ID prevents pagehide from saving discarded edits.
     currentProjectId = null;
+    projectSessionStartedAt = 0;
+    setProjectNotesOpen(false);
     showStartScreen(true);
   }
 
@@ -788,7 +947,7 @@
     }
 
     // Пустые холсты удаляются без подтверждения и не засоряют список проектов.
-    if (!scene.nodes.length) {
+    if (!hasProjectContent()) {
       deleteEmptyProject(currentProjectId);
       completeExitToStartScreen();
       return;
@@ -800,6 +959,12 @@
     if (!hasChanges) {
       // Даже если изменений нет, не оставляем таймер сохранения висеть при выходе.
       if (hasPendingWrite && !flushPendingSave()) {
+        showToast('Не удалось завершить сохранение. Попробуй ещё раз');
+        return;
+      }
+      checkpointProjectWorkTime();
+      saveProject();
+      if (pendingSave && !flushPendingSave()) {
         showToast('Не удалось завершить сохранение. Попробуй ещё раз');
         return;
       }
@@ -834,7 +999,7 @@
 
   function saveAndExitToStartScreen() {
     if (editingId) finishEditing(editingId, true);
-    if (!scene.nodes.length) {
+    if (!hasProjectContent()) {
       deleteEmptyProject(currentProjectId);
       completeExitToStartScreen();
       return;
@@ -844,6 +1009,7 @@
       return;
     }
 
+    checkpointProjectWorkTime();
     saveProject();
     const saved = flushPendingSave();
     if (!saved) {
@@ -878,7 +1044,7 @@
       height: clamp(Number(n && n.height) || 42, 10, 1200),
       fontSize: clamp(Number(n && n.fontSize) || 16, 8, 80),
       autoSize: !n || n.autoSize !== false,
-      color: ['#111111','#4b4b4b','#888888','#bf2929','#185abc','#267344','#7a35a2'].includes(n && n.color) ? n.color : '#111111',
+      color: typeof (n && n.color) === 'string' && /^#[0-9a-fA-F]{6}$/.test(n.color.trim()) ? n.color.trim().toLowerCase() : '#111111',
       underline: !!(n && n.underline),
       highlight: !!(n && n.highlight),
       type: n && n.type === 'image' ? 'image' : 'text',
@@ -1014,31 +1180,6 @@
     const dx = (b.x + bw / 2) - (a.x + aw / 2);
     const dy = (b.y + bh / 2) - (a.y + ah / 2);
 
-    // Keep siblings attached to the same side of their parent. Pairwise
-    // geometry alone can otherwise send a vertically displaced child to top
-    // or bottom even though the parent's branch is predominantly on the right.
-    const outgoing = scene.edges.filter(edge =>
-      edge.from === a.id && validSide(edge.fromSide)
-    );
-    let preferredSide = null;
-
-    if (outgoing.length) {
-      const counts = new Map();
-      outgoing.forEach(edge => {
-        counts.set(edge.fromSide, (counts.get(edge.fromSide) || 0) + 1);
-      });
-      const maxCount = Math.max(...counts.values());
-      const leaders = [...counts.entries()]
-        .filter(([, count]) => count === maxCount)
-        .map(([side]) => side);
-
-      if (validSide(preferredFromSide) && leaders.includes(preferredFromSide)) {
-        preferredSide = preferredFromSide;
-      } else {
-        preferredSide = leaders[0] || null;
-      }
-    }
-
     const oppositeSide = {
       top: 'bottom',
       right: 'left',
@@ -1046,8 +1187,13 @@
       left: 'right'
     };
 
-    if (preferredSide) {
-      return { fromSide: preferredSide, toSide: oppositeSide[preferredSide] };
+    // A preferred side is supplied only when the user starts a connection
+    // by dragging a specific anchor. All other connections follow geometry.
+    if (validSide(preferredFromSide)) {
+      return {
+        fromSide: preferredFromSide,
+        toSide: oppositeSide[preferredFromSide]
+      };
     }
 
     if (Math.abs(dx) >= Math.abs(dy)) {
@@ -1437,6 +1583,9 @@
     model.nodes.forEach(n => {
       const el = document.createElement('div');
       el.className = 'node';
+      if (!isPlayback && linkDraft && n.id === linkDraft.snapTargetId) {
+        el.classList.add('link-snap-target');
+      }
       if (Number(n.width) <= 18 || Number(n.height) <= 18) el.classList.add('tiny-node');
       el.dataset.nodeId = n.id;
       el.style.left = `${n.x}px`;
@@ -1477,11 +1626,20 @@
         el.style.minWidth = autoSize ? '0' : '10px';
         el.style.minHeight = '0';
         el.style.fontSize = `${n.fontSize || 16}px`;
-        el.style.color = (document.body.classList.contains('dark-theme') && (!n.color || n.color === '#111111')) ? '#f2f2f2' : (n.color || '#111111');
+        const nodeColor = typeof n.color === 'string' ? n.color.trim() : '';
+        const normalizedNodeColor = nodeColor.toLowerCase();
+        const isBaseBlack = !nodeColor || normalizedNodeColor === '#111111' || normalizedNodeColor === '#171717';
+        const isDarkTheme = document.body.classList.contains('dark-theme');
+        const calculatedColor = isBaseBlack
+          ? (isDarkTheme && !n.highlight ? '#f2f2f2' : '#111111')
+          : nodeColor;
+        el.style.setProperty('color', calculatedColor, 'important');
         if (n.underline) el.classList.add('underlined');
         if (n.highlight) el.classList.add('highlight');
         const textSpan = document.createElement('span');
         textSpan.className = 'node-text';
+        // Apply the resolved node color directly to the text wrapper as well as its container.
+        textSpan.style.setProperty('color', calculatedColor, 'important');
         if (!isPlayback && n.id !== editingId) {
           appendTextWithLinks(textSpan, n.text);
         } else {
@@ -1669,7 +1827,9 @@
         selectedIds.splice(0);
         selectedEdgeIds.splice(0, selectedEdgeIds.length, edge.id);
         closeNodeContextMenu();
-        renderScene();
+        refreshNodeSelectionDecorations(scene, false);
+        refreshEdgeSelectionDecorations(scene, false);
+        updateActionButtons();
       });
       hit.addEventListener('contextmenu', event => {
         // Block the browser's native context menu before doing any UI work.
@@ -1685,9 +1845,12 @@
       p.setAttribute('class', edgeClasses.join(' '));
       p.setAttribute('d', d);
       p.dataset.edgeId = edge.id;
-      const edgeColor = typeof edge.color === 'string' && /^#[0-9a-f]{6}$/i.test(edge.color)
-        ? edge.color
+      const rawEdgeColor = typeof edge.color === 'string' && /^#[0-9a-f]{6}$/i.test(edge.color)
+        ? edge.color.toLowerCase()
         : '#171717';
+      const isDarkTheme = document.body.classList.contains('dark-theme');
+      const isDefaultDarkEdge = rawEdgeColor === '#171717' || rawEdgeColor === '#111111';
+      const edgeColor = (isDarkTheme && isDefaultDarkEdge) ? '#e5e5e5' : rawEdgeColor;
       p.style.setProperty('stroke', edgeColor);
 
       // Marker IDs are unique per edge so each arrowhead can use its own color.
@@ -1722,11 +1885,15 @@
       const origin = nodeById(linkDraft.fromId, scene);
       if (origin) {
         const aPoint = getStageNodePoint(origin, linkDraft.fromSide);
-        const bPoint = { x: linkDraft.x, y: linkDraft.y };
+        const snapTarget = linkDraft.snapTargetId ? nodeById(linkDraft.snapTargetId, model) : null;
+        const previewSide = snapTarget && validSide(linkDraft.snapSide) ? linkDraft.snapSide : 'left';
+        const bPoint = snapTarget
+          ? getStageNodePoint(snapTarget, previewSide)
+          : { x: linkDraft.x, y: linkDraft.y };
         const p = document.createElementNS('http://www.w3.org/2000/svg','path');
         p.setAttribute('class', 'edge-preview');
         p.setAttribute('id', 'linkPreview');
-        p.setAttribute('d', pathFor(aPoint, bPoint, linkDraft.fromSide, 'left'));
+        p.setAttribute('d', pathFor(aPoint, bPoint, linkDraft.fromSide, previewSide));
         svg.appendChild(p);
       }
     }
@@ -1818,6 +1985,19 @@
       }
       placeCaretAtEnd(newEditor);
 
+      // Re-assert focus on the next frame after the canvas pointerdown/click
+      // sequence has settled. Re-rendering can detach the original target and
+      // some browsers briefly move focus back to the canvas/body.
+      window.requestAnimationFrame(() => {
+        if (editingId !== n.id || !newEditor.isConnected) return;
+        try {
+          newEditor.focus({ preventScroll: true });
+        } catch (_) {
+          newEditor.focus();
+        }
+        placeCaretAtEnd(newEditor);
+      });
+
     } else {
       console.warn('[NetNotrh] Created text node has no .node-text editor in DOM', n.id);
     }
@@ -1863,7 +2043,7 @@
     renderScene();
   }
 
-  function selectNode(id, preserveMultiSelection = false, render = true) {
+  function selectNode(id, preserveMultiSelection = false, render = false) {
     if (playback.active) exitPlayback();
     if (editingId && editingId !== id) finishEditing(editingId, true);
     selectedEdgeIds.splice(0);
@@ -1956,6 +2136,8 @@
     drag = null;
     wasDragging = false;
     linkDraft = null;
+    // Clear any magnetic target highlight when a connection gesture is cancelled.
+    renderedNodeElements.forEach(el => el.classList.remove('link-snap-target'));
     if (activeBox && activeBox.element.isConnected) activeBox.element.remove();
     boxSelect = null;
     workspace.classList.remove('panning');
@@ -1968,6 +2150,7 @@
     clearLongPress();
     activeTouchPointers.clear();
     pinchState = null;
+    workspace.classList.remove('pinching');
   });
 
   function startNodeDrag(event, id) {
@@ -2003,14 +2186,22 @@
     if (playback.active || linkDraft || drag || boxSelect) return;
     const n = nodeById(id); if (!n) return;
     selectedId = id; selectedIds.splice(0, selectedIds.length, id);
-    // Text scales by font size and stays content-sized; images use explicit pixel dimensions.
+    // Use the rendered box as the resize baseline. Model width/height may be stale
+    // for auto-sized text nodes, while getBoundingClientRect reflects the visible box.
     const originAutoSize = n.autoSize;
-    n.width = Math.max(10, Number(n.width) || 10);
-    n.height = Math.max(10, Number(n.height) || 10);
-    const originW = n.width;
-    const originH = n.height;
-    const originFontSize = clamp(Number(n.fontSize) || 16, 8, 80);
-    n.autoSize = n.type === 'image' ? false : true;
+    const nodeElement = renderedNodeElements.get(id);
+    const nodeRect = nodeElement && nodeElement.isConnected ? nodeElement.getBoundingClientRect() : null;
+    const resizeZoom = Math.max(0.0001, Number(zoom) || 1);
+    const originW = Math.max(10, nodeRect && nodeRect.width > 0
+      ? nodeRect.width / resizeZoom
+      : (Number(n.width) || 10));
+    const originH = Math.max(10, nodeRect && nodeRect.height > 0
+      ? nodeRect.height / resizeZoom
+      : (Number(n.height) || 10));
+    const originFontSize = clamp(Number(n.fontSize) || 16, 10, 80);
+    // Once a text node is resized, persist its proportional width so existing
+    // line breaks do not collapse back to max-content after the drag commits.
+    n.autoSize = false;
     drag = { type: 'resize', id, handle, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, originW, originH, originFontSize, originAutoSize, moved: false, pointerId: event.pointerId };
     attachPointerGesture(onPointerMove, onPointerUp);
   }
@@ -2039,13 +2230,84 @@
     attachPointerGesture(onPointerMove, onPointerUp);
   }
 
+  function findLinkSnapCandidate(point, draft) {
+    if (!point || !draft) return null;
+    const origin = nodeById(draft.fromId);
+    if (!origin) return null;
+
+    // point is in stage coordinates, so convert the screen-space snap radius
+    // into model coordinates to keep the magnetic distance visually constant.
+    const snapRadius = 65 / Math.max(0.01, zoom || 1);
+    let best = null;
+
+    scene.nodes.forEach(targetNode => {
+      if (!targetNode || targetNode.id === draft.fromId) return;
+      const element = renderedNodeElements.get(targetNode.id);
+      const width = Math.max(10, element ? element.offsetWidth : (Number(targetNode.width) || 10));
+      const height = Math.max(10, element ? element.offsetHeight : (Number(targetNode.height) || 10));
+      const left = Number(targetNode.x) || 0;
+      const top = Number(targetNode.y) || 0;
+      const right = left + width;
+      const bottom = top + height;
+      const nearestX = clamp(point.x, left, right);
+      const nearestY = clamp(point.y, top, bottom);
+      const boundaryDistance = Math.hypot(point.x - nearestX, point.y - nearestY);
+      if (boundaryDistance > snapRadius) return;
+
+      // If nodes overlap, prefer the one whose center is actually nearer.
+      const centerDistance = Math.hypot(
+        point.x - (left + width / 2),
+        point.y - (top + height / 2)
+      );
+      if (best && (
+        boundaryDistance > best.boundaryDistance + 0.001 ||
+        (Math.abs(boundaryDistance - best.boundaryDistance) <= 0.001 && centerDistance >= best.centerDistance)
+      )) return;
+
+      const sides = chooseSides(origin, targetNode, draft.fromSide);
+      best = {
+        node: targetNode,
+        snapSide: sides.toSide,
+        boundaryDistance,
+        centerDistance
+      };
+    });
+
+    return best;
+  }
+
+  function setLinkSnapTarget(draft, candidate) {
+    if (!draft) return;
+    const nextId = candidate && candidate.node ? candidate.node.id : null;
+    const previousId = draft.snapTargetId || null;
+
+    if (previousId && previousId !== nextId) {
+      renderedNodeElements.get(previousId)?.classList.remove('link-snap-target');
+    }
+
+    draft.snapTargetId = nextId;
+    draft.snapSide = candidate && validSide(candidate.snapSide) ? candidate.snapSide : null;
+
+    if (nextId) {
+      renderedNodeElements.get(nextId)?.classList.add('link-snap-target');
+    }
+  }
+
   function startLink(event, id, side) {
     event.preventDefault(); event.stopPropagation();
     if (playback.active || drag || linkDraft || boxSelect || editingId) return;
     selectedEdgeIds.splice(0);
     selectedId = id; selectedIds.splice(0, selectedIds.length, id);
     const p = getStagePoint(event);
-    linkDraft = { fromId: id, fromSide: side, x: p.x, y: p.y, pointerId: event.pointerId };
+    linkDraft = {
+      fromId: id,
+      fromSide: side,
+      x: p.x,
+      y: p.y,
+      snapTargetId: null,
+      snapSide: null,
+      pointerId: event.pointerId
+    };
     // Один рендер для создания пунктирной линии; во время перетаскивания узлы не пересоздаются.
     renderScene();
     attachPointerGesture(onPointerMove, onPointerUp);
@@ -2143,13 +2405,14 @@
           el.style.width = `${Math.max(10, node.width)}px`;
           el.style.height = `${Math.max(10, node.height)}px`;
         } else {
-          // Scale the text itself. The node follows max-content dimensions so
-          // shrinking changes font size rather than wrapping letters vertically.
-          el.style.width = 'max-content';
+          // Keep the original wrapping proportions while the font scales.
+          // This prevents multiline nodes from expanding into one long line
+          // when a corner handle is dragged.
+          const fontRatio = clamp(Number(node.fontSize) || 16, 10, 80) / (drag.originFontSize || 16);
+          el.style.width = `${Math.max(10, Math.round(drag.originW * fontRatio))}px`;
           el.style.height = 'auto';
           el.style.overflowWrap = 'normal';
-          el.style.whiteSpace = 'pre';
-          el.style.fontSize = `${clamp(Number(node.fontSize) || 16, 8, 80)}px`;
+          el.style.fontSize = `${clamp(Number(node.fontSize) || 16, 10, 80)}px`;
 
           // Measure only the currently resized node. Convert viewport dimensions
           // back to graph coordinates to avoid rounding drift at non-100% zoom.
@@ -2247,29 +2510,43 @@
           n.x = west ? Math.max(0, drag.originX + drag.originW - n.width) : drag.originX;
           n.y = north ? Math.max(0, drag.originY + drag.originH - n.height) : drag.originY;
         } else {
-          // Scale the complete text node from the dragged corner instead of
-          // constraining width. Content dimensions are measured in paintDragGeometry.
+          // Project pointer movement onto the node's original diagonal. This
+          // gives a stable, direction-aware scale for every corner handle and
+          // avoids independent X/Y scaling that can drift at font-size limits.
           const originW = Math.max(10, drag.originW);
           const originH = Math.max(10, drag.originH);
-          const targetW = Math.max(10, originW + horizontalDelta);
-          const targetH = Math.max(10, originH + verticalDelta);
           const originDiagonal = Math.max(1, Math.hypot(originW, originH));
-          const scaleFactor = Math.hypot(targetW, targetH) / originDiagonal;
-          const originFontSize = clamp(Number(drag.originFontSize) || Number(n.fontSize) || 16, 8, 80);
-          n.fontSize = Math.round(clamp(originFontSize * scaleFactor, 8, 80) * 10) / 10;
-          // Text keeps natural content width; font size is its scaling source.
-          n.autoSize = true;
+          const diagonalX = originW / originDiagonal;
+          const diagonalY = originH / originDiagonal;
+          const projectedMovement = horizontalDelta * diagonalX + verticalDelta * diagonalY;
+          const scaleFactor = Math.max(0, 1 + projectedMovement / originDiagonal);
+          const originFontSize = clamp(Number(drag.originFontSize) || Number(n.fontSize) || 16, 10, 80);
+          const clampedFontSize = clamp(originFontSize * scaleFactor, 10, 80);
+          n.fontSize = clamp(Math.round(clampedFontSize * 2) / 2, 10, 80);
+          // Apply the font size immediately; the next geometry paint measures
+          // the resulting DOM box and anchors its opposite corner to originX/Y.
+          const textElement = renderedNodeElements.get(drag.id);
+          if (textElement) textElement.style.fontSize = `${n.fontSize}px`;
+          n.autoSize = false;
         }
       }
       scheduleDragGeometryPaint();
     } else if (linkDraft) {
       const point = getStagePoint(event);
       linkDraft.x = point.x; linkDraft.y = point.y;
+
+      const snapCandidate = findLinkSnapCandidate(point, linkDraft);
+      setLinkSnapTarget(linkDraft, snapCandidate);
+
       const preview = stage.querySelector('#linkPreview');
       const origin = nodeById(linkDraft.fromId);
       if (preview && origin) {
         const aPoint = getStageNodePoint(origin, linkDraft.fromSide);
-        preview.setAttribute('d', pathFor(aPoint, point, linkDraft.fromSide, 'left'));
+        const previewSide = snapCandidate ? snapCandidate.snapSide : 'left';
+        const previewPoint = snapCandidate
+          ? getStageNodePoint(snapCandidate.node, snapCandidate.snapSide)
+          : point;
+        preview.setAttribute('d', pathFor(aPoint, previewPoint, linkDraft.fromSide, previewSide));
       }
     }
   }
@@ -2309,21 +2586,38 @@
       return;
     }
     if (linkDraft) {
-      const draft = linkDraft; linkDraft = null;
+      const draft = linkDraft;
       const under = document.elementFromPoint(event.clientX, event.clientY);
       const nodeEl = under && under.closest ? under.closest('.node[data-node-id]') : null;
-      const targetId = nodeEl ? nodeEl.dataset.nodeId : null;
-      let targetSide = null;
+      const directTargetId = nodeEl ? nodeEl.dataset.nodeId : null;
       const anchorEl = under && under.closest ? under.closest('.anchor') : null;
-      if (anchorEl) targetSide = [...anchorEl.classList].find(c => validSide(c));
-      if (targetId && targetId !== draft.fromId) {
-        const source = nodeById(draft.fromId), target = nodeById(targetId);
-        if (source && target) {
-          let sides = chooseSides(source, target);
-          if (targetSide) sides.toSide = targetSide;
-          addEdge(draft.fromId, targetId, draft.fromSide, sides.toSide);
-          return;
+      const directAnchorSide = anchorEl ? [...anchorEl.classList].find(c => validSide(c)) : null;
+      const releasePoint = getStagePoint(event);
+      const releaseSnap = findLinkSnapCandidate(releasePoint, draft);
+
+      // A node directly under the pointer wins (and an explicit target anchor
+      // wins over the calculated side). Otherwise keep the magnetic snap target.
+      let targetId = directTargetId
+        ? (directTargetId !== draft.fromId ? directTargetId : null)
+        : (releaseSnap?.node.id || draft.snapTargetId || null);
+      let targetSide = null;
+      if (targetId) {
+        if (directTargetId === targetId && directAnchorSide) {
+          targetSide = directAnchorSide;
+        } else if (releaseSnap && releaseSnap.node.id === targetId) {
+          targetSide = releaseSnap.snapSide;
+        } else if (draft.snapTargetId === targetId && validSide(draft.snapSide)) {
+          targetSide = draft.snapSide;
         }
+      }
+
+      linkDraft = null;
+      const source = nodeById(draft.fromId);
+      const target = targetId ? nodeById(targetId) : null;
+      if (source && target && target.id !== source.id) {
+        const sides = chooseSides(source, target, draft.fromSide);
+        addEdge(draft.fromId, target.id, draft.fromSide, targetSide || sides.toSide);
+        return;
       }
       renderScene();
     }
@@ -2334,19 +2628,22 @@
   // Это происходит только при создании связи: последующее ручное перемещение остаётся свободным.
   function autoArrangeBranch(sourceId, side) {
     const source = nodeById(sourceId);
-    if (!source) return false;
+    if (!source || !validSide(side)) return false;
 
-    const outgoing = scene.edges.filter(edge => edge.from === sourceId && edge.fromSide === side);
-    const targetIds = [...new Set(outgoing.map(edge => edge.to))];
+    // Only edges originating from this exact parent side participate.
+    const branchEdges = scene.edges.filter(edge =>
+      edge.from === sourceId && edge.fromSide === side
+    );
+    const targetIds = [...new Set(branchEdges.map(edge => edge.to))];
     if (targetIds.length < 2) return false;
 
-    // Only arrange siblings that belong to this same branch. Nodes connected
-    // from another side of the source may have an intentional, different role.
-    const conflictingTargets = new Set(scene.edges
+    // A node also connected from another side has an independent relationship
+    // there, so leave its position untouched rather than pulling it into this branch.
+    const targetsConnectedFromOtherSides = new Set(scene.edges
       .filter(edge => edge.from === sourceId && edge.fromSide !== side)
       .map(edge => edge.to));
     const targets = targetIds
-      .filter(id => !conflictingTargets.has(id))
+      .filter(id => !targetsConnectedFromOtherSides.has(id))
       .map(id => nodeById(id))
       .filter(Boolean);
     if (targets.length < 2) return false;
@@ -2356,12 +2653,11 @@
     const before = new Map(targets.map(node => [node.id, { x: node.x, y: node.y }]));
     const widthOf = node => Math.max(10, Number(node.width) || 10);
     const heightOf = node => Math.max(10, Number(node.height) || 10);
-    let ordered;
 
     if (side === 'right' || side === 'left') {
-      // Keep the sibling order but center the complete column on the parent's
-      // vertical midpoint, not on the children's previous average position.
-      ordered = [...targets].sort((a, b) =>
+      // Align only this side's targets into a vertical column. Preserve their
+      // average X depth so branches on the opposite side remain independent.
+      const ordered = [...targets].sort((a, b) =>
         (a.y + heightOf(a) / 2) - (b.y + heightOf(b) / 2)
       );
       const totalHeight = ordered.reduce((sum, node) => sum + heightOf(node), 0)
@@ -2369,13 +2665,12 @@
       const sourceCenterY = source.y + heightOf(source) / 2;
       let y = sourceCenterY - totalHeight / 2;
 
-      // Keep the existing branch depth while aligning all sibling faces.
-      const alignedEdge = side === 'right'
+      const averageAlignedEdge = side === 'right'
         ? ordered.reduce((sum, node) => sum + node.x, 0) / ordered.length
         : ordered.reduce((sum, node) => sum + node.x + widthOf(node), 0) / ordered.length;
       const leftEdge = side === 'right'
-        ? Math.max(0, alignedEdge)
-        : Math.max(Math.max(...ordered.map(widthOf)), alignedEdge);
+        ? Math.max(0, averageAlignedEdge)
+        : Math.max(Math.max(...ordered.map(widthOf)), averageAlignedEdge);
 
       ordered.forEach(node => {
         node.x = side === 'right' ? leftEdge : leftEdge - widthOf(node);
@@ -2383,9 +2678,9 @@
         y += heightOf(node) + verticalGap;
       });
     } else {
-      // For top/bottom branches, keep left-to-right order and center the row
-      // on the parent's horizontal midpoint.
-      ordered = [...targets].sort((a, b) =>
+      // Align only this side's targets into a horizontal row. Preserve their
+      // average Y depth independently from branches above or below the source.
+      const ordered = [...targets].sort((a, b) =>
         (a.x + widthOf(a) / 2) - (b.x + widthOf(b) / 2)
       );
       const totalWidth = ordered.reduce((sum, node) => sum + widthOf(node), 0)
@@ -2393,12 +2688,12 @@
       const sourceCenterX = source.x + widthOf(source) / 2;
       let x = sourceCenterX - totalWidth / 2;
 
-      const alignedEdge = side === 'bottom'
+      const averageAlignedEdge = side === 'bottom'
         ? ordered.reduce((sum, node) => sum + node.y, 0) / ordered.length
         : ordered.reduce((sum, node) => sum + node.y + heightOf(node), 0) / ordered.length;
       const topEdge = side === 'bottom'
-        ? Math.max(0, alignedEdge)
-        : Math.max(Math.max(...ordered.map(heightOf)), alignedEdge);
+        ? Math.max(0, averageAlignedEdge)
+        : Math.max(Math.max(...ordered.map(heightOf)), averageAlignedEdge);
 
       ordered.forEach(node => {
         node.x = x;
@@ -2407,19 +2702,9 @@
       });
     }
 
-    // Recalculate both sides against the final positions. The current side is
-    // passed as a tie-breaker; chooseSides still promotes a clear majority side
-    // for all siblings of the same parent.
-    scene.edges.forEach(edge => {
-      const sourceNode = nodeById(edge.from);
-      const targetNode = nodeById(edge.to);
-      if (sourceNode && targetNode) {
-        const dynamicSides = chooseSides(sourceNode, targetNode, edge.fromSide);
-        edge.fromSide = dynamicSides.fromSide;
-        edge.toSide = dynamicSides.toSide;
-      }
-    });
-
+    // Do not run chooseSides across the whole scene here: that used to rewrite
+    // unrelated branches and collapse the parent's four independent directions.
+    // Keep each edge's chosen anchor sides intact while only positions change.
     return targets.some(node => {
       const old = before.get(node.id);
       return old && (Math.abs(old.x - node.x) > 0.25 || Math.abs(old.y - node.y) > 0.25);
@@ -2691,8 +2976,8 @@
           return;
         }
 
-        if (pixelWidth > 800 || pixelHeight > 800) {
-          const resizeScale = Math.min(800 / pixelWidth, 800 / pixelHeight);
+        if (pixelWidth > 512 || pixelHeight > 512) {
+          const resizeScale = Math.min(512 / pixelWidth, 512 / pixelHeight);
           const targetWidth = Math.max(1, Math.round(pixelWidth * resizeScale));
           const targetHeight = Math.max(1, Math.round(pixelHeight * resizeScale));
           const tempCanvas = document.createElement('canvas');
@@ -2707,7 +2992,7 @@
           ctx.fillRect(0, 0, targetWidth, targetHeight);
           ctx.drawImage(sourceImage, 0, 0, targetWidth, targetHeight);
           try {
-            imageData = tempCanvas.toDataURL('image/jpeg', 0.7);
+            imageData = tempCanvas.toDataURL('image/jpeg', 0.65);
           } catch (error) {
             console.warn('Image compression failed:', error);
             showToast('Не удалось сжать изображение');
@@ -2781,6 +3066,9 @@
   }
 
   function showCanvasContextMenu(x, y) {
+    if (mainArea && mainArea.classList.contains('project-notes-open')) {
+      setProjectNotesOpen(false);
+    }
     contextNodeId = null;
     pendingImagePoint = { ...contextCanvasPoint };
     canvasContextActions.hidden = false;
@@ -2790,6 +3078,9 @@
   }
 
   function showNodeContextMenu(id, x, y) {
+    if (mainArea && mainArea.classList.contains('project-notes-open')) {
+      setProjectNotesOpen(false);
+    }
     pendingImagePoint = getStagePoint({ clientX: x, clientY: y });
     contextCanvasPoint = { ...pendingImagePoint };
     selectedEdgeIds.splice(0);
@@ -3023,6 +3314,7 @@
         button.setAttribute('aria-pressed', 'false');
       });
       if (edgeColorPreview) edgeColorPreview.style.backgroundColor = '#171717';
+      if (edgeCustomColorInput) edgeCustomColorInput.value = '#171717';
       if (edgeBidirectionalInput) {
         edgeBidirectionalInput.checked = false;
         edgeBidirectionalInput.indeterminate = false;
@@ -3049,7 +3341,11 @@
       button.classList.toggle('active', active);
       button.setAttribute('aria-pressed', String(active));
     });
-    if (edgeColorPreview) edgeColorPreview.style.backgroundColor = commonColor || colors[0] || '#171717';
+    const editorColor = commonColor || colors[0] || '#171717';
+    if (edgeColorPreview) edgeColorPreview.style.backgroundColor = editorColor;
+    if (edgeCustomColorInput && /^#[0-9a-f]{6}$/i.test(editorColor)) {
+      edgeCustomColorInput.value = editorColor;
+    }
 
     const bidirectionalValues = targets.map(edge => edge.bidirectional === true);
     const allBidirectional = bidirectionalValues.length > 0 && bidirectionalValues.every(Boolean);
@@ -3137,8 +3433,8 @@
       });
       edgeStyleOptions.querySelectorAll('[data-edge-color]').forEach(button => {
         button.onclick = () => {
-          const color = button.dataset.edgeColor;
-          if (!EDGE_COLORS.includes(color)) return;
+          const color = String(button.dataset.edgeColor || '').toLowerCase();
+          if (!/^#[0-9a-f]{6}$/i.test(color) || !EDGE_COLORS.includes(color)) return;
           updateSelectedEdgeProperty(
             selectedEdgeSnapshot,
             'color',
@@ -3149,6 +3445,21 @@
           if (edgeColorToggle) edgeColorToggle.setAttribute('aria-expanded', 'true');
         };
       });
+
+      if (edgeCustomColorInput) {
+        edgeCustomColorInput.oninput = () => {
+          const color = String(edgeCustomColorInput.value || '').toLowerCase();
+          if (!/^#[0-9a-f]{6}$/i.test(color)) return;
+          updateSelectedEdgeProperty(
+            selectedEdgeSnapshot,
+            'color',
+            color,
+            'Произвольный цвет связи обновлён'
+          );
+          if (edgeColorPalette) edgeColorPalette.hidden = false;
+          if (edgeColorToggle) edgeColorToggle.setAttribute('aria-expanded', 'true');
+        };
+      }
 
       if (edgeBidirectionalInput) {
         edgeBidirectionalInput.onchange = () => updateSelectedEdgeProperty(
@@ -3176,7 +3487,14 @@
   }
 
   function exportProjectJSON() {
-    const data = { format: 'osint-visualization', version: 1, title: projectTitle.value.trim() || 'Новая схема', scene: snapshot(), timeline, projectStartedAt };
+    const data = {
+      format: 'osint-visualization', version: 1,
+      title: projectTitle.value.trim() || 'Новая схема',
+      scene: snapshot(), timeline, projectStartedAt,
+      workedMs: currentProjectWorkedMs(),
+      notes: projectNotes,
+      checklist: clone(projectChecklist)
+    };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -3369,7 +3687,11 @@
             ctx.lineTo(tx + point.x * scale, ty + point.y * scale);
           });
         }
-        const edgeColor = edge.color || '#111111';
+        const rawEdgeColor = typeof edge.color === 'string' && /^#[0-9a-f]{6}$/i.test(edge.color)
+          ? edge.color.toLowerCase()
+          : '#171717';
+        const isDefaultDarkEdge = rawEdgeColor === '#171717' || rawEdgeColor === '#111111';
+        const edgeColor = (dark && isDefaultDarkEdge) ? '#e5e5e5' : rawEdgeColor;
         ctx.strokeStyle = edgeColor;
         ctx.lineWidth = Math.max(1, 1.7 * scale);
         ctx.setLineDash(edge.style === 'dashed' ? [6, 6] : []);
@@ -3432,21 +3754,37 @@
         const px = tx + (Number(node.x) || 0) * scale + 4 * scale;
         const py = ty + (Number(node.y) || 0) * scale + 2 * scale;
         const nodeWidth = Math.max(10, Number(node.width) || 10);
-        const maxTextW = Math.max(fontSize * 2, (nodeWidth - 8) * scale);
+        // Match the live DOM letter spacing and leave a small width allowance
+        // for Canvas-vs-DOM font metric differences to prevent premature wraps.
+        if ('letterSpacing' in ctx) {
+          ctx.letterSpacing = `${-0.25 * scale}px`;
+        }
+        const maxTextW = Math.max(fontSize * 2, (nodeWidth - 2) * scale);
         const lines = wrapCanvasText(ctx, node.text, maxTextW);
         const lineHeight = fontSize * 1.28;
+        const nodeColor = typeof node.color === 'string' ? node.color.trim() : '';
+        const normalizedNodeColor = nodeColor.toLowerCase();
+        const isBaseBlack = !nodeColor || normalizedNodeColor === '#111111' || normalizedNodeColor === '#171717';
+        const nodeTextColor = isBaseBlack
+          ? (dark && !node.highlight ? '#f2f2f2' : '#111111')
+          : nodeColor;
 
         lines.forEach((line, i) => {
           const baseline = py + fontSize * .98 + i * lineHeight;
-          const lineWidth = Math.min(maxTextW, ctx.measureText(line).width);
+          const measuredLineWidth = ctx.measureText(line).width;
+          const lineWidth = Math.min(maxTextW, measuredLineWidth);
           if (node.highlight) {
             ctx.fillStyle = '#ffea00';
             ctx.fillRect(px - 2 * scale, baseline - fontSize * .86,
                          lineWidth + 4 * scale, fontSize * 1.13);
           }
-          ctx.fillStyle = (dark && (!node.color || node.color === '#111111'))
-            ? '#f2f2f2' : (node.color || '#111111');
-          ctx.fillText(line, px, baseline, maxTextW);
+          ctx.fillStyle = nodeTextColor;
+          // Do not let fillText horizontally squeeze a line that already fits.
+          if (measuredLineWidth <= maxTextW) {
+            ctx.fillText(line, px, baseline);
+          } else {
+            ctx.fillText(line, px, baseline, maxTextW);
+          }
           if (node.underline) {
             ctx.strokeStyle = ctx.fillStyle;
             ctx.lineWidth = Math.max(1, 1.5 * scale);
@@ -3456,6 +3794,9 @@
             ctx.stroke();
           }
         });
+        if ('letterSpacing' in ctx) {
+          ctx.letterSpacing = '0px';
+        }
       });
 
       const name = (projectTitle.value.trim() || 'NetNotrh').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNotrh';
@@ -3503,6 +3844,9 @@
               }))
           : [];
         const importedProjectStartedAt = Number(data.projectStartedAt) || Date.now();
+        const importedNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
+        const importedChecklist = sanitizeProjectChecklist(data.checklist);
+        const importedWorkedMs = Math.max(0, Number(data.workedMs) || 0);
 
         if (!importedTimeline.length) {
           importedTimeline = [
@@ -3520,6 +3864,11 @@
         projectTitle.value = importedTitle;
         timeline = importedTimeline;
         projectStartedAt = importedProjectStartedAt;
+        projectNotes = importedNotes;
+        projectChecklist = importedChecklist;
+        projectWorkedMs = importedWorkedMs;
+        projectSessionStartedAt = Date.now();
+        syncProjectNotesPanel();
         selectedId = editingId = null;
         selectedIds.splice(0);
         mode = 'select';
@@ -3903,6 +4252,9 @@
   }
 
   function handleWorkspaceTouchDown(event) {
+    const initialTouchTarget = event.target instanceof Element ? event.target : null;
+    if (initialTouchTarget && initialTouchTarget.closest('#projectNotesPanel')) return;
+
     // A previous pointerup/cancel may have detached the global touch trackers.
     // Restore them before processing this new pointer sequence.
     attachWorkspaceTouchListeners();
@@ -3943,6 +4295,7 @@
     if (activeTouchPointers.size >= 2) {
       cancelGestureForPinch();
       pinchState = rebasePinchFromActivePointers();
+      workspace.classList.toggle('pinching', !!pinchState);
       event.preventDefault();
       event.stopImmediatePropagation();
       return;
@@ -4001,6 +4354,8 @@
       } else if (activeTouchPointers.size === 0) {
         pinchState = null;
       }
+      // Keep the performance mode until all fingers have left the canvas.
+      workspace.classList.toggle('pinching', !!pinchState);
       // When one finger remains, pinchState intentionally stays active until it is lifted.
       if (event.cancelable) event.preventDefault();
     }
@@ -4131,6 +4486,10 @@
       updateActionButtons();
     }
     if (mode === 'text') {
+      // Keep this pointer action from falling through to workspace/canvas
+      // defaults after createNodeAt() focuses the freshly rendered editor.
+      if (event.cancelable) event.preventDefault();
+      event.stopPropagation();
       const p = getStagePoint(event);
       createNodeAt(p.x, p.y);
       return;
@@ -4197,6 +4556,60 @@
   playbackRange.addEventListener('input', event => seekPlayback(event.target.value));
   projectTitle.addEventListener('input', saveProject);
   projectTitle.addEventListener('blur', () => { if (!projectTitle.value.trim()) projectTitle.value = 'Новая схема'; saveProject(); });
+
+
+  projectNotesToggle.addEventListener('click', () => {
+    closeMobileSidebar();
+    setProjectNotesOpen(!mainArea.classList.contains('project-notes-open'));
+  });
+  projectNotesClose.addEventListener('click', () => setProjectNotesOpen(false));
+  projectNotesBackdrop.addEventListener('click', () => setProjectNotesOpen(false));
+  projectNotesInput.addEventListener('input', () => {
+    projectNotes = projectNotesInput.value.slice(0, 100000);
+    saveProject();
+  });
+  projectChecklistForm.addEventListener('submit', event => {
+    event.preventDefault();
+    const text = projectChecklistInput.value.trim().slice(0, 240);
+    if (!text) return;
+    if (projectChecklist.length >= 300) {
+      showToast('В чек-листе можно хранить не более 300 задач');
+      return;
+    }
+    projectChecklist.push({ id: safeId(), text, done: false });
+    projectChecklistInput.value = '';
+    renderProjectChecklist();
+    saveProject();
+    projectChecklistInput.focus({ preventScroll: true });
+  });
+  projectChecklistList.addEventListener('change', event => {
+    const checkbox = event.target.closest('[data-checklist-toggle]');
+    if (!checkbox) return;
+    const task = projectChecklist.find(item => item.id === checkbox.dataset.checklistToggle);
+    if (!task) return;
+    task.done = checkbox.checked;
+    const row = checkbox.closest('.project-checklist-item');
+    if (row) row.classList.toggle('is-done', task.done);
+    if (projectChecklistProgress) {
+      const completed = projectChecklist.filter(item => item.done).length;
+      projectChecklistProgress.textContent = `${completed} / ${projectChecklist.length}`;
+    }
+    saveProject();
+  });
+  projectChecklistList.addEventListener('click', event => {
+    const remove = event.target.closest('[data-checklist-delete]');
+    if (!remove) return;
+    const id = remove.dataset.checklistDelete;
+    projectChecklist = projectChecklist.filter(item => item.id !== id);
+    renderProjectChecklist();
+    saveProject();
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && mainArea.classList.contains('project-notes-open')) {
+      setProjectNotesOpen(false);
+      event.stopImmediatePropagation();
+    }
+  });
   document.getElementById('clearBtn').addEventListener('click', () => openConfirm('Очистить рабочее поле?', 'Все узлы и связи будут удалены из текущей схемы. Это действие можно отменить.', 'Очистить', () => {
     if (editingId) finishEditing(editingId, true);
     scene = freshScene(); selectedId = editingId = null; selectedIds.splice(0); linkDraft = null; connectionSourceId = null;
@@ -4353,12 +4766,16 @@
     if (editingId) finishEditing(editingId, true);
 
     const id = currentProjectId;
-    if (id && scene.nodes.length === 0) {
+    if (event && event.type === 'pagehide' && id && hasProjectContent()) {
+      checkpointProjectWorkTime();
+      saveProject();
+    }
+    if (id && !hasProjectContent()) {
       deleteEmptyProject(id);
       return;
     }
 
-    const dirty = !!(id && scene.nodes.length > 0 && hasUnsavedChanges());
+    const dirty = !!(id && hasProjectContent() && hasUnsavedChanges());
 
     if (event && event.type === 'beforeunload') {
       if (dirty) {
@@ -4376,7 +4793,7 @@
 
     // pagehide means navigation/closing is proceeding. Persist the latest snapshot
     // synchronously here, because the 140 ms debounce may never fire.
-    if (id && scene.nodes.length > 0 && dirty) saveProject();
+    if (id && hasProjectContent() && dirty) saveProject();
     if (pendingSave) flushPendingSave();
   }
   window.addEventListener('beforeunload', flushBeforeLeavingPage);
@@ -4415,9 +4832,43 @@
   scene = freshScene();
   projectTitle.value = 'Новая схема';
   projectStartedAt = Date.now();
+  projectSessionStartedAt = 0;
+  projectWorkedMs = 0;
+  projectNotes = '';
+  projectChecklist = [];
+  syncProjectNotesPanel();
   timeline = [{ at: 0, scene: freshScene() }];
   undoStack = [snapshot()]; undoIndex = 0;
   renderScene();
   updateActionButtons();
+  updateProjectNotesMeta();
+  // Count only time while this page is visible. Browsers fire visibilitychange
+  // when a tab is backgrounded or a mobile screen is locked.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      checkpointProjectWorkTime();
+      projectSessionStartedAt = 0;
+      updateProjectNotesMeta();
+
+      if (currentProjectId && hasProjectContent()) {
+        saveProject();
+        // Persist synchronously: background timers may be throttled or suspended.
+        flushPendingSave();
+      }
+      return;
+    }
+
+    if (currentProjectId) {
+      projectSessionStartedAt = Date.now();
+      updateProjectNotesMeta();
+    }
+  });
+
+  window.setInterval(() => {
+    if (document.hidden) return;
+    if (!currentProjectId) return;
+    checkpointProjectWorkTime();
+    if (hasProjectContent()) saveProject();
+  }, 60000);
   showStartScreen();
 })();

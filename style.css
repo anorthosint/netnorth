@@ -92,6 +92,13 @@
   .node.underlined .node-text { text-decoration: none; background-image: linear-gradient(currentColor, currentColor); background-repeat: repeat-x; background-size: 100% 1.5px; background-position: left calc(100% - 1px); -webkit-box-decoration-break: clone; box-decoration-break: clone; }
   .node.selected { border: 1px dashed #242424; background: rgba(255,255,255,.82); }
   .node.link-target { border: 1px dashed #333; background: rgba(255,255,255,.9); }
+  .node.link-snap-target {
+    outline: none;
+    border-color: #171717 !important;
+    background: rgba(23, 23, 23, 0.05) !important;
+    box-shadow: 0 0 0 2px rgba(23, 23, 23, 0.14);
+    border-radius: 4px;
+  }
   .node.editing { border: 1px solid #444; background-color: rgba(255,255,255,.97); background-image: linear-gradient(rgba(30,30,30,.055) 1px, transparent 1px), linear-gradient(90deg, rgba(30,30,30,.055) 1px, transparent 1px); background-size: 12px 12px; box-shadow: 0 1px 3px rgba(0,0,0,.025); user-select: text; cursor: text; }
   .node:focus, .node-text:focus { outline: none; }
   .node-text[contenteditable="true"] { cursor: text; }
@@ -205,11 +212,13 @@
   .edge-color-toggle { min-height:30px; display:inline-flex; align-items:center; gap:8px; padding:5px 9px; border:1px solid #dedfe1; border-radius:5px; background:#fff; color:#222; font:inherit; font-size:11px; font-weight:650; cursor:pointer; }
   .edge-color-toggle:hover { background:#f7f7f7; border-color:#bfc1c4; }
   .edge-color-preview { width:13px; height:13px; display:block; border:1px solid rgba(0,0,0,.2); border-radius:3px; background:#171717; }
-  .edge-color-palette { position:absolute; left:0; top:calc(100% + 6px); z-index:8; display:grid; grid-template-columns:repeat(7, 22px); gap:6px; padding:8px; border:1px solid #dedfe1; border-radius:6px; background:#fff; box-shadow:0 8px 24px rgba(0,0,0,.15); }
+  .edge-color-palette { position:absolute; left:0; top:calc(100% + 6px); z-index:8; display:grid; grid-template-columns:repeat(8, 22px); gap:6px; padding:8px; border:1px solid #dedfe1; border-radius:6px; background:#fff; box-shadow:0 8px 24px rgba(0,0,0,.15); }
   .edge-color-palette[hidden] { display:none; }
   .edge-color-swatch { position:relative; width:22px; height:22px; padding:0; border:1px solid rgba(0,0,0,.16); border-radius:4px; background:var(--swatch-color); cursor:pointer; }
   .edge-color-swatch:hover { transform:translateY(-1px); box-shadow:0 0 0 2px rgba(0,0,0,.14); }
   .edge-color-swatch.active { outline:2px solid #777; outline-offset:2px; }
+  .edge-custom-color { grid-column:span 2; min-height:26px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:2px 5px; border:1px solid #dedfe1; border-radius:4px; color:#333; background:#f8f8f8; font-size:10px; font-weight:650; white-space:nowrap; cursor:pointer; }
+  .edge-custom-color input[type="color"] { width:26px; height:22px; min-width:26px; padding:0; border:0; background:transparent; cursor:pointer; }
   .edge-direction-controls { display:flex; align-items:center; justify-content:flex-start; flex-wrap:wrap; gap:10px; min-width:0; }
   .edge-option { display:inline-flex; align-items:center; gap:5px; color:#424242; font-size:10px; font-weight:600; white-space:nowrap; cursor:pointer; }
   .edge-option input { width:13px; height:13px; margin:0; accent-color:#171717; cursor:pointer; }
@@ -326,6 +335,13 @@
   .dark-theme .edge-preview { stroke:#ddd; }
   .dark-theme .node.selected { border-color:#dedede; background:rgba(20,20,20,.88); }
   .dark-theme .node.link-target { border-color:#bbb; background:rgba(20,20,20,.92); }
+  .dark-theme .node.link-snap-target {
+    outline: none;
+    border-color: #f1f1f1 !important;
+    background: rgba(241, 241, 241, 0.08) !important;
+    box-shadow: 0 0 0 2px rgba(241, 241, 241, 0.18);
+    border-radius: 4px;
+  }
   .dark-theme .node.editing { border-color:#bbb; background-color:rgba(18,18,18,.98); background-image:linear-gradient(rgba(255,255,255,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.06) 1px,transparent 1px); }
   .dark-theme .resize-handle, .dark-theme .anchor { background:#181818; border-color:#eee; }
   .dark-theme .anchor:hover, .dark-theme .anchor:focus { background:#eee; border-color:#eee; }
@@ -346,6 +362,7 @@
   .dark-theme .edge-color-palette { background:#222; border-color:#484848; box-shadow:0 9px 26px rgba(0,0,0,.5); }
   .dark-theme .edge-color-swatch { border-color:rgba(255,255,255,.2); }
   .dark-theme .edge-color-swatch.active { outline-color:#eee; }
+  .dark-theme .edge-custom-color { background:#242424; border-color:#484848; color:#eee; }
   .dark-theme .edge-option { color:#ddd; }
   .dark-theme .edge-option input { accent-color:#eee; }
 
@@ -662,4 +679,159 @@
   .dark-theme .context-item:hover { background: transparent; }
   .color-swatch:hover { outline: none; }
   .dark-theme .node-text a.node-link:hover { color: #82baff; }
+}
+
+/* Keep an editable text node physically focusable when it is empty on mobile. */
+.node.editing .node-text {
+  display: inline-block;
+  min-width: 60px;
+  min-height: 20px;
+  outline: none;
+  vertical-align: middle;
+}
+
+/* Make context-sheet actions easier to hit on touch screens. */
+@media (max-width: 767px) {
+  .context-item {
+    width: 100% !important;
+    min-height: 48px !important;
+    display: flex !important;
+    align-items: center !important;
+    padding: 0 16px !important;
+    box-sizing: border-box !important;
+  }
+}
+
+/* Image nodes keep a stable compositing hint without content-visibility clipping. */
+.node.image-node {
+  will-change: transform;
+}
+
+/* Temporarily remove expensive paint and animation effects during canvas gestures. */
+.workspace.panning .stage .node,
+.workspace.panning .stage .node *,
+.workspace.panning .stage .edge,
+.workspace.pinching .stage .node,
+.workspace.pinching .stage .node *,
+.workspace.pinching .stage .edge {
+  transition: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+
+
+/* Project notes and activity drawer */
+.project-notes-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 38;
+  background: rgba(0, 0, 0, .16);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity .22s ease, visibility 0s linear .22s;
+}
+.project-notes-panel {
+  position: absolute;
+  z-index: 39;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(390px, calc(100% - 12px));
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 20px calc(20px + env(safe-area-inset-bottom));
+  overflow: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+  background: #fff;
+  color: #171717;
+  border-left: 1px solid #e7e8ea;
+  box-shadow: -14px 0 38px rgba(0,0,0,.13);
+  transform: translateX(104%);
+  visibility: hidden;
+  transition: transform .24s cubic-bezier(.2,.75,.25,1), visibility 0s linear .24s;
+}
+.main.project-notes-open .project-notes-backdrop {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition: opacity .22s ease, visibility 0s;
+}
+.main.project-notes-open .project-notes-panel {
+  transform: translateX(0);
+  visibility: visible;
+  transition: transform .24s cubic-bezier(.2,.75,.25,1), visibility 0s;
+}
+.project-notes-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.project-notes-heading { min-width: 0; }
+.project-notes-header h2 { margin: 0; font-size: 19px; line-height: 1.2; font-weight: 720; letter-spacing: -.035em; }
+.project-notes-close { width: 34px; height: 34px; flex: 0 0 34px; border: 1px solid #e4e5e7; border-radius: 7px; background: transparent; color: #555; font-size: 24px; line-height: 1; cursor: pointer; }
+.project-notes-close:hover { background: #f5f5f5; }
+.project-notes-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.project-notes-meta-item { min-width: 0; display: flex; flex-direction: column; gap: 5px; padding: 11px 12px; border: 1px solid #e9eaec; border-radius: 8px; background: #fafafa; }
+.project-notes-meta-item span { color: #8b8f95; font-size: 10px; }
+.project-notes-meta-item strong { color: #252525; font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
+.project-notes-section { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.project-notes-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.project-notes-section-heading h3 { margin: 0; color: #222; font-size: 13px; font-weight: 720; }
+.project-notes-textarea { width: 100%; min-height: 172px; max-height: 38vh; resize: vertical; padding: 12px; border: 1px solid #e5e6e8; border-radius: 8px; outline: 0; background: #fcfcfc; color: #222; font-family: inherit; font-size: 12px; line-height: 1.6; font-weight: 450; touch-action: pan-y; -webkit-overflow-scrolling: touch; }
+.project-notes-textarea:focus { border-color: #aaa; background: #fff; box-shadow: 0 0 0 3px rgba(0,0,0,.035); }
+.project-checklist-section { flex: 1 0 auto; min-height: 140px; gap: 8px; }
+.project-checklist-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 14px;
+  margin-bottom: -2px;
+}
+#projectChecklistProgress {
+  color: #9a9da2;
+  font-size: 10px;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.project-checklist-form { display: flex; align-items: stretch; gap: 7px; }
+.project-checklist-form input { flex: 1; min-width: 0; height: 38px; padding: 0 11px; border: 1px solid #e5e6e8; border-radius: 7px; outline: 0; background: #fff; color: #222; font-size: 12px; }
+.project-checklist-form input:focus { border-color: #aaa; box-shadow: 0 0 0 3px rgba(0,0,0,.035); }
+.project-checklist-form button { width: 38px; height: 38px; flex: 0 0 38px; border: 1px solid #222; border-radius: 7px; background: #222; color: #fff; font-size: 22px; line-height: 1; cursor: pointer; }
+.project-checklist-list { display: flex; flex-direction: column; gap: 5px; min-height: 30px; }
+.project-checklist-empty { margin: 4px 0; padding: 10px 4px; color: #a0a3a8; font-size: 11px; line-height: 1.5; }
+.project-checklist-item { display: flex; align-items: center; gap: 9px; min-height: 37px; padding: 5px 5px 5px 8px; border: 1px solid transparent; border-radius: 7px; }
+.project-checklist-item:hover { background: #f8f8f8; border-color: #eee; }
+.project-checklist-checkbox { width: 15px; height: 15px; flex: 0 0 15px; accent-color: #222; cursor: pointer; }
+.project-checklist-text { flex: 1; min-width: 0; color: #383838; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.project-checklist-item.is-done .project-checklist-text { color: #a1a4a9; text-decoration: line-through; }
+.project-checklist-delete { width: 28px; height: 28px; flex: 0 0 28px; border: 0; border-radius: 5px; background: transparent; color: #96999e; font-size: 19px; line-height: 1; cursor: pointer; }
+.project-checklist-delete:hover { background: #ededed; color: #a22; }
+.dark-theme .project-notes-panel { background: #171717; color: #f1f1f1; border-color: #333; box-shadow: -14px 0 38px rgba(0,0,0,.38); }
+.dark-theme .project-notes-backdrop { background: rgba(0,0,0,.4); }
+.dark-theme .project-notes-header h2,
+.dark-theme .project-notes-section-heading h3 { color: #f1f1f1; }
+.dark-theme .project-notes-meta-item { background: #202020; border-color: #353535; }
+.dark-theme .project-notes-meta-item strong { color: #ededed; }
+.dark-theme .project-notes-close { color: #ddd; border-color: #414141; }
+.dark-theme .project-notes-close:hover,
+.dark-theme .project-checklist-item:hover { background: #242424; border-color: #363636; }
+.dark-theme .project-notes-textarea,
+.dark-theme .project-checklist-form input { background: #202020; color: #eee; border-color: #414141; }
+.dark-theme .project-notes-textarea:focus,
+.dark-theme .project-checklist-form input:focus { background: #222; border-color: #777; }
+.dark-theme .project-checklist-form button { background: #eee; color: #171717; border-color: #eee; }
+.dark-theme .project-checklist-text { color: #dedede; }
+.dark-theme .project-checklist-item.is-done .project-checklist-text { color: #777; }
+.dark-theme .project-checklist-delete:hover { background: #343434; color: #ff8585; }
+@media (max-width: 767px) {
+  .project-notes-panel { width: min(420px, 100%); padding: 18px 16px calc(18px + env(safe-area-inset-bottom)); gap: 14px; }
+  .project-notes-textarea { min-height: 150px; max-height: 32vh; }
+  .project-checklist-form input, .project-checklist-form button { min-height: 44px; height: 44px; }
+  .project-checklist-form button { width: 44px; flex-basis: 44px; }
+  .project-checklist-item { min-height: 44px; }
+  .project-checklist-delete { width: 36px; height: 36px; flex-basis: 36px; }
 }
