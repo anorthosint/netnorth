@@ -843,3 +843,116 @@
   .project-checklist-item { min-height: 44px; }
   .project-checklist-delete { width: 36px; height: 36px; flex-basis: 36px; }
 }
+
+/* Mobile text nodes stay content-sized; edge editing controls use a compact,
+   scroll-safe layout instead of overlapping the modal on narrow screens. */
+@media (max-width: 767px) {
+  .node:not(.image-node):not(.editing) {
+    padding: 6px 9px;
+  }
+  .node.selected:not(.image-node):not(.editing),
+  .dark-theme .node.selected:not(.image-node):not(.editing) {
+    background: transparent !important;
+  }
+
+  .modal-backdrop {
+    align-items: center;
+    justify-content: center;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom));
+  }
+  .modal {
+    width: min(430px, 100%);
+    max-width: 100%;
+    max-height: calc(100dvh - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    padding: 18px 16px;
+  }
+  .modal h2 { font-size: 16px; line-height: 1.3; }
+  .modal p { margin-bottom: 14px; }
+  .edge-style-options { margin-bottom: 14px; }
+  .edge-style-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .edge-style-button {
+    min-height: 64px;
+    aspect-ratio: auto;
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 9px;
+    padding: 9px 10px;
+    text-align: left;
+  }
+  .edge-style-button svg {
+    flex: 0 0 30px;
+    width: 30px;
+    height: 30px;
+  }
+  .edge-style-label {
+    white-space: normal;
+    overflow: visible;
+    font-size: 11px;
+    line-height: 1.25;
+  }
+  .edge-property-controls {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .edge-color-control { width: 100%; }
+  .edge-color-toggle {
+    width: 100%;
+    min-height: 42px;
+    justify-content: space-between;
+    font-size: 12px;
+  }
+  .edge-color-palette:not([hidden]) {
+    position: static;
+    width: 100%;
+    grid-template-columns: repeat(6, minmax(28px, 1fr));
+    gap: 9px;
+    margin-top: 8px;
+    padding: 10px;
+    box-sizing: border-box;
+  }
+  .edge-color-swatch {
+    width: 28px;
+    height: 28px;
+    justify-self: center;
+  }
+  .edge-custom-color { grid-column: 1 / -1; min-height: 38px; font-size: 11px; }
+  .edge-custom-color input[type="color"] { width: 32px; height: 28px; }
+  .edge-direction-controls {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .edge-option { min-height: 40px; font-size: 12px; }
+  .edge-option input { width: 17px; height: 17px; }
+  .modal-actions {
+    position: sticky;
+    bottom: -18px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px;
+    margin: 14px -16px -18px;
+    padding: 12px 16px max(8px, env(safe-area-inset-bottom));
+    background: inherit;
+    border-top: 1px solid var(--line);
+  }
+  .modal-actions button {
+    min-width: 0;
+    min-height: 44px;
+    margin: 0 !important;
+    padding: 9px 10px;
+    white-space: normal;
+  }
+}
+

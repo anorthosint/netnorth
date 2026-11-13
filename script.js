@@ -1903,6 +1903,14 @@
     });
   }
 
+  function getMobileTextNodeMaxWidth() {
+    if (!window.matchMedia('(max-width: 767px)').matches) return null;
+    const viewportWidth = workspace.clientWidth || window.innerWidth || 360;
+    // Keep the text block visually compact on phones while allowing long text
+    // to wrap instead of stretching the selected node across the canvas.
+    return Math.max(120, Math.min(420, Math.floor(viewportWidth * 0.82)));
+  }
+
   function renderScene(model = scene, options = {}) {
     if (model !== scene) model = materializeSceneSnapshot(model);
     currentRenderScene = model;
@@ -1919,6 +1927,7 @@
     renderedConnectionsSvg = null;
     renderedLinkPreviewEl = null;
     const modelNodesById = new Map(model.nodes.map(node => [node.id, node]));
+    const mobileTextMaxWidth = getMobileTextNodeMaxWidth();
     const maxX = model.nodes.reduce((max, n) => Math.max(max, n.x + n.width), 0);
     const maxY = model.nodes.reduce((max, n) => Math.max(max, n.y + n.height), 0);
     const baseWidth = Math.max((workspace.clientWidth || 1000) / zoom, 1200, Math.ceil(maxX + 500));
@@ -1967,11 +1976,15 @@
         }, { once: true });
         el.appendChild(imageEl);
       } else {
-        // Text nodes wrap to content; images use explicit pixel dimensions above.
-        el.style.width = autoSize ? 'max-content' : `${n.width}px`;
+        // On phones, let text nodes size to their contents but cap the line
+        // length to the visible workspace. This also clamps legacy fixed-width
+        // nodes that were saved on a much wider desktop canvas.
+        el.style.width = mobileTextMaxWidth
+          ? 'fit-content'
+          : (autoSize ? 'max-content' : `${n.width}px`);
         el.style.height = 'auto';
-        el.style.maxWidth = 'none';
-        el.style.minWidth = autoSize ? '0' : '10px';
+        el.style.maxWidth = mobileTextMaxWidth ? `${mobileTextMaxWidth}px` : 'none';
+        el.style.minWidth = mobileTextMaxWidth || autoSize ? '0' : '10px';
         el.style.minHeight = '0';
         el.style.fontSize = `${n.fontSize || 16}px`;
         const nodeColor = typeof n.color === 'string' ? n.color.trim() : '';
@@ -2191,6 +2204,19 @@
         if (event.button !== 0 || isPlayback) return;
         event.preventDefault();
         event.stopPropagation();
+
+        if (event.pointerType === 'touch') {
+          // A mobile tap on the actual SVG hit path opens the edge editor
+          // directly. Cancel the generic long-press candidate first so the
+          // timer and the browser's native contextmenu cannot open competing
+          // node/context UI over the edge controls.
+          clearLongPress();
+          suppressContextMenuUntil = Date.now() + 1300;
+          closeNodeContextMenu();
+          openSelectedEdgesActions(edge.id, event);
+          return;
+        }
+
         selectedId = null;
         selectedIds.splice(0);
         selectedEdgeIds.splice(0, selectedEdgeIds.length, edge.id);
@@ -2794,7 +2820,8 @@
       if (drag.type === 'resize' && id === drag.id) {
         const west = drag.handle.includes('w');
         const north = drag.handle.includes('n');
-        el.style.maxWidth = 'none';
+        const mobileTextMaxWidth = node.type === 'image' ? null : getMobileTextNodeMaxWidth();
+        el.style.maxWidth = mobileTextMaxWidth ? `${mobileTextMaxWidth}px` : 'none';
         el.style.minWidth = '0';
         el.style.minHeight = '0';
 
