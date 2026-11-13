@@ -20,6 +20,10 @@
   const zoomIndicator = document.getElementById('zoomIndicator');
   const CANVAS_PAD = 1400;
   let zoom = 1;
+  // Coalesce high-frequency pan/zoom input into one viewport update per frame.
+  let isTicking = false;
+  let pendingViewportPan = null;
+  let pendingViewportZoom = null;
   let contextNodeId = null;
   const emptyState = document.getElementById('emptyState');
   const emptyStateCloseBtn = document.getElementById('emptyStateCloseBtn');
@@ -1342,12 +1346,63 @@
   function syncZoomLayout(baseWidth, baseHeight) {
     stage.style.left = `${CANVAS_PAD * zoom}px`;
     stage.style.top = `${CANVAS_PAD * zoom}px`;
-    stage.style.transform = `scale(${zoom})`;
+    stage.style.transform = `translateZ(0) scale(${zoom})`;
     world.style.width = `${(baseWidth + CANVAS_PAD * 2) * zoom}px`;
     world.style.height = `${(baseHeight + CANVAS_PAD * 2) * zoom}px`;
     zoomIndicator.textContent = `${Math.round(zoom * 100)}%`;
   }
+  function scheduleViewportFrame() {
+    if (isTicking) return;
+    isTicking = true;
+    requestAnimationFrame(() => {
+      isTicking = false;
+
+      // Apply the latest pan position first. If zoom is also pending, its focal
+      // point is then calculated from the most recent scroll position.
+      flushPendingViewportPan();
+
+      const zoomRequest = pendingViewportZoom;
+      pendingViewportZoom = null;
+      if (zoomRequest) {
+        applyZoom(
+          zoomRequest.nextZoom,
+          zoomRequest.clientX,
+          zoomRequest.clientY,
+          zoomRequest.anchorWorldPoint
+        );
+      }
+
+      if (pendingViewportPan || pendingViewportZoom) scheduleViewportFrame();
+    });
+  }
+
+  function flushPendingViewportPan() {
+    const pan = pendingViewportPan;
+    pendingViewportPan = null;
+    if (!pan) return;
+    workspace.scrollLeft = pan.left;
+    workspace.scrollTop = pan.top;
+    scheduleViewportCulling();
+  }
+
+  function scheduleViewportPan(left, top) {
+    pendingViewportPan = { left, top };
+    scheduleViewportFrame();
+  }
+
   function setZoom(nextZoom, clientX, clientY, anchorWorldPoint = null) {
+    // Clamp before storing so rapid opposite wheel events accumulate from a
+    // valid target even when the previous pending event reached a zoom limit.
+    pendingViewportZoom = {
+      nextZoom: clamp(nextZoom, .25, 2.5),
+      clientX,
+      clientY,
+      anchorWorldPoint
+    };
+    scheduleViewportFrame();
+  }
+
+  function applyZoom(nextZoom, clientX, clientY, anchorWorldPoint = null) {
     const next = clamp(nextZoom, .25, 2.5);
     if (Math.abs(next - zoom) < .001) return;
     const rect = workspace.getBoundingClientRect();
@@ -1666,7 +1721,36 @@
       anchor.className = `anchor ${side}`;
       anchor.title = `Привязать связь к стороне: ${side}`;
       anchor.setAttribute('aria-label', `Подключить к стороне ${side}`);
-      anchor.addEventListener('pointerdown', event => startLink(event, nodeId, side));
+      anchor.addEventListener('pointerdown', event => {
+        // On compact nodes the 44px anchor and corner-resize hit areas can
+        // geometrically overlap. Route a press to the nearest control so both
+        // connection dragging and resizing remain practical on touch screens.
+        if (window.matchMedia('(max-width: 767px)').matches && mode === 'select') {
+          const rect = element.getBoundingClientRect();
+          const anchorPoint = side === 'top'
+            ? { x: rect.left + rect.width / 2, y: rect.top }
+            : side === 'right'
+              ? { x: rect.right, y: rect.top + rect.height / 2 }
+              : side === 'bottom'
+                ? { x: rect.left + rect.width / 2, y: rect.bottom }
+                : { x: rect.left, y: rect.top + rect.height / 2 };
+          const corners = [
+            { handle: 'nw', x: rect.left, y: rect.top },
+            { handle: 'ne', x: rect.right, y: rect.top },
+            { handle: 'sw', x: rect.left, y: rect.bottom },
+            { handle: 'se', x: rect.right, y: rect.bottom }
+          ];
+          const anchorDistance = Math.hypot(event.clientX - anchorPoint.x, event.clientY - anchorPoint.y);
+          const nearestCorner = corners
+            .map(corner => ({ ...corner, distance: Math.hypot(event.clientX - corner.x, event.clientY - corner.y) }))
+            .sort((a, b) => a.distance - b.distance)[0];
+          if (nearestCorner && nearestCorner.distance < anchorDistance) {
+            startResize(event, nodeId, nearestCorner.handle);
+            return;
+          }
+        }
+        startLink(event, nodeId, side);
+      });
       element.appendChild(anchor);
     });
   }
@@ -1682,14 +1766,14 @@
       element.querySelectorAll('.resize-handle, .anchor').forEach(control => control.remove());
 
       const mobileTouchLayout = window.matchMedia('(max-width: 767px)').matches;
-      // On touch screens show one set of large hit targets at a time so 44px
-      // resize handles do not overlap the 44px connection anchors on short nodes.
+      // Keep both touch-friendly controls available on the selected mobile node:
+      // corner handles resize it, while side anchors start a connection drag.
       const showResizeHandles = !isPlayback && id === selectedId && id !== editingId &&
         (!mobileTouchLayout || (mode === 'select' && !linkDraft));
       if (showResizeHandles) addResizeHandles(element, id);
       const canShowAnchors = !isPlayback && id !== editingId &&
         (id === selectedId || (!!linkDraft && id !== linkDraft.fromId)) &&
-        (!mobileTouchLayout || mode === 'connect' || !!linkDraft);
+        (!mobileTouchLayout || mode === 'connect' || (mode === 'select' && id === selectedId) || !!linkDraft);
       if (canShowAnchors) addNodeAnchors(element, id);
     });
   }
@@ -2412,6 +2496,8 @@
     drag = null;
     wasDragging = false;
     linkDraft = null;
+    // Discard any pan frame queued by the gesture that is being rolled back.
+    pendingViewportPan = null;
     // Clear any magnetic target highlight when a connection gesture is cancelled.
     renderedNodeElements.forEach(el => el.classList.remove('link-snap-target'));
     if (activeBox && activeBox.element.isConnected) activeBox.element.remove();
@@ -2777,9 +2863,10 @@
         if (event.cancelable) event.preventDefault();
       }
       if (drag.type === 'pan') {
-        workspace.scrollLeft = drag.originScrollLeft - dx;
-        workspace.scrollTop = drag.originScrollTop - dy;
-        scheduleViewportCulling();
+        scheduleViewportPan(
+          drag.originScrollLeft - dx,
+          drag.originScrollTop - dy
+        );
         return;
       }
       // Use the zoom captured when this gesture started. This keeps model-space movement
@@ -4560,6 +4647,7 @@
     // This makes the two-pointer gesture exclusive and prevents accidental node moves.
     if (drag && drag.startedOnLink) suppressImmediateDraggedLinkClick(1200);
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
+    else pendingViewportPan = null;
     clearLongPress();
   }
 
@@ -4792,7 +4880,8 @@
     // Keep the coordinate frame stable until a drag/link gesture is released.
     if (drag || linkDraft) return;
     const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
-    setZoom(zoom * factor, event.clientX, event.clientY);
+    const queuedZoom = pendingViewportZoom ? pendingViewportZoom.nextZoom : zoom;
+    setZoom(queuedZoom * factor, event.clientX, event.clientY);
   }, { passive: false });
 
   stage.addEventListener('pointerdown', event => {

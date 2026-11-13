@@ -62,7 +62,9 @@
   .workspace.panning { cursor: grabbing; user-select: none; }
   .world { position: relative; flex: none; }
   .stage { position: absolute; left: 0; top: 0; width: 1200px; height: 800px; background-color: #fff; background-image: linear-gradient(rgba(0,0,0,.015) 1px, transparent 1px), linear-gradient(90deg, rgba(0,0,0,.015) 1px, transparent 1px); background-size: 40px 40px; transform-origin: top left; }
-  .connections { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; z-index: 1; contain: layout style; }
+  .connections { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; z-index: 1; contain: layout style; will-change: transform; transform: translateZ(0); backface-visibility: hidden; }
+  /* The stage is the actual graph/node container in this build; keep its scale layer composited. */
+  .stage { will-change: transform; backface-visibility: hidden; }
   .connections .edge-hit { pointer-events: stroke; }
   .edge {
     fill: none;
@@ -84,13 +86,13 @@
   }
   .edge-hit:hover + .edge:not(.selected) { stroke-width: 2.5px; }
   .edge-preview { fill: none; stroke: #222; stroke-width: 1.7; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; }
-  .node { position: absolute; z-index: 2; box-sizing: border-box; width: max-content; contain: layout style; min-width: 0; min-height: 0; height: auto; padding: 2px 4px; white-space: pre-wrap; overflow-wrap: anywhere; color: #111; background: transparent; border: 1px solid transparent; border-radius: 2px; line-height: 1.28; font-size: 16px; font-weight: 720; letter-spacing: -.25px; cursor: default; user-select: none; }
+  .node { position: absolute; z-index: 2; box-sizing: border-box; width: max-content; contain: layout style; min-width: 0; min-height: 0; height: auto; padding: 10px 14px; white-space: pre-wrap; overflow-wrap: anywhere; color: #111; background: transparent; border: 1px solid transparent; border-radius: 2px; line-height: 1.28; font-size: 16px; font-weight: 720; letter-spacing: -.25px; cursor: default; user-select: none; }
   .node-text { display: inline; color: inherit; font: inherit; line-height: inherit; letter-spacing: inherit; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
   .node.image-node { padding: 0; line-height: 0; white-space: normal; overflow: hidden; max-width: none; min-width: 10px; min-height: 10px; background: transparent; }
   .node.image-node .node-image { display: block; width: 100%; height: 100%; max-width: none; object-fit: fill; pointer-events: none; user-select: none; -webkit-user-drag: none; }
   .node.highlight .node-text { background: #ffea00; box-shadow: 2px 0 0 #ffea00, -2px 0 0 #ffea00; }
   .node.underlined .node-text { text-decoration: none; background-image: linear-gradient(currentColor, currentColor); background-repeat: repeat-x; background-size: 100% 1.5px; background-position: left calc(100% - 1px); -webkit-box-decoration-break: clone; box-decoration-break: clone; }
-  .node.selected { border: 1px dashed #242424; background: rgba(255,255,255,.82); }
+  .node.selected { border-color: transparent; outline: 2px solid var(--accent-color, #3b82f6); outline-offset: 2px; background: rgba(255,255,255,.82); }
   .node.link-target { border: 1px dashed #333; background: rgba(255,255,255,.9); }
   .node.link-snap-target {
     outline: none;
@@ -106,7 +108,7 @@
   .node-text a.node-link:hover { color: #084a9f; }
   .node-placeholder { color: #8c8c8c; font-weight: 550; pointer-events: none; user-select: none; }
   .node-placeholder.hidden { display: none; }
-  .node.selected.editing { border-style: solid; }
+  .node.selected.editing { border-style: solid; border-color: transparent; }
   .resize-handle { position: absolute; width: 8px; height: 8px; background: #fff; border: 1.5px solid #202020; border-radius: 1px; z-index: 4; }
   .resize-handle.nw { top: -4px; left: -4px; cursor: nwse-resize; }
   .resize-handle.ne { top: -4px; right: -4px; cursor: nesw-resize; }
@@ -334,7 +336,7 @@
   .dark-theme .edge.selected { stroke-width: 2.8px; }
   .dark-theme .edge-hit:hover + .edge:not(.selected) { stroke-width: 2.5px; }
   .dark-theme .edge-preview { stroke:#ddd; }
-  .dark-theme .node.selected { border-color:#dedede; background:rgba(20,20,20,.88); }
+  .dark-theme .node.selected { border-color:transparent; outline-color:var(--accent-color, #3b82f6); background:rgba(20,20,20,.88); }
   .dark-theme .node.link-target { border-color:#bbb; background:rgba(20,20,20,.92); }
   .dark-theme .node.link-snap-target {
     outline: none;
@@ -344,6 +346,7 @@
     border-radius: 4px;
   }
   .dark-theme .node.editing { border-color:#bbb; background-color:rgba(18,18,18,.98); background-image:linear-gradient(rgba(255,255,255,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.06) 1px,transparent 1px); }
+  .dark-theme .node.selected.editing { border-color:transparent; }
   .dark-theme .resize-handle, .dark-theme .anchor { background:#181818; border-color:#eee; }
   .dark-theme .anchor:hover, .dark-theme .anchor:focus { background:#eee; border-color:#eee; }
   .dark-theme .context-menu, .dark-theme .modal, .dark-theme .playback-panel, .dark-theme .zoom-indicator { background:rgba(28,28,28,.98); color:#f3f3f3; border-color:#444; }
@@ -447,6 +450,10 @@
 }
 
 @media (max-width: 767px) {
+  .edge-hit { stroke-width: 32px !important; }
+  .anchor,
+  .resize-handle { width: 44px !important; height: 44px !important; }
+
   #workspace,
   #stage {
     touch-action: none;
