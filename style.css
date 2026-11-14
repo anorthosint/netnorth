@@ -434,8 +434,10 @@
 
 /* NetNorth mobile interaction layer (iOS / Android). */
 .sidebar-backdrop { display: none; }
-#workspace,
-#stage {
+.workspace,
+.world,
+.stage,
+.connections {
   touch-action: none;
   overscroll-behavior: contain;
   -webkit-touch-callout: none;
@@ -591,34 +593,35 @@
   .playback-panel { left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: auto; }
   .modal-backdrop, .project-modal-backdrop, .exit-confirm-backdrop, .export-screen { padding: 12px; }
 
-  /* Large invisible hit areas, with small visible affordances in their centers. */
+  /* Compact mobile affordances with practical but less intrusive touch targets. */
+  .resize-handle,
+  .anchor {
+    width: 34px !important;
+    height: 34px !important;
+  }
   .resize-handle {
-    width: 44px;
-    height: 44px;
     border: 0;
-    border-radius: 8px;
+    border-radius: 7px;
     background: transparent;
     z-index: 8;
   }
   .resize-handle::after {
     content: "";
     position: absolute;
-    width: 10px;
-    height: 10px;
+    width: 7px;
+    height: 7px;
     left: 50%;
     top: 50%;
     transform: translate(-50%, -50%);
-    border: 1.5px solid #202020;
+    border: 1.25px solid #202020;
     border-radius: 2px;
     background: #fff;
   }
-  .resize-handle.nw { top: -22px; left: -22px; }
-  .resize-handle.ne { top: -22px; right: -22px; }
-  .resize-handle.sw { bottom: -22px; left: -22px; }
-  .resize-handle.se { bottom: -22px; right: -22px; }
+  .resize-handle.nw { top: -17px; left: -17px; }
+  .resize-handle.ne { top: -17px; right: -17px; }
+  .resize-handle.sw { bottom: -17px; left: -17px; }
+  .resize-handle.se { bottom: -17px; right: -17px; }
   .anchor {
-    width: 44px;
-    height: 44px;
     border: 0;
     border-radius: 50%;
     background: transparent;
@@ -627,12 +630,12 @@
   .anchor::after {
     content: "";
     position: absolute;
-    width: 10px;
-    height: 10px;
+    width: 7px;
+    height: 7px;
     left: 50%;
     top: 50%;
     transform: translate(-50%, -50%);
-    border: 1.5px solid #222;
+    border: 1.25px solid #222;
     border-radius: 50%;
     background: #fff;
   }
@@ -640,12 +643,12 @@
   .anchor.right { left: 100%; top: 50%; }
   .anchor.bottom { left: 50%; top: 100%; }
   .anchor.left { left: 0; top: 50%; }
-  .node.tiny-node .resize-handle { width: 44px; height: 44px; }
-  .node.tiny-node .anchor { width: 44px; height: 44px; }
-  .node.tiny-node .resize-handle.nw { top: -22px; left: -22px; }
-  .node.tiny-node .resize-handle.ne { top: -22px; right: -22px; }
-  .node.tiny-node .resize-handle.sw { bottom: -22px; left: -22px; }
-  .node.tiny-node .resize-handle.se { bottom: -22px; right: -22px; }
+  .node.tiny-node .resize-handle,
+  .node.tiny-node .anchor { width: 34px !important; height: 34px !important; }
+  .node.tiny-node .resize-handle.nw { top: -17px; left: -17px; }
+  .node.tiny-node .resize-handle.ne { top: -17px; right: -17px; }
+  .node.tiny-node .resize-handle.sw { bottom: -17px; left: -17px; }
+  .node.tiny-node .resize-handle.se { bottom: -17px; right: -17px; }
 }
 
 /* Remove hover-only visual feedback on touch-first devices. */
@@ -710,9 +713,10 @@
   }
 }
 
-/* Image nodes keep a stable compositing hint without content-visibility clipping. */
+/* Avoid forcing a separate GPU layer for every image in large graphs.
+   The stage and SVG connection layer are composited as shared viewport layers. */
 .node.image-node {
-  will-change: transform;
+  will-change: auto;
 }
 
 /* Temporarily remove expensive paint and animation effects during canvas gestures. */
@@ -729,6 +733,31 @@
 }
 
 
+
+/* Low-cost mobile paint mode for large graphs. */
+@media (max-width: 768px) {
+  .workspace .stage .node:not(.selected):not(.editing):not(.link-snap-target) {
+    box-shadow: none !important;
+    filter: none !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+  .workspace .stage .edge { transition: none !important; }
+  .context-menu,
+  .modal-backdrop,
+  .project-notes-backdrop,
+  .sidebar-backdrop,
+  .exit-confirm-backdrop {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+  .saved-project,
+  .start-panel,
+  .project-notes-meta-item,
+  .project-checklist-item {
+    box-shadow: none !important;
+  }
+}
 
 /* Project notes and activity drawer */
 .project-notes-backdrop {
@@ -956,3 +985,108 @@
   }
 }
 
+
+
+/* Final mobile UX pass: keyboard-aware editor space, iOS safe areas and a
+   non-leaking sidebar backdrop. viewport-fit=cover is enabled in index.html. */
+@media (max-width: 767px) {
+  :root {
+    --nn-safe-top: env(safe-area-inset-top, 0px);
+    --nn-safe-bottom: env(safe-area-inset-bottom, 0px);
+    --nn-topbar-height: calc(58px + var(--nn-safe-top));
+  }
+
+  html,
+  body,
+  #app {
+    min-height: 100dvh;
+    height: 100dvh;
+  }
+
+  #app {
+    grid-template-rows: var(--nn-topbar-height) minmax(0, 1fr);
+  }
+
+  .topbar {
+    min-height: var(--nn-topbar-height);
+    padding-top: var(--nn-safe-top);
+    padding-right: max(10px, env(safe-area-inset-right, 0px));
+    padding-left: max(10px, env(safe-area-inset-left, 0px));
+  }
+
+  .sidebar {
+    top: var(--nn-topbar-height);
+    bottom: var(--nn-safe-bottom);
+    padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+  }
+
+  body.sidebar-open .sidebar-backdrop {
+    inset: var(--nn-topbar-height) 0 var(--nn-safe-bottom) 0;
+    touch-action: none;
+    overscroll-behavior: contain;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  .sidebar-backdrop {
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .toast {
+    bottom: calc(22px + var(--nn-safe-bottom));
+    max-width: calc(100vw - 32px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+    white-space: normal;
+    text-align: center;
+  }
+
+  .playback-panel {
+    bottom: calc(10px + var(--nn-safe-bottom));
+    left: max(10px, env(safe-area-inset-left, 0px));
+    right: max(10px, env(safe-area-inset-right, 0px));
+  }
+
+  .zoom-indicator {
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    bottom: calc(10px + var(--nn-safe-bottom));
+  }
+
+  .mode-indicator {
+    left: calc(12px + env(safe-area-inset-left, 0px));
+    top: 12px;
+  }
+
+  .context-menu,
+  .context-menu.visible {
+    padding-bottom: calc(18px + var(--nn-safe-bottom));
+  }
+
+  .project-notes-panel {
+    padding-top: calc(18px + var(--nn-safe-top));
+    padding-bottom: calc(18px + var(--nn-safe-bottom));
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+
+  .modal-backdrop,
+  .project-modal-backdrop,
+  .exit-confirm-backdrop,
+  .export-screen {
+    padding-top: max(12px, env(safe-area-inset-top, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+    padding-bottom: max(12px, env(safe-area-inset-bottom, 0px));
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+  }
+}
+
+/* The canvas editor itself remains selectable and editable; only the canvas
+   chrome is non-selectable while the mobile browser's keyboard is active. */
+@media (max-width: 767px) {
+  .node-text[contenteditable="true"] {
+    scroll-margin-top: 18px;
+    scroll-margin-bottom: 18px;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+}

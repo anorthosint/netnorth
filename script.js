@@ -20,10 +20,16 @@
   const zoomIndicator = document.getElementById('zoomIndicator');
   const CANVAS_PAD = 1400;
   let zoom = 1;
+  let stageContentBounds = { maxX: 1200, maxY: 800 };
   // Coalesce high-frequency pan/zoom input into one viewport update per frame.
   let isTicking = false;
   let pendingViewportPan = null;
   let pendingViewportZoom = null;
+  // Coalesce expensive pointer geometry work to one update per display frame.
+  let pointerMoveRaf = 0;
+  let pendingPointerMove = null;
+  let pendingPointerMoveHandler = null;
+  let processingPointerMoveFrame = false;
   let contextNodeId = null;
   const emptyState = document.getElementById('emptyState');
   const emptyStateCloseBtn = document.getElementById('emptyStateCloseBtn');
@@ -82,6 +88,10 @@
   let currentProjectId = null;
   let boxSelect = null;
   let suppressContextMenuUntil = 0;
+  let editorVisibilityRaf = 0;
+  let lastEditorScrollTarget = null;
+  let editorScrollResetTimer = 0;
+  let sidebarBackdropClickGuard = null;
   let contextCanvasPoint = { x: 0, y: 0 };
   let pendingImagePoint = { x: 0, y: 0 };
   let activeProjectActionId = null;
@@ -118,7 +128,18 @@
   let renderedNodeModels = new Map();
   let renderedEdgeElements = new Map();
   let renderedNodeToEdges = new Map();
+  let renderedSquareGroups = new Map();
   let renderedConnectionsSvg = null;
+  // Spatial buckets keep viewport culling proportional to visible graph cells.
+  const VIEWPORT_GRID_CELL_SIZE = 640;
+  let viewportNodeGrid = new Map();
+  let viewportEdgeGrid = new Map();
+  let viewportLargeNodeIds = new Set();
+  let viewportLargeEdgeIds = new Set();
+  let viewportNodeBounds = new Map();
+  let viewportEdgeBounds = new Map();
+  let visibleViewportNodeIds = new Set();
+  let visibleViewportEdgeIds = new Set();
   let renderedLinkPreviewEl = null;
   let dragPaintRaf = 0;
   let viewportCullRaf = 0;
@@ -238,9 +259,13 @@
   function normalizeProjectImageAssets(input) {
     if (input == null) return {};
     if (typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid image asset dictionary');
-    const assets = {};
-    Object.entries(input).forEach(([key, value]) => {
-      if (typeof value !== 'string' || value.length > 12000000 ||
+    const entries = Object.entries(input);
+    if (entries.length > 500) throw new Error('Too many project image assets');
+    // A null-prototype dictionary avoids special-property assignment while reading untrusted JSON keys.
+    const assets = Object.create(null);
+    entries.forEach(([key, value]) => {
+      if (!key || key.length > 256 || ['__proto__', 'prototype', 'constructor'].includes(key) ||
+          typeof value !== 'string' || value.length > 12000000 ||
           !/^data:image\/(?:png|jpeg);base64,/i.test(value)) {
         throw new Error('Invalid project image asset');
       }
@@ -249,7 +274,145 @@
     return assets;
   }
 
+  // Validate untrusted project JSON before changing the active project or its caches.
+  // Keep the limits aligned with sanitizeScene() so imports stay bounded and predictable.
+  function validateProjectSceneStructure(input, label = 'scene') {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      throw new Error(`Invalid ${label}`);
+    }
+    if (!Array.isArray(input.nodes) || !Array.isArray(input.edges)) {
+      throw new Error(`Invalid ${label} collections`);
+    }
+    if (input.nodes.length > 500 || input.edges.length > 2000) {
+      throw new Error(`Project ${label} exceeds size limits`);
+    }
+
+    const nodeIds = new Set();
+    const optionalNumericFields = ['x', 'y', 'width', 'height', 'fontSize', 'aspectRatio'];
+    input.nodes.forEach((node, index) => {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) {
+        throw new Error(`Invalid node at ${label}[${index}]`);
+      }
+      if (typeof node.id !== 'string' || !node.id.trim() || node.id.length > 160) {
+        throw new Error(`Invalid node id at ${label}[${index}]`);
+      }
+      if (nodeIds.has(node.id)) throw new Error(`Duplicate node id in ${label}`);
+      nodeIds.add(node.id);
+
+      if (node.type != null && !['text', 'image'].includes(node.type)) {
+        throw new Error(`Invalid node type at ${label}[${index}]`);
+      }
+      if (node.text != null && typeof node.text !== 'string') {
+        throw new Error(`Invalid node text at ${label}[${index}]`);
+      }
+      if (typeof node.text === 'string' && node.text.length > 10000) {
+        throw new Error(`Node text is too long at ${label}[${index}]`);
+      }
+      optionalNumericFields.forEach(field => {
+        if (node[field] == null) return;
+        const value = Number(node[field]);
+        if (!Number.isFinite(value)) throw new Error(`Invalid node ${field} at ${label}[${index}]`);
+      });
+      if (node.image != null && typeof node.image !== 'string') {
+        throw new Error(`Invalid image data at ${label}[${index}]`);
+      }
+      if (typeof node.image === 'string' && node.image &&
+          (node.image.length > 12000000 || !/^data:image\/(?:png|jpeg);base64,/i.test(node.image))) {
+        throw new Error(`Invalid image payload at ${label}[${index}]`);
+      }
+      if (node.imageKey != null && (typeof node.imageKey !== 'string' || node.imageKey.length > 256)) {
+        throw new Error(`Invalid image key at ${label}[${index}]`);
+      }
+      if (node.color != null && typeof node.color !== 'string') {
+        throw new Error(`Invalid node color at ${label}[${index}]`);
+      }
+    });
+
+    const edgeIds = new Set();
+    input.edges.forEach((edge, index) => {
+      if (!edge || typeof edge !== 'object' || Array.isArray(edge)) {
+        throw new Error(`Invalid edge at ${label}[${index}]`);
+      }
+      if (typeof edge.from !== 'string' || typeof edge.to !== 'string' ||
+          !edge.from || !edge.to || edge.from === edge.to ||
+          !nodeIds.has(edge.from) || !nodeIds.has(edge.to)) {
+        throw new Error(`Invalid edge endpoints at ${label}[${index}]`);
+      }
+      if (edge.id != null) {
+        if (typeof edge.id !== 'string' || !edge.id.trim() || edge.id.length > 160) {
+          throw new Error(`Invalid edge id at ${label}[${index}]`);
+        }
+        if (edgeIds.has(edge.id)) throw new Error(`Duplicate edge id in ${label}`);
+        edgeIds.add(edge.id);
+      }
+      ['fromSide', 'toSide', 'style', 'color'].forEach(field => {
+        if (edge[field] != null && typeof edge[field] !== 'string') {
+          throw new Error(`Invalid edge ${field} at ${label}[${index}]`);
+        }
+      });
+      ['bidirectional', 'arrowhead'].forEach(field => {
+        if (edge[field] != null && typeof edge[field] !== 'boolean') {
+          throw new Error(`Invalid edge ${field} at ${label}[${index}]`);
+        }
+      });
+    });
+    return true;
+  }
+
+  function validateProjectDataStructure(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('Invalid project envelope');
+    }
+    validateProjectSceneStructure(data.scene, 'scene');
+    normalizeProjectImageAssets(data.images);
+    if (data.timeline != null) {
+      if (!Array.isArray(data.timeline) || data.timeline.length > 500) {
+        throw new Error('Invalid project timeline');
+      }
+      data.timeline.forEach((frame, index) => {
+        if (!frame || typeof frame !== 'object' || Array.isArray(frame)) {
+          throw new Error(`Invalid timeline frame ${index}`);
+        }
+        if (frame.at != null && !Number.isFinite(Number(frame.at))) {
+          throw new Error(`Invalid timeline timestamp ${index}`);
+        }
+        validateProjectSceneStructure(frame.scene, `timeline frame ${index}`);
+      });
+    }
+    if (data.title != null && typeof data.title !== 'string') throw new Error('Invalid project title');
+    if (data.notes != null && (typeof data.notes !== 'string' || data.notes.length > 100000)) {
+      throw new Error('Invalid project notes');
+    }
+    if (data.workedMs != null && (!Number.isFinite(Number(data.workedMs)) || Number(data.workedMs) < 0)) {
+      throw new Error('Invalid project work time');
+    }
+    if (data.projectStartedAt != null && !Number.isFinite(Number(data.projectStartedAt))) {
+      throw new Error('Invalid project start time');
+    }
+    if (data.checklist != null) {
+      if (!Array.isArray(data.checklist) || data.checklist.length > 300) throw new Error('Invalid project checklist');
+      data.checklist.forEach((item, index) => {
+        if (!item || typeof item !== 'object' || Array.isArray(item) ||
+            (item.id != null && typeof item.id !== 'string') ||
+            (item.text != null && typeof item.text !== 'string') ||
+            (item.done != null && typeof item.done !== 'boolean')) {
+          throw new Error(`Invalid checklist item ${index}`);
+        }
+      });
+    }
+    return true;
+  }
+
   function clearProjectRuntimeCaches(clearImages = false) {
+    clearQueuedGesturePointerMove();
+    if (editorScrollResetTimer) window.clearTimeout(editorScrollResetTimer);
+    editorScrollResetTimer = 0;
+    if (toastTimer) window.clearTimeout(toastTimer);
+    toastTimer = 0;
+    if (editorVisibilityRaf) cancelAnimationFrame(editorVisibilityRaf);
+    editorVisibilityRaf = 0;
+    lastEditorScrollTarget = null;
+    if (toastEl) toastEl.classList.remove('show');
     if (dragPaintRaf) cancelAnimationFrame(dragPaintRaf);
     dragPaintRaf = 0;
     if (playback.raf) cancelAnimationFrame(playback.raf);
@@ -271,6 +434,13 @@
     renderedNodeModels.clear();
     renderedEdgeElements.clear();
     renderedNodeToEdges.clear();
+    renderedSquareGroups.clear();
+    viewportNodeGrid.clear();
+    viewportEdgeGrid.clear();
+    viewportNodeBounds.clear();
+    viewportEdgeBounds.clear();
+    visibleViewportNodeIds.clear();
+    visibleViewportEdgeIds.clear();
     renderedConnectionsSvg = null;
     renderedLinkPreviewEl = null;
     currentRenderScene = null;
@@ -460,6 +630,7 @@
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!index.length && raw) {
         const data = JSON.parse(raw);
+        validateProjectDataStructure(data);
         if (data && data.scene && Array.isArray(data.scene.nodes) && Array.isArray(data.scene.edges)) {
           const known = index.some(item => item.id === 'previous-session');
           if (!known) {
@@ -1084,7 +1255,7 @@
       const raw = localStorage.getItem(PROJECT_KEY_PREFIX + id);
       if (!raw) { showToast('Проект не найден'); renderProjectList(); return; }
       const data = JSON.parse(raw);
-      if (!data || !data.scene || !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) throw new Error('Invalid project');
+      validateProjectDataStructure(data);
       const imageAssets = normalizeProjectImageAssets(data.images);
 
       clearProjectRuntimeCaches(false);
@@ -1309,6 +1480,91 @@
     setMobileSidebarOpen(false);
   }
 
+  function dismissMobileSidebarFromBackdrop(event) {
+    if (!document.body.classList.contains('sidebar-open') || !sidebarBackdrop) return;
+    if (event.target !== sidebarBackdrop) return;
+
+    // Dismiss on pointerdown, not on click. Preventing the default touch action
+    // suppresses the compatibility click that could otherwise land on the canvas
+    // after the backdrop is removed from the hit-testing tree.
+    sidebarBackdropClickGuard = {
+      x: event.clientX,
+      y: event.clientY,
+      until: Date.now() + 500
+    };
+    if (event.cancelable) event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+    closeMobileSidebar();
+  }
+
+  function suppressSidebarBackdropGhostClick(event) {
+    const guard = sidebarBackdropClickGuard;
+    if (!guard) return;
+    if (Date.now() > guard.until) {
+      sidebarBackdropClickGuard = null;
+      return;
+    }
+    // Only consume the click at the exact location of the just-dismissed
+    // backdrop tap. A separate, intentional tap elsewhere remains unaffected.
+    if (event.detail === 0 || Math.hypot(event.clientX - guard.x, event.clientY - guard.y) > 28) return;
+    sidebarBackdropClickGuard = null;
+    if (event.cancelable) event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+  }
+
+  function scheduleActiveEditorVisibilityCheck() {
+    if (editorVisibilityRaf || !workspace) return;
+    editorVisibilityRaf = requestAnimationFrame(() => {
+      editorVisibilityRaf = 0;
+      if (!editingId || workspace.classList.contains('panning') || workspace.classList.contains('pinching')) return;
+      const editor = document.activeElement;
+      if (!(editor instanceof HTMLElement) || !editor.matches('.node-text[contenteditable="true"]')) return;
+      const nodeElement = editor.closest('.node[data-node-id]');
+      if (!nodeElement || !nodeElement.isConnected) return;
+      if (!window.matchMedia('(max-width: 767px), (pointer: coarse)').matches) return;
+
+      const workspaceRect = workspace.getBoundingClientRect();
+      const visualViewport = window.visualViewport;
+      const visualTop = visualViewport ? visualViewport.offsetTop : 0;
+      const visualBottom = visualViewport
+        ? visualViewport.offsetTop + visualViewport.height
+        : window.innerHeight;
+      const visibleTop = Math.max(workspaceRect.top + 10, visualTop + 8);
+      const visibleBottom = Math.min(workspaceRect.bottom - 8, visualBottom - 12);
+      const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+      if (visibleHeight < 80) return;
+
+      const nodeRect = nodeElement.getBoundingClientRect();
+      const preferredTop = visibleTop + Math.min(26, visibleHeight * 0.08);
+      const upperBandBottom = visibleTop + visibleHeight * 0.42;
+      let delta = 0;
+
+      // Keep the active editor near the upper part of the remaining visual
+      // viewport, especially after iOS/Android shrink it for the soft keyboard.
+      if (nodeRect.top > upperBandBottom || nodeRect.bottom > visibleBottom) {
+        delta = nodeRect.top - preferredTop;
+      } else if (nodeRect.top < visibleTop) {
+        delta = nodeRect.top - visibleTop;
+      }
+      if (Math.abs(delta) < 7) return;
+
+      const maxScrollTop = Math.max(0, workspace.scrollHeight - workspace.clientHeight);
+      const targetScrollTop = clamp(workspace.scrollTop + delta, 0, maxScrollTop);
+      if (Math.abs(targetScrollTop - workspace.scrollTop) < 7) return;
+      if (lastEditorScrollTarget !== null && Math.abs(lastEditorScrollTarget - targetScrollTop) < 8) return;
+
+      lastEditorScrollTarget = targetScrollTop;
+      workspace.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
+      if (editorScrollResetTimer) window.clearTimeout(editorScrollResetTimer);
+      editorScrollResetTimer = window.setTimeout(() => {
+        editorScrollResetTimer = 0;
+        lastEditorScrollTarget = null;
+      }, 650);
+    });
+  }
+
   function setMode(next) {
     if (playback.active) exitPlayback();
     closeNodeContextMenu();
@@ -1385,11 +1641,6 @@
     scheduleViewportCulling();
   }
 
-  function scheduleViewportPan(left, top) {
-    pendingViewportPan = { left, top };
-    scheduleViewportFrame();
-  }
-
   function setZoom(nextZoom, clientX, clientY, anchorWorldPoint = null) {
     // Clamp before storing so rapid opposite wheel events accumulate from a
     // valid target even when the previous pending event reached a zoom limit.
@@ -1413,9 +1664,10 @@
     zoom = next;
     // Zooming only transforms the existing stage. Rebuilding every node and SVG path
     // on each wheel tick made large graphs unnecessarily expensive.
-    const model = currentRenderScene || scene;
-    const maxX = model.nodes.reduce((max, node) => Math.max(max, node.x + node.width), 0);
-    const maxY = model.nodes.reduce((max, node) => Math.max(max, node.y + node.height), 0);
+    // Bounds are cached during full scene renders and extended only by moved
+    // nodes, avoiding an O(N) graph scan on every zoom frame.
+    const maxX = stageContentBounds.maxX;
+    const maxY = stageContentBounds.maxY;
     const baseWidth = Math.max((workspace.clientWidth || 1000) / zoom, 1200, Math.ceil(maxX + 500));
     const baseHeight = Math.max((workspace.clientHeight || 700) / zoom, 800, Math.ceil(maxY + 400));
     stage.style.width = `${baseWidth}px`;
@@ -1709,7 +1961,7 @@
       const control = document.createElement('span');
       control.className = `resize-handle ${handle}`;
       control.setAttribute('aria-label', 'Изменить размер');
-      control.addEventListener('pointerdown', event => startResize(event, nodeId, handle));
+      control?.addEventListener('pointerdown', event => startResize(event, nodeId, handle));
       element.appendChild(control);
     });
   }
@@ -1721,7 +1973,7 @@
       anchor.className = `anchor ${side}`;
       anchor.title = `Привязать связь к стороне: ${side}`;
       anchor.setAttribute('aria-label', `Подключить к стороне ${side}`);
-      anchor.addEventListener('pointerdown', event => {
+      anchor?.addEventListener('pointerdown', event => {
         // On compact nodes the 44px anchor and corner-resize hit areas can
         // geometrically overlap. Route a press to the nearest control so both
         // connection dragging and resizing remain practical on touch screens.
@@ -1796,7 +2048,7 @@
       document.removeEventListener('click', suppressClick, true);
     };
 
-    document.addEventListener('click', suppressClick, true);
+    document?.addEventListener('click', suppressClick, true);
     window.setTimeout(() => {
       document.removeEventListener('click', suppressClick, true);
     }, Math.max(0, timeout));
@@ -1828,7 +2080,7 @@
       anchor.rel = 'noopener noreferrer';
       // Keep pointer events bubbling so select-text and connect-node interactions work.
       // Handle the link click ourselves to prevent native navigation from opening a duplicate tab.
-      anchor.addEventListener('click', event => {
+      anchor?.addEventListener('click', event => {
         // Avoid opening twice on a double-click; leave the normal selection intact.
         if (event.detail > 1) {
           event.preventDefault();
@@ -1866,9 +2118,113 @@
     emptyState.setAttribute('aria-hidden', String(isHidden));
   }
 
+  function addViewportIndexItem(grid, largeIds, id, left, top, right, bottom) {
+    const cellSize = VIEWPORT_GRID_CELL_SIZE;
+    const minCol = Math.floor(left / cellSize);
+    const maxCol = Math.floor(right / cellSize);
+    const minRow = Math.floor(top / cellSize);
+    const maxRow = Math.floor(bottom / cellSize);
+    const cellCount = (maxCol - minCol + 1) * (maxRow - minRow + 1);
+    // Very large nodes/edges are rare; keep them in a short overflow set rather
+    // than inserting the same ID into hundreds of cells.
+    if (cellCount > 64) {
+      largeIds.add(id);
+      return;
+    }
+    for (let col = minCol; col <= maxCol; col++) {
+      for (let row = minRow; row <= maxRow; row++) {
+        const key = `${col}:${row}`;
+        let bucket = grid.get(key);
+        if (!bucket) grid.set(key, bucket = new Set());
+        bucket.add(id);
+      }
+    }
+  }
+
+  function queryViewportIndex(grid, largeIds, left, top, right, bottom) {
+    const result = new Set(largeIds);
+    const cellSize = VIEWPORT_GRID_CELL_SIZE;
+    const minCol = Math.floor(left / cellSize);
+    const maxCol = Math.floor(right / cellSize);
+    const minRow = Math.floor(top / cellSize);
+    const maxRow = Math.floor(bottom / cellSize);
+    for (let col = minCol; col <= maxCol; col++) {
+      for (let row = minRow; row <= maxRow; row++) {
+        const bucket = grid.get(`${col}:${row}`);
+        if (bucket) bucket.forEach(id => result.add(id));
+      }
+    }
+    return result;
+  }
+
+  function rebuildViewportSpatialIndexes() {
+    viewportNodeGrid.clear();
+    viewportEdgeGrid.clear();
+    viewportLargeNodeIds.clear();
+    viewportLargeEdgeIds.clear();
+    viewportNodeBounds.clear();
+    viewportEdgeBounds.clear();
+
+    renderedNodeModels.forEach((node, id) => {
+      const element = renderedNodeElements.get(id);
+      const width = Math.max(10, Number(node.width) || (element && element.offsetWidth) || 10);
+      const height = Math.max(10, Number(node.height) || (element && element.offsetHeight) || 10);
+      const bounds = { left: node.x, top: node.y, right: node.x + width, bottom: node.y + height };
+      viewportNodeBounds.set(id, bounds);
+      addViewportIndexItem(
+        viewportNodeGrid, viewportLargeNodeIds, id,
+        bounds.left, bounds.top, bounds.right, bounds.bottom
+      );
+    });
+
+    renderedEdgeElements.forEach((bundle, id) => {
+      const edge = bundle && bundle.edge;
+      const from = edge && renderedNodeModels.get(edge.from);
+      const to = edge && renderedNodeModels.get(edge.to);
+      if (!from || !to) return;
+      const fromEl = renderedNodeElements.get(from.id);
+      const toEl = renderedNodeElements.get(to.id);
+      const fromW = Math.max(10, Number(from.width) || (fromEl && fromEl.offsetWidth) || 10);
+      const fromH = Math.max(10, Number(from.height) || (fromEl && fromEl.offsetHeight) || 10);
+      const toW = Math.max(10, Number(to.width) || (toEl && toEl.offsetWidth) || 10);
+      const toH = Math.max(10, Number(to.height) || (toEl && toEl.offsetHeight) || 10);
+      // The rectangle between both endpoint boxes conservatively contains
+      // curved and orthogonal paths, including their control/approach segments.
+      const routePadding = 96;
+      const bounds = {
+        left: Math.min(from.x, to.x) - routePadding,
+        top: Math.min(from.y, to.y) - routePadding,
+        right: Math.max(from.x + fromW, to.x + toW) + routePadding,
+        bottom: Math.max(from.y + fromH, to.y + toH) + routePadding
+      };
+      viewportEdgeBounds.set(id, bounds);
+      addViewportIndexItem(
+        viewportEdgeGrid, viewportLargeEdgeIds, id,
+        bounds.left, bounds.top, bounds.right, bounds.bottom
+      );
+    });
+
+    // All newly rendered items start visible; the first cull pass hides the
+    // off-screen subset using a delta update rather than touching every item.
+    visibleViewportNodeIds = new Set(renderedNodeElements.keys());
+    visibleViewportEdgeIds = new Set(renderedEdgeElements.keys());
+  }
+
+  function filterViewportCandidates(candidateIds, boundsIndex, left, top, right, bottom) {
+    const visibleIds = new Set();
+    candidateIds.forEach(id => {
+      const bounds = boundsIndex.get(id);
+      if (!bounds || (
+        bounds.right >= left && bounds.left <= right &&
+        bounds.bottom >= top && bounds.top <= bottom
+      )) visibleIds.add(id);
+    });
+    return visibleIds;
+  }
+
   function updateViewportCulling() {
     if (!workspace || !workspace.clientWidth || !workspace.clientHeight) return;
-    if (!renderedNodeElements.size) return;
+    if (!renderedNodeElements.size && !renderedEdgeElements.size) return;
     const scale = Math.max(0.01, Number(zoom) || 1);
     const margin = 300 / scale;
     // Stage is offset from the world's top-left by CANVAS_PAD at every zoom level.
@@ -1876,23 +2232,68 @@
     const viewTop = workspace.scrollTop / scale - CANVAS_PAD;
     const viewRight = (workspace.scrollLeft + workspace.clientWidth) / scale - CANVAS_PAD;
     const viewBottom = (workspace.scrollTop + workspace.clientHeight) / scale - CANVAS_PAD;
+    const left = viewLeft - margin;
+    const top = viewTop - margin;
+    const right = viewRight + margin;
+    const bottom = viewBottom + margin;
 
-    renderedNodeElements.forEach((element, id) => {
-      if (!element) return;
-      if (id === editingId || id === selectedId || selectedIds.includes(id)) {
-        element.style.visibility = 'visible';
-        return;
-      }
-      const node = renderedNodeModels.get(id);
-      if (!node) return;
-      const width = Math.max(10, Number(node.width) || element.offsetWidth || 10);
-      const height = Math.max(10, Number(node.height) || element.offsetHeight || 10);
-      const outside = node.x + width < viewLeft - margin ||
-        node.x > viewRight + margin ||
-        node.y + height < viewTop - margin ||
-        node.y > viewBottom + margin;
-      element.style.visibility = outside ? 'hidden' : 'visible';
+    const nextVisibleNodes = filterViewportCandidates(
+      queryViewportIndex(viewportNodeGrid, viewportLargeNodeIds, left, top, right, bottom),
+      viewportNodeBounds, left, top, right, bottom
+    );
+    // Keep active edits/selections and the object currently being dragged alive
+    // even when its position has moved outside the cell where it was indexed.
+    if (editingId) nextVisibleNodes.add(editingId);
+    if (selectedId) nextVisibleNodes.add(selectedId);
+    selectedIds.forEach(id => nextVisibleNodes.add(id));
+    if (drag) {
+      if (drag.type === 'move') nextVisibleNodes.add(drag.id);
+      else if (drag.type === 'resize') nextVisibleNodes.add(drag.id);
+      else if (drag.type === 'moveSelection') drag.ids.forEach(item => nextVisibleNodes.add(item.id));
+    }
+
+    // Only mutate visibility when an item's state changes. Off-screen nodes are
+    // retained in the DOM (so geometry/editing stays stable) but skipped by paint.
+    visibleViewportNodeIds.forEach(id => {
+      if (nextVisibleNodes.has(id)) return;
+      const element = renderedNodeElements.get(id);
+      if (element) element.style.visibility = 'hidden';
     });
+    nextVisibleNodes.forEach(id => {
+      if (visibleViewportNodeIds.has(id)) return;
+      const element = renderedNodeElements.get(id);
+      if (element) element.style.visibility = 'visible';
+    });
+    visibleViewportNodeIds = nextVisibleNodes;
+
+    const nextVisibleEdges = filterViewportCandidates(
+      queryViewportIndex(viewportEdgeGrid, viewportLargeEdgeIds, left, top, right, bottom),
+      viewportEdgeBounds, left, top, right, bottom
+    );
+    if (drag) {
+      const movedIds = drag.type === 'move' || drag.type === 'resize'
+        ? [drag.id]
+        : (drag.type === 'moveSelection' ? drag.ids.map(item => item.id) : []);
+      movedIds.forEach(nodeId => (renderedNodeToEdges.get(nodeId) || []).forEach(edgeId => nextVisibleEdges.add(edgeId)));
+    }
+    selectedEdgeIds.forEach(id => nextVisibleEdges.add(id));
+    visibleViewportEdgeIds.forEach(id => {
+      if (nextVisibleEdges.has(id)) return;
+      const bundle = renderedEdgeElements.get(id);
+      if (bundle) {
+        bundle.hit.style.visibility = 'hidden';
+        bundle.line.style.visibility = 'hidden';
+      }
+    });
+    nextVisibleEdges.forEach(id => {
+      if (visibleViewportEdgeIds.has(id)) return;
+      const bundle = renderedEdgeElements.get(id);
+      if (bundle) {
+        bundle.hit.style.visibility = 'visible';
+        bundle.line.style.visibility = 'visible';
+      }
+    });
+    visibleViewportEdgeIds = nextVisibleEdges;
   }
 
   function scheduleViewportCulling() {
@@ -1924,12 +2325,20 @@
     renderedNodeModels.clear();
     renderedEdgeElements.clear();
     renderedNodeToEdges.clear();
+    renderedSquareGroups.clear();
+    viewportNodeGrid.clear();
+    viewportEdgeGrid.clear();
+    viewportNodeBounds.clear();
+    viewportEdgeBounds.clear();
+    visibleViewportNodeIds.clear();
+    visibleViewportEdgeIds.clear();
     renderedConnectionsSvg = null;
     renderedLinkPreviewEl = null;
     const modelNodesById = new Map(model.nodes.map(node => [node.id, node]));
     const mobileTextMaxWidth = getMobileTextNodeMaxWidth();
     const maxX = model.nodes.reduce((max, n) => Math.max(max, n.x + n.width), 0);
     const maxY = model.nodes.reduce((max, n) => Math.max(max, n.y + n.height), 0);
+    stageContentBounds = { maxX, maxY };
     const baseWidth = Math.max((workspace.clientWidth || 1000) / zoom, 1200, Math.ceil(maxX + 500));
     const baseHeight = Math.max((workspace.clientHeight || 700) / zoom, 800, Math.ceil(maxY + 400));
     stage.style.width = `${baseWidth}px`;
@@ -1961,7 +2370,7 @@
         imageEl.alt = 'Изображение';
         imageEl.draggable = false;
         imageEl.src = n.image;
-        imageEl.addEventListener('load', () => {
+        imageEl?.addEventListener('load', () => {
           const liveNode = nodeById(n.id);
           if (!liveNode || liveNode.type !== 'image') return;
           // Geometry is captured when the file is inserted. Only recover missing dimensions.
@@ -2015,6 +2424,7 @@
           el.appendChild(placeholderEl);
         }
         if (!isPlayback && n.id === editingId) {
+          const targetId = n.id;
           el.classList.add('editing');
           textSpan.contentEditable = 'true';
           textSpan.spellcheck = false;
@@ -2023,24 +2433,33 @@
           textSpan.style.setProperty('-webkit-touch-callout', 'default');
           textSpan.setAttribute('role', 'textbox');
           textSpan.setAttribute('aria-label', 'Текстовый узел');
-          textSpan.addEventListener('input', () => {
-            const target = nodeById(n.id);
+          textSpan?.addEventListener('input', () => {
+            const target = nodeById(targetId);
             const liveText = textSpan.innerText.replace(/\r/g, '').replace(/\n+$/, '');
             if (target) target.text = liveText;
             if (placeholderEl) placeholderEl.classList.toggle('hidden', !!liveText.trim());
             saveProject();
           });
-          textSpan.addEventListener('keydown', event => {
-            if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); finishEditing(n.id, true); }
-            if (event.key === 'Escape') { event.preventDefault(); finishEditing(n.id, false); }
+          textSpan?.addEventListener('keydown', event => {
+            if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); finishEditing(targetId, true); }
+            if (event.key === 'Escape') { event.preventDefault(); finishEditing(targetId, false); }
             event.stopPropagation();
           });
-          textSpan.addEventListener('blur', () => {
-            // Mobile browsers can emit a transient blur while the software
-            // keyboard is animating in. Give the trusted input/focus sequence
-            // more time to settle before deciding that editing has ended.
+          textSpan?.addEventListener('blur', () => {
+            // Capture this editor's identity before the delayed callback runs.
+            // A later render may replace `n` or the user may already be editing another node.
+            const targetId = n.id;
             window.setTimeout(() => {
-              if (editingId !== n.id) return;
+              if (editingId !== targetId) return;
+
+              const liveNode = nodeById(targetId);
+              if (!liveNode) {
+                // The node was deleted while the blur timer was pending. Do not
+                // commit stale text into another model object or keep a dead editor active.
+                editingId = null;
+                editingOriginalText = null;
+                return;
+              }
               if (document.activeElement === textSpan) return;
 
               const activeElement = document.activeElement;
@@ -2048,21 +2467,25 @@
                 activeElement instanceof Element &&
                 activeElement.closest('#nodeContextMenu')
               ) {
-                try { textSpan.focus({ preventScroll: true }); } catch (_) { textSpan.focus(); }
-                placeCaretAtEnd(textSpan);
+                const currentNodeElement = renderedNodeElements.get(targetId) ||
+                  stage.querySelector(`[data-node-id="${CSS.escape(targetId)}"]`);
+                const currentEditor = currentNodeElement && currentNodeElement.querySelector('.node-text');
+                const editorToRestore = currentEditor && currentEditor.isConnected ? currentEditor : textSpan;
+                if (!editorToRestore.isConnected) return;
+                try { editorToRestore.focus({ preventScroll: true }); } catch (_) { editorToRestore.focus(); }
+                placeCaretAtEnd(editorToRestore);
                 return;
               }
 
-              const liveNode = nodeById(n.id);
-              const liveText = liveNode ? String(liveNode.text || '').trim() : '';
+              const liveText = String(liveNode.text || '').trim();
               const recentlyCreatedEmptyNode = !!(
                 liveNode && liveNode.createdAt &&
                 Date.now() - liveNode.createdAt < 2000 &&
                 !liveText
               );
               if (recentlyCreatedEmptyNode) {
-                const liveNodeElement = renderedNodeElements.get(n.id) ||
-                  stage.querySelector(`[data-node-id="${CSS.escape(n.id)}"]`);
+                const liveNodeElement = renderedNodeElements.get(targetId) ||
+                  stage.querySelector(`[data-node-id="${CSS.escape(targetId)}"]`);
                 const liveEditor = liveNodeElement && liveNodeElement.querySelector('.node-text');
                 if (liveEditor && liveEditor.isConnected) {
                   try { liveEditor.focus({ preventScroll: true }); } catch (_) { liveEditor.focus(); }
@@ -2071,13 +2494,13 @@
                 return;
               }
 
-              finishEditing(n.id, true);
+              finishEditing(targetId, true);
             }, 350);
           });
 
           // Empty inline spans have no hit area. After a transient blur, tapping
           // the visible node/placeholder must focus the editor again on touch devices.
-          el.addEventListener('pointerdown', event => {
+          el?.addEventListener('pointerdown', event => {
             if (event.button !== 0 || editingId !== n.id) return;
             if (event.target instanceof Element && event.target.closest('a.node-link')) return;
             try { textSpan.focus({ preventScroll: true }); } catch (_) { textSpan.focus(); }
@@ -2089,7 +2512,7 @@
         }
       }
       if (!isPlayback && n.id !== editingId) {
-        el.addEventListener('pointerdown', event => {
+        el?.addEventListener('pointerdown', event => {
           const pointerTarget = event.target instanceof Element ? event.target : null;
           const linkTarget = pointerTarget?.closest('a.node-link');
 
@@ -2132,7 +2555,7 @@
           if (event.target.closest('.resize-handle') || event.target.closest('.anchor')) return;
           if (event.target.closest('.node')) startNodeDrag(event, n.id);
         });
-        el.addEventListener('dblclick', event => {
+        el?.addEventListener('dblclick', event => {
           const target = event.target instanceof Element ? event.target : null;
           // Double-clicking a URL must not enter node text-edit mode.
           if (target?.closest('a.node-link')) return;
@@ -2140,7 +2563,7 @@
           event.preventDefault(); event.stopPropagation();
           if (n.type !== 'image') startEditing(n.id);
         });
-        el.addEventListener('contextmenu', event => {
+        el?.addEventListener('contextmenu', event => {
           event.preventDefault(); event.stopPropagation();
           showNodeContextMenu(n.id, event.clientX, event.clientY);
         });
@@ -2176,6 +2599,7 @@
     renderedEdgeElements.clear();
     const edgeElements = new Map();
     const nodeToEdges = new Map();
+    const squareGroups = new Map();
     const addNodeEdgeIndex = (nodeId, edgeId) => {
       if (!nodeToEdges.has(nodeId)) nodeToEdges.set(nodeId, []);
       nodeToEdges.get(nodeId).push(edgeId);
@@ -2200,7 +2624,7 @@
       hit.setAttribute('class', 'edge-hit');
       hit.setAttribute('d', d);
       hit.dataset.edgeId = edge.id;
-      hit.addEventListener('pointerdown', event => {
+      hit?.addEventListener('pointerdown', event => {
         if (event.button !== 0 || isPlayback) return;
         event.preventDefault();
         event.stopPropagation();
@@ -2225,7 +2649,7 @@
         refreshEdgeSelectionDecorations(scene, false);
         updateActionButtons();
       });
-      hit.addEventListener('contextmenu', event => {
+      hit?.addEventListener('contextmenu', event => {
         // Block the browser's native context menu before doing any UI work.
         event.preventDefault();
         event.stopPropagation();
@@ -2274,6 +2698,11 @@
       edgeElements.set(edge.id, { edge, hit, line: p });
       addNodeEdgeIndex(edge.from, edge.id);
       addNodeEdgeIndex(edge.to, edge.id);
+      if (edge.style === 'square') {
+        const groupKey = `${edge.from}::${edge.fromSide}`;
+        if (!squareGroups.has(groupKey)) squareGroups.set(groupKey, []);
+        squareGroups.get(groupKey).push(edge.id);
+      }
     });
     if (!isPlayback && linkDraft) {
       const origin = nodeById(linkDraft.fromId, scene);
@@ -2295,7 +2724,9 @@
     stage.prepend(svg);
     renderedEdgeElements = edgeElements;
     renderedNodeToEdges = nodeToEdges;
+    renderedSquareGroups = squareGroups;
     renderedConnectionsSvg = svg;
+    rebuildViewportSpatialIndexes();
     if (!isPlayback && editingId) {
       const editingEl = stage.querySelector(`[data-node-id="${CSS.escape(editingId)}"]`);
       const editingText = editingEl && editingEl.querySelector('.node-text');
@@ -2449,9 +2880,9 @@
     // These listeners are app-level touch tracking, but they share the same
     // gesture lifecycle as the temporary move/up handlers below. Re-registering
     // the same callback is idempotent, so a new canvas gesture safely restores them.
-    window.addEventListener('pointermove', handleWorkspaceTouchMove, { passive: false });
-    window.addEventListener('pointerup', handleWorkspaceTouchEnd, { passive: false });
-    window.addEventListener('pointercancel', handleWorkspaceTouchEnd, { passive: false });
+    window?.addEventListener('pointermove', handleWorkspaceTouchMove, { passive: false });
+    window?.addEventListener('pointerup', handleWorkspaceTouchEnd, { passive: false });
+    window?.addEventListener('pointercancel', handleWorkspaceTouchEnd, { passive: false });
   }
 
   function detachPointerGestureListeners() {
@@ -2474,20 +2905,21 @@
     detachPointerGestureListeners();
     activeMoveHandler = typeof moveHandler === 'function' ? moveHandler : null;
     activeUpHandler = typeof upHandler === 'function' ? upHandler : null;
-    if (activeMoveHandler) window.addEventListener('pointermove', activeMoveHandler);
-    if (activeUpHandler) window.addEventListener('pointerup', activeUpHandler);
-    window.addEventListener('pointercancel', cancelPointerGesture);
+    if (activeMoveHandler) window?.addEventListener('pointermove', activeMoveHandler);
+    if (activeUpHandler) window?.addEventListener('pointerup', activeUpHandler);
+    window?.addEventListener('pointercancel', cancelPointerGesture);
     attachWorkspaceTouchListeners();
   }
 
   function cancelPointerGesture(event) {
-    // Keep the active pointer sequence intact while a two-finger pinch is in progress.
-    // Rendering here would rebuild the stage DOM and invalidate active touch tracking.
-    if (pinchState) return;
-    if (event && drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
-    if (event && linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
+    // pointercancel/programmatic cancellation ends the complete gesture transaction.
+    // Flush every tracked touch id so a later pointerdown cannot inherit stale pinch state.
+    activeTouchPointers.clear();
+    pinchState = null;
+    workspace.classList.remove('pinching');
     const activeDrag = drag;
     const activeBox = boxSelect;
+    clearQueuedGesturePointerMove();
     detachPointerGestureListeners();
     if (dragPaintRaf) {
       cancelAnimationFrame(dragPaintRaf);
@@ -2533,7 +2965,7 @@
     renderScene();
   }
 
-  window.addEventListener('blur', () => {
+  window?.addEventListener('blur', () => {
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     clearLongPress();
     activeTouchPointers.clear();
@@ -2737,13 +3169,20 @@
     attachPointerGesture(onPointerMove, onPointerUp);
   }
 
-  function ensureStageBoundsForDrag() {
-    // Extend the drawing surface only when a node is dragged beyond its current edge.
-    // Growing (never shrinking) avoids scrollbar oscillation while dragging.
+  function ensureStageBoundsForDrag(nodeIds = []) {
+    // The stage already includes every node at render time. During a drag,
+    // inspect only the moved objects instead of reducing the complete graph.
     const currentWidth = Number.parseFloat(stage.style.width) || 1200;
     const currentHeight = Number.parseFloat(stage.style.height) || 800;
-    const maxX = scene.nodes.reduce((max, node) => Math.max(max, node.x + Math.max(10, node.width || 10)), 0);
-    const maxY = scene.nodes.reduce((max, node) => Math.max(max, node.y + Math.max(10, node.height || 10)), 0);
+    let maxX = 0, maxY = 0;
+    nodeIds.forEach(id => {
+      const node = renderedNodeModels.get(id) || nodeById(id);
+      if (!node) return;
+      maxX = Math.max(maxX, node.x + Math.max(10, node.width || 10));
+      maxY = Math.max(maxY, node.y + Math.max(10, node.height || 10));
+    });
+    stageContentBounds.maxX = Math.max(stageContentBounds.maxX, maxX);
+    stageContentBounds.maxY = Math.max(stageContentBounds.maxY, maxY);
     const nextWidth = Math.max(currentWidth, Math.ceil((workspace.clientWidth || 1000) / zoom), Math.ceil(maxX + 500));
     const nextHeight = Math.max(currentHeight, Math.ceil((workspace.clientHeight || 700) / zoom), Math.ceil(maxY + 400));
     if (nextWidth !== currentWidth || nextHeight !== currentHeight) {
@@ -2764,23 +3203,26 @@
     nodeIds.forEach(id => {
       (renderedNodeToEdges.get(id) || []).forEach(edgeId => {
         edgeIds.add(edgeId);
-        const edge = scene.edges.find(item => item.id === edgeId);
+        const bundle = renderedEdgeElements.get(edgeId);
+        const edge = bundle && bundle.edge;
         if (edge && edge.style === 'square') {
           affectedSquareGroups.add(`${edge.from}::${edge.fromSide}`);
         }
       });
     });
 
-    if (affectedSquareGroups.size) {
-      scene.edges.forEach(edge => {
-        if (edge.style === 'square' && affectedSquareGroups.has(`${edge.from}::${edge.fromSide}`)) {
-          edgeIds.add(edge.id);
-        }
-      });
-    }
+    // Square branches share a trunk. Update only siblings in the affected
+    // source-side group instead of scanning/re-routing the entire graph.
+    affectedSquareGroups.forEach(groupKey => {
+      (renderedSquareGroups.get(groupKey) || []).forEach(edgeId => edgeIds.add(edgeId));
+    });
 
+    const affectedEdges = [...edgeIds]
+      .map(edgeId => renderedEdgeElements.get(edgeId))
+      .filter(Boolean)
+      .map(bundle => bundle.edge);
     const squareRouteContexts = buildSquareRouteContexts(
-      scene.edges,
+      affectedEdges,
       renderedNodeModels,
       (node, side) => getStageNodePoint(node, side)
     );
@@ -2860,12 +3302,17 @@
       el.style.top = `${node.y}px`;
     });
 
-    ensureStageBoundsForDrag();
+    ensureStageBoundsForDrag(ids);
     updateRenderedEdgesForNodes(ids);
     scheduleViewportCulling();
   }
 
   function scheduleDragGeometryPaint() {
+    if (processingPointerMoveFrame) {
+      if (dragPaintRaf) { cancelAnimationFrame(dragPaintRaf); dragPaintRaf = 0; }
+      paintDragGeometry();
+      return;
+    }
     if (dragPaintRaf) return;
     dragPaintRaf = requestAnimationFrame(() => {
       dragPaintRaf = 0;
@@ -2873,7 +3320,69 @@
     });
   }
 
+  function snapshotPointerMove(event) {
+    return {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType || 'mouse',
+      button: event.button,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      cancelable: false,
+      preventDefault() {}
+    };
+  }
+
+  function queueGesturePointerMove(event, handler) {
+    if (!event || !handler) return;
+    // preventDefault must run during the native event dispatch on iOS Safari;
+    // the geometry work itself is deferred to the next animation frame.
+    if (event.pointerType === 'touch' && event.cancelable) event.preventDefault();
+    pendingPointerMove = snapshotPointerMove(event);
+    pendingPointerMoveHandler = handler;
+    if (pointerMoveRaf) return;
+    pointerMoveRaf = requestAnimationFrame(() => {
+      pointerMoveRaf = 0;
+      const sample = pendingPointerMove;
+      const callback = pendingPointerMoveHandler;
+      pendingPointerMove = null;
+      pendingPointerMoveHandler = null;
+      if (!sample || !callback) return;
+      processingPointerMoveFrame = true;
+      try { callback(sample); }
+      finally { processingPointerMoveFrame = false; }
+    });
+  }
+
+  function flushQueuedGesturePointerMove(pointerId = null) {
+    if (!pendingPointerMove || !pendingPointerMoveHandler) return;
+    if (pointerId != null && pendingPointerMove.pointerId !== pointerId) return;
+    if (pointerMoveRaf) cancelAnimationFrame(pointerMoveRaf);
+    pointerMoveRaf = 0;
+    const sample = pendingPointerMove;
+    const callback = pendingPointerMoveHandler;
+    pendingPointerMove = null;
+    pendingPointerMoveHandler = null;
+    processingPointerMoveFrame = true;
+    try { callback(sample); }
+    finally { processingPointerMoveFrame = false; }
+  }
+
+  function clearQueuedGesturePointerMove() {
+    if (pointerMoveRaf) cancelAnimationFrame(pointerMoveRaf);
+    pointerMoveRaf = 0;
+    pendingPointerMove = null;
+    pendingPointerMoveHandler = null;
+  }
+
   function onPointerMove(event) {
+    if (pinchState) return;
+    if (!drag && !linkDraft) return;
+    if (drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
+    if (linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
+    queueGesturePointerMove(event, processPointerMove);
+  }
+
+  function processPointerMove(event) {
     if (pinchState) return;
     if (!drag && !linkDraft) return;
     if (drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
@@ -2890,10 +3399,12 @@
         if (event.cancelable) event.preventDefault();
       }
       if (drag.type === 'pan') {
-        scheduleViewportPan(
-          drag.originScrollLeft - dx,
-          drag.originScrollTop - dy
-        );
+        pendingViewportPan = {
+          left: drag.originScrollLeft - dx,
+          top: drag.originScrollTop - dy
+        };
+        if (processingPointerMoveFrame) flushPendingViewportPan();
+        else scheduleViewportFrame();
         return;
       }
       // Use the zoom captured when this gesture started. This keeps model-space movement
@@ -2982,6 +3493,7 @@
     if (pinchState) return;
     if (drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
     if (linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
+    flushQueuedGesturePointerMove(event.pointerId);
     // Snapshot the active gesture's movement before clearing its global state.
     const movementWasTracked = wasDragging;
     wasDragging = false;
@@ -3550,7 +4062,7 @@
     });
   }
 
-  nodeContextMenu.addEventListener('click', event => {
+  nodeContextMenu?.addEventListener('click', event => {
     const menuTarget = event.target instanceof Element ? event.target : null;
     const canvasButton = menuTarget ? menuTarget.closest('[data-canvas-action]') : null;
     const isCreateTextAction = !!(canvasButton && canvasButton.dataset.canvasAction === 'create-text');
@@ -3617,7 +4129,7 @@
     }
     commitScene(); updateNodeContextMenu();
   });
-  document.addEventListener('pointerdown', event => {
+  document?.addEventListener('pointerdown', event => {
     const pointerTarget = event.target instanceof Element ? event.target : null;
 
     // The context sheet owns every pointer sequence that begins inside it.
@@ -4268,16 +4780,12 @@
       try {
         // Validate the envelope before switching away from the current project.
         const data = JSON.parse(String(reader.result || ''));
-        if (!data || !data.scene || !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) {
-          throw new Error('Некорректный формат');
-        }
+        validateProjectDataStructure(data);
         const imageAssets = normalizeProjectImageAssets(data.images);
         const importedTitle = typeof data.title === 'string' && data.title.trim()
           ? data.title.slice(0, 90)
           : 'Импортированная схема';
-        const timelineInput = Array.isArray(data.timeline)
-          ? data.timeline.filter(frame => frame && frame.scene && Array.isArray(frame.scene.nodes) && Array.isArray(frame.scene.edges))
-          : [];
+        const timelineInput = Array.isArray(data.timeline) ? data.timeline : [];
         const importedProjectStartedAt = Number(data.projectStartedAt) || Date.now();
         const importedNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
         const importedChecklist = sanitizeProjectChecklist(data.checklist);
@@ -4559,21 +5067,39 @@
   }
 
   function startBoxSelection(event) {
-    if (event.button !== 2 || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
+    const isTouchMarquee = event.pointerType === 'touch' && event.button === 0;
+    const isMouseMarquee = event.pointerType !== 'touch' && event.button === 2;
+    if ((!isTouchMarquee && !isMouseMarquee) || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
     const target = event.target;
     if (target.closest && (target.closest('.node[data-node-id]') || target.closest('.edge-hit') || target.closest('.anchor') || target.closest('.resize-handle'))) return;
+
+    // On touch, a one-finger drag on empty canvas is a marquee gesture rather
+    // than a pan. Two-finger gestures remain owned by the pinch/pan tracker.
+    // Clear the empty-canvas long-press candidate so it cannot open a context sheet
+    // while the user is actively drawing a selection rectangle.
+    if (isTouchMarquee) clearLongPress();
     if (editingId) finishEditing(editingId, true);
-    event.preventDefault();
+    if (event.cancelable) event.preventDefault();
+    event.stopImmediatePropagation();
     closeNodeContextMenu();
     const point = getStagePoint(event);
     const rect = document.createElement('div'); rect.className = 'selection-rect';
     rect.style.left = `${point.x}px`; rect.style.top = `${point.y}px`; rect.style.width = '0'; rect.style.height = '0';
     stage.appendChild(rect);
-    boxSelect = { startX: point.x, startY: point.y, x: point.x, y: point.y, moved: false, element: rect, pointerId: event.pointerId };
+    boxSelect = {
+      startX: point.x, startY: point.y, x: point.x, y: point.y,
+      moved: false, element: rect, pointerId: event.pointerId,
+      pointerType: event.pointerType || 'mouse'
+    };
     attachPointerGesture(onBoxSelectionMove, onBoxSelectionUp);
   }
 
   function onBoxSelectionMove(event) {
+    if (!boxSelect || (boxSelect.pointerId != null && event.pointerId !== boxSelect.pointerId)) return;
+    queueGesturePointerMove(event, processBoxSelectionMove);
+  }
+
+  function processBoxSelectionMove(event) {
     if (!boxSelect || (boxSelect.pointerId != null && event.pointerId !== boxSelect.pointerId)) return;
     const p = getStagePoint(event);
     boxSelect.x = p.x; boxSelect.y = p.y;
@@ -4586,11 +5112,12 @@
 
   function onBoxSelectionUp(event) {
     if (!boxSelect || (boxSelect.pointerId != null && event.pointerId !== boxSelect.pointerId)) return;
+    flushQueuedGesturePointerMove(event.pointerId);
     // Prevent native context-menu behavior immediately, before any DOM updates.
     if (event && event.cancelable) event.preventDefault();
     if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
-    // This function is only attached for a right-button marquee gesture.
-    // Keep suppressing the delayed contextmenu event even if the browser retargets it.
+    // Keep suppressing delayed native context-menu events after either the
+    // desktop right-button marquee or a mobile touch marquee.
     suppressContextMenuUntil = Date.now() + 1200;
     detachPointerGestureListeners();
     if (!boxSelect) return;
@@ -4599,8 +5126,10 @@
     if (box.element.isConnected) box.element.remove();
 
     if (!box.moved) {
-      // A right-click on empty canvas is a canvas action, not a command to delete
-      // previously selected edges. Edge actions are opened only from an edge hit.
+      // A tap on empty mobile canvas is not a selection gesture and must not
+      // unexpectedly open the canvas context sheet. Desktop right-click keeps
+      // its existing context-menu behavior.
+      if (box.pointerType === 'touch') return;
       contextCanvasPoint = { x: box.startX, y: box.startY };
       showCanvasContextMenu(event && event.clientX || 0, event && event.clientY || 0);
       return;
@@ -4611,7 +5140,21 @@
     const top = Math.min(box.startY, box.y);
     const bottom = Math.max(box.startY, box.y);
 
+    const stageRect = stage.getBoundingClientRect();
+    const safeZoom = Math.max(0.0001, Number(zoom) || 1);
     const selected = scene.nodes.filter(node => {
+      // Auto-sized text nodes may have stale model width/height values. Prefer
+      // their currently rendered bounds so the marquee selects what the user
+      // can actually see, including wrapped text and mobile-sized nodes.
+      const element = renderedNodeElements.get(node.id);
+      if (element && element.isConnected) {
+        const bounds = element.getBoundingClientRect();
+        const nx1 = (bounds.left - stageRect.left) / safeZoom;
+        const ny1 = (bounds.top - stageRect.top) / safeZoom;
+        const nx2 = nx1 + bounds.width / safeZoom;
+        const ny2 = ny1 + bounds.height / safeZoom;
+        return nx2 >= left && nx1 <= right && ny2 >= top && ny1 <= bottom;
+      }
       const nx1 = node.x;
       const ny1 = node.y;
       const nx2 = node.x + Math.max(10, node.width || 10);
@@ -4821,16 +5364,34 @@
   // Install global touch trackers during initialization and re-arm them before
   // each new pointer sequence (including node controls that stop bubbling).
   attachWorkspaceTouchListeners();
-  window.addEventListener('pointerdown', attachWorkspaceTouchListeners, { capture: true, passive: true });
-  workspace.addEventListener('pointerdown', handleWorkspaceTouchDown, { passive: false });
+  window?.addEventListener('pointerdown', attachWorkspaceTouchListeners, { capture: true, passive: true });
+  workspace?.addEventListener('pointerdown', handleWorkspaceTouchDown, { passive: false });
 
-  stage.addEventListener('pointerdown', startBoxSelection);
+  stage?.addEventListener('pointerdown', startBoxSelection);
+
+  // When a contenteditable node receives focus, the mobile keyboard can shrink
+  // the visual viewport after the focus event. Recheck during its animation so
+  // the active node is brought above the keyboard without scrolling the page.
+  stage?.addEventListener('focusin', event => {
+    const target = event.target instanceof Element ? event.target : null;
+    const editor = target && target.closest('.node-text[contenteditable="true"]');
+    if (!editor) return;
+    lastEditorScrollTarget = null;
+    [0, 70, 160, 280, 420].forEach(delay => {
+      window.setTimeout(scheduleActiveEditorVisibilityCheck, delay);
+    });
+  }, true);
+
+  if (window.visualViewport) {
+    window.visualViewport?.addEventListener('resize', scheduleActiveEditorVisibilityCheck, { passive: true });
+    window.visualViewport?.addEventListener('scroll', scheduleActiveEditorVisibilityCheck, { passive: true });
+  }
 
   // ПКМ по пустому холсту открывает меню создания текстового узла или изображения.
   // Capture context-menu events before SVG/node handlers so the browser's
   // native menu never appears over the canvas. We route the intended app action
   // here as well, because stopPropagation() prevents later stage/node listeners.
-  document.addEventListener('contextmenu', event => {
+  document?.addEventListener('contextmenu', event => {
     // While the app's mobile context sheet is open, suppress the browser menu
     // everywhere on the screen, not only over the canvas element.
     if (nodeContextMenu.classList.contains('visible')) {
@@ -4897,11 +5458,11 @@
   // During history playback, prevent wheel scrolling anywhere on the document,
   // including when the pointer is over the playback panel. Capture + passive:false
   // ensures the browser has not already committed to its default scroll action.
-  document.addEventListener('wheel', event => {
+  document?.addEventListener('wheel', event => {
     if (playback.active && event.cancelable) event.preventDefault();
   }, { passive: false, capture: true });
 
-  workspace.addEventListener('wheel', event => {
+  workspace?.addEventListener('wheel', event => {
     if (playback.active) return;
     event.preventDefault();
     // Keep the coordinate frame stable until a drag/link gesture is released.
@@ -4911,7 +5472,7 @@
     setZoom(queuedZoom * factor, event.clientX, event.clientY);
   }, { passive: false });
 
-  stage.addEventListener('pointerdown', event => {
+  stage?.addEventListener('pointerdown', event => {
     if (playback.active) return;
     if (event.button !== 0) return;
 
@@ -4959,37 +5520,47 @@
     if (editingId) finishEditing(editingId, true);
     startPan(event);
   }, { passive: false });
-  mobileMenuToggle.addEventListener('click', () => {
+  mobileMenuToggle?.addEventListener('click', () => {
     setMobileSidebarOpen(!document.body.classList.contains('sidebar-open'));
   });
-  sidebarBackdrop.addEventListener('click', closeMobileSidebar);
-  sidebar.addEventListener('click', event => {
+  sidebarBackdrop?.addEventListener('pointerdown', dismissMobileSidebarFromBackdrop, { capture: true, passive: false });
+  sidebarBackdrop?.addEventListener('click', event => {
+    if (!document.body.classList.contains('sidebar-open')) {
+      if (event.cancelable) event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      return;
+    }
+    dismissMobileSidebarFromBackdrop(event);
+  }, { capture: true });
+  window?.addEventListener('click', suppressSidebarBackdropGhostClick, { capture: true });
+  sidebar?.addEventListener('click', event => {
     if (event.target.closest('button')) closeMobileSidebar();
   });
-  document.querySelectorAll('[data-mode]').forEach(btn => btn.addEventListener('click', () => {
+  document.querySelectorAll('[data-mode]').forEach(btn => btn?.addEventListener('click', () => {
     setMode(btn.dataset.mode);
     closeMobileSidebar();
   }));
-  document.getElementById('deleteBtn').addEventListener('click', deleteSelected);
-  document.getElementById('undoBtn').addEventListener('click', undo);
-  document.getElementById('redoBtn').addEventListener('click', redo);
-  document.getElementById('exportBtn').addEventListener('click', exportProject);
-  document.getElementById('themeToggleBtn').addEventListener('click', () => applyTheme(document.body.classList.contains('dark-theme') ? 'light' : 'dark'));
-  document.getElementById('exportJsonBtn').addEventListener('click', exportProjectJSON);
-  document.getElementById('cancelPngExportBtn').addEventListener('click', () => exportScreen.classList.remove('visible'));
-  document.getElementById('downloadPngBtn').addEventListener('click', () => {
+  document.getElementById('deleteBtn')?.addEventListener('click', deleteSelected);
+  document.getElementById('undoBtn')?.addEventListener('click', undo);
+  document.getElementById('redoBtn')?.addEventListener('click', redo);
+  document.getElementById('exportBtn')?.addEventListener('click', exportProject);
+  document.getElementById('themeToggleBtn')?.addEventListener('click', () => applyTheme(document.body.classList.contains('dark-theme') ? 'light' : 'dark'));
+  document.getElementById('exportJsonBtn')?.addEventListener('click', exportProjectJSON);
+  document.getElementById('cancelPngExportBtn')?.addEventListener('click', () => exportScreen.classList.remove('visible'));
+  document.getElementById('downloadPngBtn')?.addEventListener('click', () => {
     const option = document.querySelector('input[name="exportFormat"]:checked');
     exportPng(option ? option.value : 'png');
   });
-  exportScreen.addEventListener('pointerdown', event => { if (event.target === exportScreen) exportScreen.classList.remove('visible'); });
-  document.getElementById('importBtn').addEventListener('click', () => importFile.click());
-  importFile.addEventListener('change', () => importProjectFile(importFile.files && importFile.files[0]));
-  imageFile.addEventListener('change', event => {
+  exportScreen?.addEventListener('pointerdown', event => { if (event.target === exportScreen) exportScreen.classList.remove('visible'); });
+  document.getElementById('importBtn')?.addEventListener('click', () => importFile.click());
+  importFile?.addEventListener('change', () => importProjectFile(importFile.files && importFile.files[0]));
+  imageFile?.addEventListener('change', event => {
     const file = event.currentTarget.files && event.currentTarget.files[0];
     event.currentTarget.value = ''; // Allows choosing the same image again later.
     if (file) insertImageFile(file, pendingImagePoint);
   });
-  document.addEventListener('paste', event => {
+  document?.addEventListener('paste', event => {
     const target = event.target;
     if (target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return;
     const items = event.clipboardData && event.clipboardData.items;
@@ -5007,25 +5578,25 @@
     pendingImagePoint = getVisibleCanvasCenter();
     insertImageFile(imageFileFromClipboard, pendingImagePoint);
   });
-  document.getElementById('playHistoryBtn').addEventListener('click', () => playback.active ? togglePlayback() : openPlayback());
-  document.getElementById('playPauseBtn').addEventListener('click', togglePlayback);
-  document.getElementById('exitPlaybackBtn').addEventListener('click', exitPlayback);
-  playbackRange.addEventListener('input', event => seekPlayback(event.target.value));
-  projectTitle.addEventListener('input', saveProject);
-  projectTitle.addEventListener('blur', () => { if (!projectTitle.value.trim()) projectTitle.value = 'Новая схема'; saveProject(); });
+  document.getElementById('playHistoryBtn')?.addEventListener('click', () => playback.active ? togglePlayback() : openPlayback());
+  document.getElementById('playPauseBtn')?.addEventListener('click', togglePlayback);
+  document.getElementById('exitPlaybackBtn')?.addEventListener('click', exitPlayback);
+  playbackRange?.addEventListener('input', event => seekPlayback(event.target.value));
+  projectTitle?.addEventListener('input', saveProject);
+  projectTitle?.addEventListener('blur', () => { if (!projectTitle.value.trim()) projectTitle.value = 'Новая схема'; saveProject(); });
 
 
-  projectNotesToggle.addEventListener('click', () => {
+  projectNotesToggle?.addEventListener('click', () => {
     closeMobileSidebar();
     setProjectNotesOpen(!mainArea.classList.contains('project-notes-open'));
   });
-  projectNotesClose.addEventListener('click', () => setProjectNotesOpen(false));
-  projectNotesBackdrop.addEventListener('click', () => setProjectNotesOpen(false));
-  projectNotesInput.addEventListener('input', () => {
+  projectNotesClose?.addEventListener('click', () => setProjectNotesOpen(false));
+  projectNotesBackdrop?.addEventListener('click', () => setProjectNotesOpen(false));
+  projectNotesInput?.addEventListener('input', () => {
     projectNotes = projectNotesInput.value.slice(0, 100000);
     saveProject();
   });
-  projectChecklistForm.addEventListener('submit', event => {
+  projectChecklistForm?.addEventListener('submit', event => {
     event.preventDefault();
     const text = projectChecklistInput.value.trim().slice(0, 240);
     if (!text) return;
@@ -5039,7 +5610,7 @@
     saveProject();
     projectChecklistInput.focus({ preventScroll: true });
   });
-  projectChecklistList.addEventListener('change', event => {
+  projectChecklistList?.addEventListener('change', event => {
     const checkbox = event.target.closest('[data-checklist-toggle]');
     if (!checkbox) return;
     const task = projectChecklist.find(item => item.id === checkbox.dataset.checklistToggle);
@@ -5053,7 +5624,7 @@
     }
     saveProject();
   });
-  projectChecklistList.addEventListener('click', event => {
+  projectChecklistList?.addEventListener('click', event => {
     const remove = event.target.closest('[data-checklist-delete]');
     if (!remove) return;
     const id = remove.dataset.checklistDelete;
@@ -5061,13 +5632,13 @@
     renderProjectChecklist();
     saveProject();
   });
-  document.addEventListener('keydown', event => {
+  document?.addEventListener('keydown', event => {
     if (event.key === 'Escape' && mainArea.classList.contains('project-notes-open')) {
       setProjectNotesOpen(false);
       event.stopImmediatePropagation();
     }
   });
-  document.getElementById('clearBtn').addEventListener('click', () => openConfirm('Очистить рабочее поле?', 'Все узлы и связи будут удалены из текущей схемы. Это действие можно отменить.', 'Очистить', () => {
+  document.getElementById('clearBtn')?.addEventListener('click', () => openConfirm('Очистить рабочее поле?', 'Все узлы и связи будут удалены из текущей схемы. Это действие можно отменить.', 'Очистить', () => {
     if (playback.active) exitPlayback();
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     if (editingId) finishEditing(editingId, true);
@@ -5075,18 +5646,18 @@
     scene = freshScene(); selectedId = editingId = null; selectedIds.splice(0); linkDraft = null; connectionSourceId = null;
     commitScene('Рабочее поле очищено');
   }));
-  document.getElementById('modalCancel').addEventListener('click', () => closeConfirm(true));
-  document.getElementById('modalConfirm').addEventListener('click', () => { const fn = confirmCallback; try { if (fn) fn(); } finally { closeConfirm(false); } });
-  modalBackdrop.addEventListener('pointerdown', event => { if (event.target === modalBackdrop) closeConfirm(false); });
+  document.getElementById('modalCancel')?.addEventListener('click', () => closeConfirm(true));
+  document.getElementById('modalConfirm')?.addEventListener('click', () => { const fn = confirmCallback; try { if (fn) fn(); } finally { closeConfirm(false); } });
+  modalBackdrop?.addEventListener('pointerdown', event => { if (event.target === modalBackdrop) closeConfirm(false); });
 
-  exitSaveBtn.addEventListener('click', saveAndExitToStartScreen);
-  exitWithoutSaveBtn.addEventListener('click', exitWithoutSavingToStartScreen);
-  exitCancelBtn.addEventListener('click', closeExitConfirm);
-  exitConfirmBackdrop.addEventListener('pointerdown', event => {
+  exitSaveBtn?.addEventListener('click', saveAndExitToStartScreen);
+  exitWithoutSaveBtn?.addEventListener('click', exitWithoutSavingToStartScreen);
+  exitCancelBtn?.addEventListener('click', closeExitConfirm);
+  exitConfirmBackdrop?.addEventListener('pointerdown', event => {
     if (event.target === exitConfirmBackdrop) closeExitConfirm();
   });
 
-  emptyStateCloseBtn.addEventListener('click', event => {
+  emptyStateCloseBtn?.addEventListener('click', event => {
     event.preventDefault();
     event.stopPropagation();
     emptyHintDismissed = true;
@@ -5097,31 +5668,31 @@
     updateEmptyState();
   });
 
-  document.getElementById('createCanvasBtn').addEventListener('click', () => {
+  document.getElementById('createCanvasBtn')?.addEventListener('click', () => {
     closeProjectActionsMenu();
     beginNewProject();
   });
-  document.querySelector('.brand').addEventListener('click', event => {
+  document.querySelector('.brand')?.addEventListener('click', event => {
     event.preventDefault();
     closeProjectActionsMenu();
     confirmExit();
   });
-  document.getElementById('openPreviousBtn').addEventListener('click', () => {
+  document.getElementById('openPreviousBtn')?.addEventListener('click', () => {
     closeProjectActionsMenu();
     showStartPanel('startProjectsPanel');
   });
-  document.getElementById('settingsBtn').addEventListener('click', () => {
+  document.getElementById('settingsBtn')?.addEventListener('click', () => {
     closeProjectActionsMenu();
     showStartPanel('startSettingsPanel');
   });
-  document.querySelectorAll('[data-start-back]').forEach(button => button.addEventListener('click', () => {
+  document.querySelectorAll('[data-start-back]').forEach(button => button?.addEventListener('click', () => {
     closeProjectActionsMenu();
     if (!startScreen.classList.contains('visible')) showStartScreen();
     else showStartPanel('startMainPanel');
   }));
-  document.querySelectorAll('[data-theme-choice]').forEach(button => button.addEventListener('click', () => applyTheme(button.dataset.themeChoice)));
-  document.getElementById('autoArrangeToggle').addEventListener('change', event => setAutoArrangeEnabled(event.currentTarget.checked));
-  document.getElementById('savedProjectList').addEventListener('click', event => {
+  document.querySelectorAll('[data-theme-choice]').forEach(button => button?.addEventListener('click', () => applyTheme(button.dataset.themeChoice)));
+  document.getElementById('autoArrangeToggle')?.addEventListener('change', event => setAutoArrangeEnabled(event.currentTarget.checked));
+  document.getElementById('savedProjectList')?.addEventListener('click', event => {
     const actionsButton = event.target.closest('[data-project-actions-id]');
     if (actionsButton) {
       event.preventDefault();
@@ -5137,7 +5708,7 @@
     }
   });
 
-  projectActionsMenu.addEventListener('click', event => {
+  projectActionsMenu?.addEventListener('click', event => {
     const actionButton = event.target.closest('[data-project-menu-action]');
     if (!actionButton || !activeProjectActionId) return;
     event.preventDefault();
@@ -5151,18 +5722,18 @@
     if (action === 'delete') openDeleteProjectModal(id);
   });
 
-  document.addEventListener('pointerdown', event => {
+  document?.addEventListener('pointerdown', event => {
     if (!projectActionsMenu.classList.contains('visible')) return;
     if (event.target.closest('#projectActionsMenu') || event.target.closest('[data-project-actions-id]')) return;
     closeProjectActionsMenu();
   });
-  window.addEventListener('resize', closeProjectActionsMenu);
-  document.getElementById('savedProjectList').addEventListener('scroll', closeProjectActionsMenu, { passive: true });
+  window?.addEventListener('resize', closeProjectActionsMenu);
+  document.getElementById('savedProjectList')?.addEventListener('scroll', closeProjectActionsMenu, { passive: true });
 
   // Handle validation in JavaScript so an empty title reaches our toast instead
   // of being blocked by the browser's native `required` validation.
   projectRenameForm.noValidate = true;
-  projectRenameForm.addEventListener('submit', event => {
+  projectRenameForm?.addEventListener('submit', event => {
     event.preventDefault();
     const submittedTitle = projectRenameInput.value;
     const renamed = renameProject(renameTargetProjectId, submittedTitle);
@@ -5178,19 +5749,19 @@
       projectRenameInput.focus({ preventScroll: true });
     }
   });
-  projectRenameCancelBtn.addEventListener('click', closeRenameProjectModal);
-  projectRenameBackdrop.addEventListener('pointerdown', event => {
+  projectRenameCancelBtn?.addEventListener('click', closeRenameProjectModal);
+  projectRenameBackdrop?.addEventListener('pointerdown', event => {
     if (event.target === projectRenameBackdrop) closeRenameProjectModal();
   });
 
-  projectDeleteCancelBtn.addEventListener('click', closeDeleteProjectModal);
-  projectDeleteConfirmBtn.addEventListener('click', () => deleteProject(deleteTargetProjectId));
-  projectDeleteBackdrop.addEventListener('pointerdown', event => {
+  projectDeleteCancelBtn?.addEventListener('click', closeDeleteProjectModal);
+  projectDeleteConfirmBtn?.addEventListener('click', () => deleteProject(deleteTargetProjectId));
+  projectDeleteBackdrop?.addEventListener('pointerdown', event => {
     if (event.target === projectDeleteBackdrop) closeDeleteProjectModal();
   });
-  document.getElementById('importFromStartBtn').addEventListener('click', () => importFile.click());
+  document.getElementById('importFromStartBtn')?.addEventListener('click', () => importFile.click());
 
-  document.addEventListener('keydown', event => {
+  document?.addEventListener('keydown', event => {
     const target = event.target;
     const inTextField = target && (target.isContentEditable || ['INPUT','TEXTAREA','SELECT'].includes(target.tagName));
     if (event.key === 'Escape') {
@@ -5256,9 +5827,9 @@
     if (id && hasProjectContent() && dirty) saveProject();
     if (pendingSave) flushPendingSave();
   }
-  window.addEventListener('beforeunload', flushBeforeLeavingPage);
-  window.addEventListener('pagehide', flushBeforeLeavingPage);
-  window.addEventListener('resize', () => {
+  window?.addEventListener('beforeunload', flushBeforeLeavingPage);
+  window?.addEventListener('pagehide', flushBeforeLeavingPage);
+  window?.addEventListener('resize', () => {
     if (nodeContextMenu.classList.contains('visible')) {
       const rect = nodeContextMenu.getBoundingClientRect();
       positionContextMenu(rect.left, rect.top);
@@ -5274,7 +5845,7 @@
       renderScene(currentRenderScene || scene);
     }, 150);
   });
-  workspace.addEventListener('scroll', scheduleViewportCulling, { passive: true });
+  workspace?.addEventListener('scroll', scheduleViewportCulling, { passive: true });
 
   // Initial state: projects are opened from the start menu, rather than loaded invisibly.
   try {
@@ -5313,7 +5884,7 @@
   updateProjectNotesMeta();
   // Count only time while this page is visible. Browsers fire visibilitychange
   // when a tab is backgrounded or a mobile screen is locked.
-  document.addEventListener('visibilitychange', () => {
+  document?.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       checkpointProjectWorkTime();
       projectSessionStartedAt = 0;
