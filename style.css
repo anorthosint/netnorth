@@ -43,7 +43,67 @@
   .save-dot { width: 5px; height: 5px; border-radius: 50%; background: #9b9b9b; }
   .top-action { background: #fff; border: 1px solid #dedfe1; border-radius: 5px; padding: 8px 11px; display: inline-flex; gap: 8px; align-items: center; cursor: pointer; transition: border-color .16s, background .16s; }
   .top-action:hover { background: #fafafa; border-color: #bfc1c4; }
-  .sidebar { grid-column: 1; grid-row: 2; border-right: 1px solid var(--line); padding: 18px 12px 12px; display: flex; flex-direction: column; min-height: 0; background: #fff; }
+  /* The sidebar rail owns the grid column and toggle. Its content is a fixed-width
+     composited layer, so labels never reflow while the rail collapses. */
+  .sidebar { grid-column: 1; grid-row: 2; position: relative; min-width: 0; min-height: 0; width: 100%; padding: 0; border: 0; background: transparent; overflow: visible; }
+  .sidebar-content {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: flex;
+    flex-direction: column;
+    width: var(--sidebar-panel-width, 226px);
+    min-width: var(--sidebar-panel-width, 226px);
+    height: 100%;
+    min-height: 0;
+    padding: 18px 12px 12px;
+    border-right: 1px solid var(--line);
+    background: #fff;
+    transform: translate3d(0,0,0);
+    transform-origin: left center;
+    transition: transform .24s cubic-bezier(.2,.75,.25,1);
+    will-change: transform;
+    backface-visibility: hidden;
+  }
+  #app { transition: grid-template-columns .24s cubic-bezier(.2,.75,.25,1); }
+
+  .sidebar-toggle {
+    position: absolute;
+    z-index: 20;
+    top: 50%;
+    right: -13px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 48px;
+    padding: 0;
+    border: 1px solid #dedfe2;
+    border-left: 0;
+    border-radius: 0 7px 7px 0;
+    background: #fff;
+    color: #555b63;
+    box-shadow: 3px 1px 8px rgba(0,0,0,.055);
+    cursor: pointer;
+    transform: translateY(-50%);
+    transition: right .24s cubic-bezier(.2,.75,.25,1), background-color .16s ease, color .16s ease, border-color .16s ease;
+  }
+  .sidebar-toggle-icon { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; transform: rotate(0deg); transition: transform .24s cubic-bezier(.2,.75,.25,1); transform-origin: center; will-change: transform; }
+  .sidebar-toggle svg { display: block; width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+  .sidebar-toggle:hover { background: #f5f5f5; color: #171717; }
+  .sidebar-toggle:focus-visible { outline: 2px solid #858b94; outline-offset: 2px; }
+
+  @media (min-width: 768px) {
+    body.sidebar-collapsed { --sidebar: 0px; }
+    body.sidebar-collapsed #app { grid-template-columns: 0 minmax(0, 1fr); }
+    body.sidebar-collapsed .brand { visibility: hidden; padding-left: 0; padding-right: 0; border-bottom-color: transparent; }
+    .sidebar.collapsed .sidebar-content { transform: translate3d(-100%,0,0); pointer-events: none; }
+    .sidebar.collapsed .sidebar-toggle { right: -26px; border-left: 1px solid #dedfe2; }
+    .sidebar.collapsed .sidebar-toggle-icon { transform: rotate(180deg); }
+  }
+  .dark-theme .sidebar-content { border-color: #303030; background: #111; }
+  .dark-theme .sidebar-toggle { border-color: #383838; background: #1e1e1e; color: #c9c9c9; box-shadow: 3px 1px 8px rgba(0,0,0,.2); }
+  .dark-theme .sidebar-toggle:hover { background: #292929; color: #fff; }
+  @media (min-width: 768px) { .dark-theme .sidebar.collapsed .sidebar-toggle { border-left-color: #383838; } }
   .section-label { font-size: 10px; letter-spacing: .09em; color: #9a9da2; font-weight: 650; padding: 5px 10px 9px; }
   .tool-button { width: 100%; display: flex; align-items: center; gap: 11px; min-height: 39px; border: 1px solid transparent; background: transparent; border-radius: 5px; padding: 0 10px; text-align: left; cursor: pointer; color: #55585d; transition: background .15s, color .15s, border-color .15s; }
   .tool-button:hover { background: #f8f8f8; color: #111; }
@@ -422,6 +482,7 @@
   .dark-theme .project-title:focus { border-color:#666; background:#151515; box-shadow:0 0 0 2px rgba(255,255,255,.06); }
   .dark-theme .project-title:hover, .dark-theme .tool-button:hover, .dark-theme .tool-button.active { background:#252525; color:#fff; border-color:#393939; }
   .dark-theme .tool-button { color:#c5c5c5; }
+  .dark-theme .sidebar-content { background:#111; border-color:#303030; }
   .dark-theme .sidebar-separator, .dark-theme .sidebar-bottom { background:#303030; border-color:#303030; }
   .dark-theme .stage { background-image:linear-gradient(rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px); background-size:40px 40px; }
   .dark-theme .edge.selected { stroke-width: 2.8px; }
@@ -606,6 +667,7 @@
   .top-action .tool-icon { display: none; }
 
   .main { grid-column: 1; grid-row: 2; min-height: 0; }
+  .sidebar-toggle { display: none !important; }
   .sidebar {
     position: fixed;
     z-index: 1002;
@@ -616,15 +678,30 @@
     max-width: 320px;
     grid-column: auto;
     grid-row: auto;
+    overflow: visible;
+    box-shadow: none;
+    transform: translateX(-105%);
+    visibility: hidden;
+    transition: transform .24s cubic-bezier(.2,.75,.25,1), visibility 0s linear .24s;
+    will-change: transform;
+  }
+  .sidebar-content {
+    position: relative;
+    inset: auto;
+    width: 100%;
+    min-width: 0;
+    height: 100%;
+    min-height: 100%;
     overflow-y: auto;
     overscroll-behavior: contain;
     padding: 16px 10px calc(16px + env(safe-area-inset-bottom));
     border-right: 1px solid var(--line);
     box-shadow: 12px 0 36px rgba(0,0,0,.12);
-    transform: translateX(-105%);
-    visibility: hidden;
-    transition: transform .24s cubic-bezier(.2,.75,.25,1), visibility 0s linear .24s;
-    will-change: transform;
+    transform: none;
+    transition: none;
+    will-change: auto;
+    backface-visibility: visible;
+    pointer-events: auto;
   }
   body.sidebar-open .sidebar {
     transform: translateX(0);
@@ -1301,34 +1378,35 @@ body.presentation-mode.dark-theme .presentation-exit:active { background: rgba(3
 }
 
 
-/* Minimal clear-field action: preserve the control, remove its button plate. */
+/* Minimal clear-field action: transparent at rest, subtle danger tint only on interaction. */
 #clearBtn.tool-button {
   background: transparent !important;
   border: 0 !important;
   border-color: transparent !important;
   box-shadow: none !important;
   outline: none;
-  transition: color .16s ease, opacity .16s ease, transform .16s ease;
+  transition: color .16s ease, background-color .16s ease, opacity .16s ease, transform .16s ease;
 }
 #clearBtn.tool-button:hover {
-  background: transparent !important;
+  background: rgba(177, 48, 48, .055) !important;
   border: 0 !important;
   border-color: transparent !important;
   box-shadow: none !important;
-  color: #765454;
+  color: #923b3b;
 }
 #clearBtn.tool-button:active {
-  background: transparent !important;
+  background: rgba(177, 48, 48, .095) !important;
   border: 0 !important;
   box-shadow: none !important;
-  color: #9a5555;
+  color: #a33333;
   transform: scale(.985);
 }
 #clearBtn.tool-button:focus-visible {
-  background: transparent !important;
+  background: rgba(177, 48, 48, .045) !important;
   border: 0 !important;
   box-shadow: none !important;
-  outline: none;
+  outline: 2px solid rgba(150, 65, 65, .38);
+  outline-offset: 2px;
 }
 #clearBtn.tool-button:focus-visible .label {
   text-decoration: underline;
@@ -1336,12 +1414,16 @@ body.presentation-mode.dark-theme .presentation-exit:active { background: rgba(3
   text-underline-offset: 3px;
 }
 .dark-theme #clearBtn.tool-button:hover {
-  background: transparent !important;
-  color: #d0aaaa;
+  background: rgba(231, 115, 115, .10) !important;
+  color: #e3b0b0;
 }
 .dark-theme #clearBtn.tool-button:active {
-  background: transparent !important;
-  color: #e0aaaa;
+  background: rgba(231, 115, 115, .15) !important;
+  color: #f0b4b4;
+}
+.dark-theme #clearBtn.tool-button:focus-visible {
+  background: rgba(231, 115, 115, .08) !important;
+  outline-color: rgba(231, 155, 155, .5);
 }
 @media (hover: none), (pointer: coarse) {
   #clearBtn.tool-button:hover {
@@ -1352,4 +1434,8 @@ body.presentation-mode.dark-theme .presentation-exit:active { background: rgba(3
     background: transparent !important;
     color: inherit;
   }
+}
+
+@media (prefers-reduced-motion: reduce) and (min-width: 768px) {
+  #app, .sidebar-content, .sidebar-toggle, .sidebar-toggle-icon { transition-duration: .01ms !important; }
 }

@@ -11,6 +11,7 @@
   const AUTO_ARRANGE_KEY = 'netnotrh_auto_arrange_v1';
   const EMPTY_HINT_DISMISSED_KEY = 'netnotrh_empty_hint_dismissed_v1';
   const PROJECT_VIEW_KEY = 'netnorth_projects_view_v1';
+  const SIDEBAR_COLLAPSED_KEY = 'netnorth_sidebar_collapsed_v1';
   let presentationMode = false;
   let presentationPreviousState = null;
   const stage = document.getElementById('stage');
@@ -74,6 +75,7 @@
   const mobileMenuToggle = document.getElementById('mobileMenuToggle');
   const sidebarBackdrop = document.getElementById('sidebarBackdrop');
   const sidebar = document.querySelector('.sidebar');
+  const sidebarToggle = document.getElementById('sidebarToggle');
   const mainArea = document.getElementById('mainArea');
   const presentationModeBtn = document.getElementById('presentationModeBtn');
   const presentationExitBtn = document.getElementById('presentationExitBtn');
@@ -97,6 +99,8 @@
   let lastEditorScrollTarget = null;
   let editorScrollResetTimer = 0;
   let sidebarBackdropClickGuard = null;
+  let sidebarLayoutTimer = 0;
+  let sidebarCenterWorldX = null;
   let contextCanvasPoint = { x: 0, y: 0 };
   let pendingImagePoint = { x: 0, y: 0 };
   let activeProjectActionId = null;
@@ -128,6 +132,13 @@
   let pinchState = null;
   let longPressTimer = 0;
   let longPressCandidate = null;
+  // Mobile canvas taps are tracked separately from marquee/drag gestures so a
+  // one-finger double tap can open the canvas action sheet without breaking
+  // box selection or pinch zoom.
+  let mobileCanvasTapCandidate = null;
+  let lastMobileCanvasTap = null;
+  const MOBILE_DOUBLE_TAP_DELAY = 420;
+  const MOBILE_DOUBLE_TAP_DISTANCE = 36;
   let currentRenderScene = null;
   // Cached DOM/model indexes let drag operations update only affected nodes and edges.
   // This avoids rebuilding the whole DOM/SVG on every pointermove for large graphs.
@@ -1717,6 +1728,71 @@
     setMobileSidebarOpen(false);
   }
 
+  function syncCanvasAfterSidebarTransition() {
+    if (!workspace || !stage || !world) return;
+    const centerWorldX = Number.isFinite(sidebarCenterWorldX)
+      ? sidebarCenterWorldX
+      : (workspace.scrollLeft + workspace.clientWidth / 2) / Math.max(zoom, 0.0001);
+    sidebarCenterWorldX = null;
+
+    // The graph stage is a DOM transform layer (not a bitmap canvas). Recalculate
+    // its virtual bounds after the main grid track has finished expanding, then
+    // keep the same world point centered in the newly available viewport.
+    const baseWidth = Math.max(
+      (workspace.clientWidth || 1000) / Math.max(zoom, 0.0001),
+      1200,
+      Math.ceil(stageContentBounds.maxX + 500)
+    );
+    const baseHeight = Math.max(
+      (workspace.clientHeight || 700) / Math.max(zoom, 0.0001),
+      800,
+      Math.ceil(stageContentBounds.maxY + 400)
+    );
+    stage.style.width = `${baseWidth}px`;
+    stage.style.height = `${baseHeight}px`;
+    syncZoomLayout(baseWidth, baseHeight);
+    if (renderedConnectionsSvg) {
+      renderedConnectionsSvg.setAttribute('width', String(Math.max(baseWidth, 1)));
+      renderedConnectionsSvg.setAttribute('height', String(Math.max(baseHeight, 1)));
+    }
+
+    workspace.scrollLeft = Math.max(0, centerWorldX * zoom - workspace.clientWidth / 2);
+    scheduleViewportCulling();
+  }
+
+  function setSidebarCollapsed(collapsed, persist = true) {
+    if (!sidebar || !sidebarToggle) return;
+    const shouldCollapse = !!collapsed;
+    if (window.matchMedia('(max-width: 767px)').matches) return;
+    if (sidebar.classList.contains('collapsed') === shouldCollapse) return;
+
+    // Preserve the currently inspected world point while the canvas grows or
+    // contracts. The sidebar text itself stays at a fixed width and slides on GPU.
+    if (workspace) {
+      sidebarCenterWorldX = (workspace.scrollLeft + workspace.clientWidth / 2) / Math.max(zoom, 0.0001);
+    }
+
+    sidebar.classList.toggle('collapsed', shouldCollapse);
+    document.body.classList.toggle('sidebar-collapsed', shouldCollapse);
+    sidebarToggle.setAttribute('aria-expanded', String(!shouldCollapse));
+    sidebarToggle.setAttribute('aria-label', shouldCollapse
+      ? 'Развернуть левую панель инструментов'
+      : 'Свернуть левую панель инструментов');
+    sidebarToggle.title = shouldCollapse ? 'Развернуть панель' : 'Свернуть панель';
+
+    if (persist && localStorageAvailable) {
+      try {
+        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, shouldCollapse ? '1' : '0');
+      } catch (_) { /* The panel remains usable when storage is unavailable. */ }
+    }
+
+    if (sidebarLayoutTimer) window.clearTimeout(sidebarLayoutTimer);
+    sidebarLayoutTimer = window.setTimeout(() => {
+      sidebarLayoutTimer = 0;
+      syncCanvasAfterSidebarTransition();
+    }, 280);
+  }
+
   function dismissMobileSidebarFromBackdrop(event) {
     if (!document.body.classList.contains('sidebar-open') || !sidebarBackdrop) return;
     if (event.target !== sidebarBackdrop) return;
@@ -3272,6 +3348,8 @@
     // Flush every tracked touch id so a later pointerdown cannot inherit stale pinch state.
     activeTouchPointers.clear();
     pinchState = null;
+    mobileCanvasTapCandidate = null;
+    lastMobileCanvasTap = null;
     workspace.classList.remove('pinching');
     const activeDrag = drag;
     const activeBox = boxSelect;
@@ -5649,10 +5727,9 @@
     if (target.closest && (target.closest('.node[data-node-id]') || target.closest('.edge-hit') || target.closest('.anchor') || target.closest('.resize-handle'))) return;
 
     // On touch, a one-finger drag on empty canvas is a marquee gesture rather
-    // than a pan. Two-finger gestures remain owned by the pinch/pan tracker.
-    // Clear the empty-canvas long-press candidate so it cannot open a context sheet
-    // while the user is actively drawing a selection rectangle.
-    if (isTouchMarquee) clearLongPress();
+    // than a pan. The capture-phase touch tracker runs before this handler, so
+    // its long-press timer can still switch to the selection tool when the finger
+    // stays down; actual movement cancels that timer in handleWorkspaceTouchMove.
     if (editingId) finishEditing(editingId, true);
     if (event.cancelable) event.preventDefault();
     event.stopImmediatePropagation();
@@ -5803,9 +5880,21 @@
   function triggerLongPress(candidate) {
     if (!candidate || pinchState || activeTouchPointers.size !== 1) return;
     candidate.triggered = true;
+    longPressTimer = 0;
     suppressContextMenuUntil = Date.now() + 1300;
 
     if (candidate.startedOnLink) suppressImmediateDraggedLinkClick(1200);
+
+    if (candidate.isBlankCanvas) {
+      // A stationary hold on empty canvas now activates the selection tool.
+      // Cancel the pending marquee rectangle; a following drag starts a fresh
+      // box-selection gesture with the intended tool already active.
+      if (drag || linkDraft || boxSelect) cancelPointerGesture();
+      lastMobileCanvasTap = null;
+      setMode('select');
+      showToast('Инструмент выделения активирован');
+      return;
+    }
 
     if (drag && drag.pointerId === candidate.pointerId) {
       cancelPointerGesture();
@@ -5813,17 +5902,13 @@
       cancelPointerGesture();
     }
 
-    const pointEvent = { clientX: candidate.x, clientY: candidate.y };
     if (candidate.edgeId) {
       openSelectedEdgesActions(candidate.edgeId);
       return;
     }
     if (candidate.nodeId) {
       showNodeContextMenu(candidate.nodeId, candidate.x, candidate.y);
-      return;
     }
-    contextCanvasPoint = getStagePoint(pointEvent);
-    showCanvasContextMenu(candidate.x, candidate.y);
   }
 
   function handleWorkspaceTouchDown(event) {
@@ -5837,34 +5922,38 @@
     const touchTarget = event.target instanceof Element ? event.target : null;
     if (touchTarget && touchTarget.closest('#nodeContextMenu')) {
       clearLongPress();
+      mobileCanvasTapCandidate = null;
+      lastMobileCanvasTap = null;
       return;
     }
-    const tappedInsideNodeContextMenu =
-      touchTarget && touchTarget.closest('#nodeContextMenu');
 
-    if (
-      nodeContextMenu.classList.contains('visible') &&
-      !tappedInsideNodeContextMenu
-    ) {
-      closeNodeContextMenu();
-    }
+    if (nodeContextMenu.classList.contains('visible')) closeNodeContextMenu();
 
     const target = event.target instanceof Element ? event.target : null;
 
-    // A finger touching a bottom-sheet control must activate that control,
-    // not start another long-press candidate for the canvas.
+    // Touches inside the bottom sheet belong to its controls and never start
+    // canvas gestures or become candidates for a double tap.
     if (target && target.closest('#nodeContextMenu')) {
       clearLongPress();
+      mobileCanvasTapCandidate = null;
+      lastMobileCanvasTap = null;
       return;
     }
 
-    // Tool taps create nodes or initiate explicit connection selection; they
-    // must not be converted into long-press candidates or canvas pan tracking.
-    if (mode === 'text' || mode === 'connect') return;
+    // The text tool keeps its immediate single-tap creation behaviour. In
+    // select/connect modes the empty canvas can use long-press and double-tap
+    // shortcuts without interfering with node or anchor interactions.
+    if (mode === 'text') {
+      mobileCanvasTapCandidate = null;
+      lastMobileCanvasTap = null;
+      return;
+    }
 
     activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
 
     if (pinchState) {
+      mobileCanvasTapCandidate = null;
+      lastMobileCanvasTap = null;
       // Keep the remaining finger from reverting into a pan/drag after a pinch ends.
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -5872,6 +5961,8 @@
     }
 
     if (activeTouchPointers.size >= 2) {
+      mobileCanvasTapCandidate = null;
+      lastMobileCanvasTap = null;
       cancelGestureForPinch();
       pinchState = rebasePinchFromActivePointers();
       workspace.classList.toggle('pinching', !!pinchState);
@@ -5884,13 +5975,36 @@
 
     const nodeElement = target && target.closest('.node[data-node-id]');
     const edgeElement = target && target.closest('.edge-hit');
+    const interactiveControl = target && target.closest(
+      '.anchor, .resize-handle, .node-text[contenteditable="true"], a.node-link, .selection-rect'
+    );
+    const isBlankCanvas = !!(target && target.closest('#stage')) &&
+      !nodeElement && !edgeElement && !interactiveControl;
+
+    mobileCanvasTapCandidate = isBlankCanvas && (mode === 'select' || mode === 'connect') ? {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      moved: false
+    } : null;
+    if (!isBlankCanvas) lastMobileCanvasTap = null;
+
+    // Node-body holds still open the node's existing context sheet. Empty-canvas
+    // holds are repurposed to activate selection; anchors, resize handles, links
+    // and active editors keep their own interaction semantics.
+    if (interactiveControl) {
+      clearLongPress();
+      return;
+    }
+
     longPressCandidate = {
       pointerId: event.pointerId,
       x: event.clientX,
       y: event.clientY,
       nodeId: nodeElement ? nodeElement.dataset.nodeId : null,
       edgeId: edgeElement ? edgeElement.dataset.edgeId : null,
-      startedOnLink: !!(target && target.closest('a.node-link')),
+      isBlankCanvas,
+      startedOnLink: false,
       triggered: false
     };
     longPressTimer = window.setTimeout(() => {
@@ -5903,6 +6017,17 @@
   function handleWorkspaceTouchMove(event) {
     if (event.pointerType !== 'touch' || !activeTouchPointers.has(event.pointerId)) return;
     activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    if (mobileCanvasTapCandidate && mobileCanvasTapCandidate.pointerId === event.pointerId) {
+      const tapMovement = Math.hypot(
+        event.clientX - mobileCanvasTapCandidate.x,
+        event.clientY - mobileCanvasTapCandidate.y
+      );
+      if (tapMovement > 10) {
+        mobileCanvasTapCandidate.moved = true;
+        lastMobileCanvasTap = null;
+      }
+    }
 
     if (pinchState) {
       if (event.cancelable) event.preventDefault();
@@ -5924,7 +6049,39 @@
 
   function handleWorkspaceTouchEnd(event) {
     if (event.pointerType !== 'touch') return;
+    const pointersBeforeEnd = activeTouchPointers.size;
     activeTouchPointers.delete(event.pointerId);
+
+    const tapCandidate = mobileCanvasTapCandidate && mobileCanvasTapCandidate.pointerId === event.pointerId
+      ? mobileCanvasTapCandidate
+      : null;
+    const longPressWasTriggered = !!(
+      longPressCandidate && longPressCandidate.pointerId === event.pointerId && longPressCandidate.triggered
+    );
+
+    if (event.type === 'pointerup' && tapCandidate && !tapCandidate.moved &&
+        !longPressWasTriggered && !pinchState && pointersBeforeEnd === 1 &&
+        (mode === 'select' || mode === 'connect') && !presentationMode) {
+      const now = Date.now();
+      const previousTap = lastMobileCanvasTap;
+      const isDoubleTap = !!previousTap &&
+        now - previousTap.time <= MOBILE_DOUBLE_TAP_DELAY &&
+        Math.hypot(event.clientX - previousTap.x, event.clientY - previousTap.y) <= MOBILE_DOUBLE_TAP_DISTANCE;
+
+      if (isDoubleTap) {
+        lastMobileCanvasTap = null;
+        contextCanvasPoint = getStagePoint({ clientX: event.clientX, clientY: event.clientY });
+        suppressContextMenuUntil = Date.now() + 1000;
+        if (event.cancelable) event.preventDefault();
+        showCanvasContextMenu(event.clientX, event.clientY);
+      } else {
+        lastMobileCanvasTap = { time: now, x: event.clientX, y: event.clientY };
+      }
+    } else if (event.type === 'pointercancel' || tapCandidate?.moved || longPressWasTriggered || pinchState) {
+      lastMobileCanvasTap = null;
+    }
+
+    if (tapCandidate) mobileCanvasTapCandidate = null;
     if (longPressCandidate && longPressCandidate.pointerId === event.pointerId) clearLongPress();
 
     if (pinchState) {
@@ -5941,10 +6098,20 @@
   }
 
   // Install global touch trackers during initialization and re-arm them before
-  // each new pointer sequence (including node controls that stop bubbling).
+  // each new pointer sequence. Capture the down event so marquee selection on
+  // the stage cannot swallow long-press/double-tap detection.
   attachWorkspaceTouchListeners();
   window?.addEventListener('pointerdown', attachWorkspaceTouchListeners, { capture: true, passive: true });
-  workspace?.addEventListener('pointerdown', handleWorkspaceTouchDown, { passive: false });
+  workspace?.addEventListener('pointerdown', handleWorkspaceTouchDown, { capture: true, passive: false });
+  document?.addEventListener('pointerdown', event => {
+    if (event.pointerType !== 'touch') return;
+    const target = event.target instanceof Element ? event.target : null;
+    // A tap on application chrome or a modal breaks the canvas double-tap pair.
+    if (!target || !target.closest('#stage')) {
+      mobileCanvasTapCandidate = null;
+      lastMobileCanvasTap = null;
+    }
+  }, { capture: true, passive: true });
 
   stage?.addEventListener('pointerdown', startBoxSelection);
   document?.addEventListener('click', event => {
@@ -6114,6 +6281,17 @@
     if (editingId) finishEditing(editingId, true);
     startPan(event);
   }, { passive: false });
+  document.getElementById('app')?.addEventListener('transitionend', event => {
+    if (event.target !== event.currentTarget || event.propertyName !== 'grid-template-columns') return;
+    if (sidebarLayoutTimer) {
+      window.clearTimeout(sidebarLayoutTimer);
+      sidebarLayoutTimer = 0;
+    }
+    syncCanvasAfterSidebarTransition();
+  });
+  sidebarToggle?.addEventListener('click', () => {
+    setSidebarCollapsed(!sidebar?.classList.contains('collapsed'));
+  });
   mobileMenuToggle?.addEventListener('click', () => {
     setMobileSidebarOpen(!document.body.classList.contains('sidebar-open'));
   });
@@ -6475,6 +6653,7 @@
       autoArrangeEnabled = localStorage.getItem(AUTO_ARRANGE_KEY) !== '0';
       emptyHintDismissed = localStorage.getItem(EMPTY_HINT_DISMISSED_KEY) === '1';
       projectViewMode = normalizeProjectViewMode(localStorage.getItem(PROJECT_VIEW_KEY) || 'list');
+      setSidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1', false);
     } catch (_) {
       applyTheme('light', false);
       autoArrangeEnabled = true;
