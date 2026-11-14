@@ -10,6 +10,9 @@
   const THEME_KEY = 'netnotrh_theme_v1';
   const AUTO_ARRANGE_KEY = 'netnotrh_auto_arrange_v1';
   const EMPTY_HINT_DISMISSED_KEY = 'netnotrh_empty_hint_dismissed_v1';
+  const PROJECT_VIEW_KEY = 'netnorth_projects_view_v1';
+  let presentationMode = false;
+  let presentationPreviousState = null;
   const stage = document.getElementById('stage');
   const workspace = document.getElementById('workspace');
   const world = document.getElementById('world');
@@ -72,6 +75,8 @@
   const sidebarBackdrop = document.getElementById('sidebarBackdrop');
   const sidebar = document.querySelector('.sidebar');
   const mainArea = document.getElementById('mainArea');
+  const presentationModeBtn = document.getElementById('presentationModeBtn');
+  const presentationExitBtn = document.getElementById('presentationExitBtn');
   const projectNotesToggle = document.getElementById('projectNotesToggle');
   const projectNotesPanel = document.getElementById('projectNotesPanel');
   const projectNotesBackdrop = document.getElementById('projectNotesBackdrop');
@@ -98,6 +103,8 @@
   let activeProjectActionButton = null;
   let renameTargetProjectId = null;
   let deleteTargetProjectId = null;
+  let projectViewMode = 'list';
+  const projectPreviewCache = new Map();
 
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const freshScene = () => ({ nodes: [], edges: [] });
@@ -325,6 +332,13 @@
       }
       if (node.color != null && typeof node.color !== 'string') {
         throw new Error(`Invalid node color at ${label}[${index}]`);
+      }
+      if (node.framed != null && typeof node.framed !== 'boolean') {
+        throw new Error(`Invalid node frame flag at ${label}[${index}]`);
+      }
+      if (node.borderColor != null &&
+          (typeof node.borderColor !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(node.borderColor.trim()))) {
+        throw new Error(`Invalid node border color at ${label}[${index}]`);
       }
     });
 
@@ -566,6 +580,7 @@
   }
 
   function setProjectNotesOpen(open) {
+    if (presentationMode && open) return;
     const isOpen = Boolean(open);
     if (!mainArea || !projectNotesPanel) return;
     if (isOpen) {
@@ -616,10 +631,64 @@
     }
   }
 
+  function buildProjectPreviewData(inputScene) {
+    if (!inputScene || !Array.isArray(inputScene.nodes) || !Array.isArray(inputScene.edges)) return null;
+    const sourceNodes = inputScene.nodes;
+    const previewNodeCount = Math.min(sourceNodes.length, 72);
+    const sourceIndexes = new Map();
+    sourceNodes.forEach((node, index) => {
+      if (node && typeof node.id === 'string' && node.id) sourceIndexes.set(node.id, index);
+    });
+    const sampledIndexes = [];
+    const nodes = [];
+    for (let sampleIndex = 0; sampleIndex < previewNodeCount; sampleIndex++) {
+      const index = sourceNodes.length <= 72
+        ? sampleIndex
+        : Math.floor(sampleIndex * (sourceNodes.length - 1) / (previewNodeCount - 1));
+      const node = sourceNodes[index];
+      if (!node || typeof node.id !== 'string' || !node.id ||
+          !Number.isFinite(Number(node.x)) || !Number.isFinite(Number(node.y))) continue;
+      sampledIndexes.push(index);
+      // Compact numeric tuples keep the project index small and never copy text/images.
+      nodes.push([
+        clamp(Number(node.x), -100000, 100000),
+        clamp(Number(node.y), -100000, 100000),
+        clamp(Number(node.width) || 180, 10, 2000),
+        clamp(Number(node.height) || 42, 10, 1200),
+        node.type === 'image' ? 1 : 0
+      ]);
+    }
+    if (!nodes.length) return { nodes: [], edges: [] };
+    const edges = [];
+    const edgeKeys = new Set();
+    const sourceRange = Math.max(1, sourceNodes.length - 1);
+    const previewRange = Math.max(1, nodes.length - 1);
+    for (const edge of inputScene.edges) {
+      if (!edge || !sourceIndexes.has(edge.from) || !sourceIndexes.has(edge.to) || edge.from === edge.to) continue;
+      const fromIndex = sourceIndexes.get(edge.from);
+      const toIndex = sourceIndexes.get(edge.to);
+      const from = Math.round(fromIndex * previewRange / sourceRange);
+      const to = Math.round(toIndex * previewRange / sourceRange);
+      if (from === to) continue;
+      const key = `${from}>${to}`;
+      if (edgeKeys.has(key)) continue;
+      edgeKeys.add(key);
+      edges.push([from, to]);
+      if (edges.length >= 150) break;
+    }
+    return { nodes, edges };
+  }
+
   function upsertProjectIndex(data, id = currentProjectId) {
     if (!localStorageAvailable || !id) return;
+    projectPreviewCache.delete(id);
     const index = readProjectIndex().filter(item => item.id !== id);
-    index.unshift({ id, title: data.title || 'Новая схема', updatedAt: Date.now() });
+    index.unshift({
+      id,
+      title: data.title || 'Новая схема',
+      updatedAt: Date.now(),
+      preview: buildProjectPreviewData(data.scene)
+    });
     writeProjectIndex(index);
   }
 
@@ -686,6 +755,7 @@
 
   function removeProjectRecord(id, cleanupLegacy = false) {
     if (!id || !localStorageAvailable) return false;
+    projectPreviewCache.delete(id);
 
     try {
       localStorage.removeItem(PROJECT_KEY_PREFIX + id);
@@ -879,9 +949,166 @@
     }
   }
 
+  function normalizeProjectViewMode(value) {
+    return ['list', 'horizontal', 'vertical'].includes(value) ? value : 'list';
+  }
+
+  function updateProjectViewSwitcher() {
+    document.querySelectorAll('[data-project-view]').forEach(button => {
+      const active = button.dataset.projectView === projectViewMode;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+    const list = document.getElementById('savedProjectList');
+    if (list) list.dataset.view = projectViewMode;
+  }
+
+  function setProjectViewMode(value) {
+    const nextMode = normalizeProjectViewMode(value);
+    if (nextMode === projectViewMode) return;
+    projectViewMode = nextMode;
+    try {
+      if (localStorageAvailable) localStorage.setItem(PROJECT_VIEW_KEY, projectViewMode);
+    } catch (error) {
+      console.warn('Project view preference save failed:', error);
+    }
+    updateProjectViewSwitcher();
+    renderProjectList();
+  }
+
+  function makeProjectPreview(item) {
+    const projectId = item && item.id;
+    if (!projectId || !localStorageAvailable || projectViewMode === 'list') return null;
+    const cached = projectPreviewCache.get(projectId);
+    if (cached) return cached.cloneNode(true);
+
+    let previewData = item.preview;
+    if (!previewData || !Array.isArray(previewData.nodes) || !Array.isArray(previewData.edges)) {
+      // Legacy project-index entries have no thumbnail projection. Parse their
+      // project payload only once, then keep a tiny projection in the cache.
+      try {
+        const raw = localStorage.getItem(PROJECT_KEY_PREFIX + projectId);
+        if (!raw || raw.length > 16000000) return null;
+        const data = JSON.parse(raw);
+        if (!data || typeof data !== 'object' || !data.scene ||
+            !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) return null;
+        previewData = buildProjectPreviewData(data.scene);
+      } catch (_) {
+        return null;
+      }
+    }
+    if (!previewData || !Array.isArray(previewData.nodes) || !Array.isArray(previewData.edges)) return null;
+
+    const nodes = previewData.nodes.filter(node => Array.isArray(node) && node.length >= 5 &&
+      node.slice(0, 4).every(value => Number.isFinite(Number(value))));
+    if (!nodes.length) return null;
+
+    const centers = nodes.map((node, index) => ({
+      index,
+      node: { width: Number(node[2]), height: Number(node[3]), type: node[4] === 1 ? 'image' : 'text' },
+      x: Number(node[0]) + Math.max(10, Number(node[2]) || 180) / 2,
+      y: Number(node[1]) + Math.max(10, Number(node[3]) || 42) / 2
+    }));
+    const minX = Math.min(...centers.map(point => point.x));
+    const maxX = Math.max(...centers.map(point => point.x));
+    const minY = Math.min(...centers.map(point => point.y));
+    const maxY = Math.max(...centers.map(point => point.y));
+    const width = 320;
+    const height = 126;
+    const padding = 18;
+    const rangeX = Math.max(1, maxX - minX);
+    const rangeY = Math.max(1, maxY - minY);
+    const scale = Math.min((width - padding * 2) / rangeX, (height - padding * 2) / rangeY);
+    const contentWidth = rangeX * scale;
+    const contentHeight = rangeY * scale;
+    const offsetX = (width - contentWidth) / 2;
+    const offsetY = (height - contentHeight) / 2;
+    const points = new Map();
+    centers.forEach(point => {
+      points.set(point.index, {
+        x: offsetX + (point.x - minX) * scale,
+        y: offsetY + (point.y - minY) * scale,
+        node: point.node
+      });
+    });
+
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNS, 'svg');
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    svg.setAttribute('class', 'saved-project-preview-svg');
+    svg.setAttribute('aria-hidden', 'true');
+
+    const background = document.createElementNS(svgNS, 'rect');
+    background.setAttribute('x', '0');
+    background.setAttribute('y', '0');
+    background.setAttribute('width', String(width));
+    background.setAttribute('height', String(height));
+    background.setAttribute('rx', '5');
+    background.setAttribute('class', 'saved-project-preview-bg');
+    svg.appendChild(background);
+
+    // One SVG path keeps the preview lightweight even when a project has many links.
+    const edgePath = document.createElementNS(svgNS, 'path');
+    edgePath.setAttribute('class', 'saved-project-preview-edges');
+    const edges = Array.isArray(previewData.edges) ? previewData.edges : [];
+    const edgeSegments = [];
+    for (const edge of edges) {
+      if (!Array.isArray(edge) || edge.length < 2) continue;
+      const from = points.get(Number(edge[0]));
+      const to = points.get(Number(edge[1]));
+      if (!from || !to) continue;
+      edgeSegments.push(`M${from.x.toFixed(2)} ${from.y.toFixed(2)}L${to.x.toFixed(2)} ${to.y.toFixed(2)}`);
+      if (edgeSegments.length >= 150) break;
+    }
+    edgePath.setAttribute('d', edgeSegments.join(' '));
+    svg.appendChild(edgePath);
+
+    const nodeGroup = document.createElementNS(svgNS, 'g');
+    nodeGroup.setAttribute('class', 'saved-project-preview-nodes');
+    points.forEach(point => {
+      const node = point.node;
+      const rect = document.createElementNS(svgNS, 'rect');
+      const nodeWidth = Math.max(7, Math.min(24, 6 + Math.sqrt(Math.max(10, Number(node.width) || 180)) * 0.65));
+      const nodeHeight = Math.max(5, Math.min(11, 3 + Math.sqrt(Math.max(10, Number(node.height) || 42)) * 0.45));
+      rect.setAttribute('x', (point.x - nodeWidth / 2).toFixed(2));
+      rect.setAttribute('y', (point.y - nodeHeight / 2).toFixed(2));
+      rect.setAttribute('width', nodeWidth.toFixed(2));
+      rect.setAttribute('height', nodeHeight.toFixed(2));
+      rect.setAttribute('rx', '1.8');
+      rect.setAttribute('class', node.type === 'image' ? 'saved-project-preview-node image' : 'saved-project-preview-node');
+      nodeGroup.appendChild(rect);
+    });
+    svg.appendChild(nodeGroup);
+
+    projectPreviewCache.set(projectId, svg);
+    if (projectPreviewCache.size > 60) {
+      const oldestKey = projectPreviewCache.keys().next().value;
+      projectPreviewCache.delete(oldestKey);
+    }
+    return svg.cloneNode(true);
+  }
+
+  function createProjectPreview(item) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'saved-project-preview';
+    wrapper.setAttribute('aria-hidden', 'true');
+    const svg = makeProjectPreview(item);
+    if (svg) {
+      wrapper.appendChild(svg);
+    } else {
+      const empty = document.createElement('span');
+      empty.className = 'saved-project-preview-empty';
+      empty.textContent = 'Предпросмотр недоступен';
+      wrapper.appendChild(empty);
+    }
+    return wrapper;
+  }
+
   function renderProjectList() {
     const list = document.getElementById('savedProjectList');
     if (!list) return;
+    updateProjectViewSwitcher();
     list.replaceChildren();
 
     const projects = readProjectIndex().sort(
@@ -898,25 +1125,31 @@
 
     projects.forEach(item => {
       const row = document.createElement('div');
-      row.className = 'saved-project';
+      const titleText = typeof item.title === 'string' && item.title.trim() ? item.title.trim() : 'Без названия';
+      row.className = `saved-project${projectViewMode === 'horizontal' ? ' is-horizontal' : ''}${projectViewMode === 'vertical' ? ' is-vertical' : ''}`;
       row.dataset.projectId = item.id;
 
       const openButton = document.createElement('button');
       openButton.type = 'button';
       openButton.className = 'saved-project-open';
       openButton.dataset.projectOpenId = item.id;
-      openButton.setAttribute('aria-label', `Открыть проект ${item.title || 'Без названия'}`);
+      openButton.setAttribute('aria-label', `Открыть проект ${titleText}`);
 
+      if (projectViewMode !== 'list') openButton.appendChild(createProjectPreview(item));
+      const details = document.createElement('span');
+      details.className = 'saved-project-details';
       const title = document.createElement('span');
       title.className = 'saved-project-title';
-      title.textContent = item.title || 'Без названия';
+      title.textContent = titleText;
 
       const date = document.createElement('span');
       date.className = 'saved-project-date';
-      date.textContent = item.updatedAt
-        ? new Date(item.updatedAt).toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' })
+      const updatedAt = Number(item.updatedAt);
+      date.textContent = Number.isFinite(updatedAt) && updatedAt > 0
+        ? new Date(updatedAt).toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' })
         : 'Локальный проект';
-      openButton.append(title, date);
+      details.append(title, date);
+      openButton.appendChild(details);
 
       const actionsButton = document.createElement('button');
       actionsButton.type = 'button';
@@ -924,7 +1157,7 @@
       actionsButton.dataset.projectActionsId = item.id;
       actionsButton.textContent = '⋯';
       actionsButton.title = 'Действия с проектом';
-      actionsButton.setAttribute('aria-label', `Действия с проектом ${item.title || 'Без названия'}`);
+      actionsButton.setAttribute('aria-label', `Действия с проектом ${titleText}`);
       actionsButton.setAttribute('aria-haspopup', 'menu');
       actionsButton.setAttribute('aria-expanded', 'false');
 
@@ -1431,6 +1664,10 @@
       color: typeof (n && n.color) === 'string' && /^#[0-9a-fA-F]{6}$/.test(n.color.trim()) ? n.color.trim().toLowerCase() : '#111111',
       underline: !!(n && n.underline),
       highlight: !!(n && n.highlight),
+      framed: type === 'text' && !!(n && n.framed),
+      borderColor: typeof (n && n.borderColor) === 'string' && /^#[0-9a-fA-F]{6}$/.test(n.borderColor.trim())
+        ? n.borderColor.trim().toLowerCase()
+        : '#111111',
       type,
       image: imageData,
       imageKey: imageData ? imageKey : '',
@@ -1566,6 +1803,7 @@
   }
 
   function setMode(next) {
+    if (presentationMode) return;
     if (playback.active) exitPlayback();
     closeNodeContextMenu();
     mode = next;
@@ -1586,6 +1824,100 @@
       stage.style.cursor = 'grab'; workspace.style.cursor = 'grab';
     }
     renderScene();
+  }
+
+  function enterPresentationMode() {
+    if (presentationMode || (startScreen && startScreen.classList.contains('visible'))) return;
+
+    // Close/finalize any editor or transient UI before switching to the read-only view.
+    if (playback.active) exitPlayback();
+    if (drag || linkDraft || boxSelect) cancelPointerGesture();
+    if (editingId) {
+      const activeId = editingId;
+      finishEditing(activeId, true);
+      // finishEditing intentionally keeps a just-created empty node alive for mobile focus recovery.
+      // Presentation mode is an explicit transition, so detach that empty editor safely.
+      if (editingId === activeId) {
+        const activeNode = nodeById(activeId);
+        if (activeNode && !String(activeNode.text || '').trim()) {
+          scene.nodes = scene.nodes.filter(node => node.id !== activeId);
+          scene.edges = scene.edges.filter(edge => edge.from !== activeId && edge.to !== activeId);
+        }
+        editingId = null;
+        editingOriginalText = null;
+        shouldFocusNewNode = false;
+      }
+    }
+
+    closeNodeContextMenu();
+    closeProjectActionsMenu();
+    closeMobileSidebar();
+    if (mainArea && mainArea.classList.contains('project-notes-open')) setProjectNotesOpen(false);
+    if (modalBackdrop && modalBackdrop.classList.contains('visible')) closeConfirm(false);
+    if (projectRenameBackdrop && projectRenameBackdrop.classList.contains('visible')) closeRenameProjectModal();
+    if (projectDeleteBackdrop && projectDeleteBackdrop.classList.contains('visible')) closeDeleteProjectModal();
+    if (exitConfirmBackdrop && exitConfirmBackdrop.classList.contains('visible')) closeExitConfirm();
+    if (exportScreen) exportScreen.classList.remove('visible');
+
+    presentationPreviousState = {
+      mode,
+      selectedId,
+      selectedIds: [...selectedIds],
+      selectedEdgeIds: [...selectedEdgeIds]
+    };
+
+    // Remove all editing/selection affordances while keeping the graph and camera intact.
+    mode = 'select';
+    connectionSourceId = null;
+    linkDraft = null;
+    selectedId = null;
+    selectedIds.splice(0);
+    selectedEdgeIds.splice(0);
+    clearLongPress();
+    activeTouchPointers.clear();
+    pinchState = null;
+    workspace.classList.remove('pinching');
+    presentationMode = true;
+    document.body.classList.add('presentation-mode');
+    if (presentationModeBtn) {
+      presentationModeBtn.setAttribute('aria-pressed', 'true');
+      presentationModeBtn.setAttribute('aria-label', 'Выйти из режима презентации');
+    }
+    if (presentationExitBtn) presentationExitBtn.hidden = false;
+    syncModeButtons();
+    renderScene();
+    stage.style.cursor = 'grab';
+    workspace.style.cursor = 'grab';
+  }
+
+  function exitPresentationMode() {
+    if (!presentationMode) return;
+    presentationMode = false;
+    document.body.classList.remove('presentation-mode');
+    if (presentationExitBtn) presentationExitBtn.hidden = true;
+    if (presentationModeBtn) {
+      presentationModeBtn.setAttribute('aria-pressed', 'false');
+      presentationModeBtn.setAttribute('aria-label', 'Включить режим презентации');
+    }
+
+    const previous = presentationPreviousState;
+    presentationPreviousState = null;
+    const validNodeIds = new Set(scene.nodes.map(node => node.id));
+    const validEdgeIds = new Set(scene.edges.map(edge => edge.id));
+    const restoredMode = previous && ['select', 'text', 'connect'].includes(previous.mode)
+      ? previous.mode
+      : 'select';
+
+    // Reuse the regular mode setup so cursor, hint and tool-button states stay consistent.
+    setMode(restoredMode);
+    if (previous) {
+      selectedId = previous.selectedId && validNodeIds.has(previous.selectedId) ? previous.selectedId : null;
+      selectedIds.splice(0, selectedIds.length, ...previous.selectedIds.filter(id => validNodeIds.has(id)));
+      selectedEdgeIds.splice(0, selectedEdgeIds.length, ...previous.selectedEdgeIds.filter(id => validEdgeIds.has(id)));
+      if (selectedId && !selectedIds.includes(selectedId)) selectedIds.push(selectedId);
+    }
+    renderScene();
+    updateActionButtons();
   }
 
   function getStagePoint(event) {
@@ -1974,6 +2306,7 @@
       anchor.title = `Привязать связь к стороне: ${side}`;
       anchor.setAttribute('aria-label', `Подключить к стороне ${side}`);
       anchor?.addEventListener('pointerdown', event => {
+        if (presentationMode) return;
         // On compact nodes the 44px anchor and corner-resize hit areas can
         // geometrically overlap. Route a press to the nearest control so both
         // connection dragging and resizing remain practical on touch screens.
@@ -2307,9 +2640,13 @@
   function getMobileTextNodeMaxWidth() {
     if (!window.matchMedia('(max-width: 767px)').matches) return null;
     const viewportWidth = workspace.clientWidth || window.innerWidth || 360;
-    // Keep the text block visually compact on phones while allowing long text
-    // to wrap instead of stretching the selected node across the canvas.
-    return Math.max(120, Math.min(420, Math.floor(viewportWidth * 0.82)));
+    // Use a tiny outer-width tolerance: fit-content/max-width and fractional
+    // font metrics can otherwise wrap the final glyph of a word one pixel early.
+    // Keep the node inside the same compact mobile proportion while rounding up
+    // instead of flooring away available sub-pixel space.
+    const roundingSafetyPx = 4;
+    const preferredWidth = Math.ceil(viewportWidth * 0.82) + roundingSafetyPx;
+    return Math.max(120, Math.min(420, preferredWidth));
   }
 
   function renderScene(model = scene, options = {}) {
@@ -2404,6 +2741,15 @@
           ? (isDarkTheme && !n.highlight ? '#f2f2f2' : '#111111')
           : nodeColor;
         el.style.setProperty('color', calculatedColor, 'important');
+        if (n.framed) {
+          el.classList.add('framed');
+          const borderColor = typeof n.borderColor === 'string' && /^#[0-9a-f]{6}$/i.test(n.borderColor)
+            ? n.borderColor.toLowerCase()
+            : '#111111';
+          const isDefaultDarkFrameColor = borderColor === '#111111' || borderColor === '#171717';
+          const calculatedBorderColor = isDarkTheme && isDefaultDarkFrameColor ? '#e5e5e5' : borderColor;
+          el.style.setProperty('--node-border-color', calculatedBorderColor);
+        }
         if (n.underline) el.classList.add('underlined');
         if (n.highlight) el.classList.add('highlight');
         const textSpan = document.createElement('span');
@@ -2513,6 +2859,7 @@
       }
       if (!isPlayback && n.id !== editingId) {
         el?.addEventListener('pointerdown', event => {
+          if (presentationMode) return;
           const pointerTarget = event.target instanceof Element ? event.target : null;
           const linkTarget = pointerTarget?.closest('a.node-link');
 
@@ -2556,6 +2903,7 @@
           if (event.target.closest('.node')) startNodeDrag(event, n.id);
         });
         el?.addEventListener('dblclick', event => {
+          if (presentationMode) { event.preventDefault(); event.stopPropagation(); return; }
           const target = event.target instanceof Element ? event.target : null;
           // Double-clicking a URL must not enter node text-edit mode.
           if (target?.closest('a.node-link')) return;
@@ -2564,6 +2912,7 @@
           if (n.type !== 'image') startEditing(n.id);
         });
         el?.addEventListener('contextmenu', event => {
+          if (presentationMode) { event.preventDefault(); event.stopPropagation(); return; }
           event.preventDefault(); event.stopPropagation();
           showNodeContextMenu(n.id, event.clientX, event.clientY);
         });
@@ -2625,6 +2974,7 @@
       hit.setAttribute('d', d);
       hit.dataset.edgeId = edge.id;
       hit?.addEventListener('pointerdown', event => {
+        if (presentationMode) return;
         if (event.button !== 0 || isPlayback) return;
         event.preventDefault();
         event.stopPropagation();
@@ -2650,6 +3000,7 @@
         updateActionButtons();
       });
       hit?.addEventListener('contextmenu', event => {
+        if (presentationMode) { event.preventDefault(); event.stopImmediatePropagation(); return; }
         // Block the browser's native context menu before doing any UI work.
         event.preventDefault();
         event.stopPropagation();
@@ -2749,6 +3100,7 @@
   }
 
   function createNodeAt(x, y) {
+    if (presentationMode) return null;
     if (playback.active) exitPlayback();
 
     // Resolve the requested point before mutating the scene. A malformed or
@@ -2773,7 +3125,9 @@
       autoSize: true,
       color: '#111111',
       underline: false,
-      highlight: false
+      highlight: false,
+      framed: false,
+      borderColor: '#111111'
     };
 
     scene.nodes.push(n);
@@ -2824,7 +3178,7 @@
   }
 
   function finishEditing(id, save) {
-    if (editingId !== id) return;
+    if (presentationMode || editingId !== id) return;
     const el = stage.querySelector(`[data-node-id="${CSS.escape(id)}"]`);
     const textEl = el && el.querySelector('.node-text');
     const n = nodeById(id);
@@ -2854,6 +3208,7 @@
   }
 
   function startEditing(id) {
+    if (presentationMode) return;
     const n = nodeById(id);
     if (!n || playback.active) return;
     selectedId = id; selectedIds.splice(0, selectedIds.length, id); editingId = id; editingOriginalText = n.text; shouldFocusNewNode = true;
@@ -2861,6 +3216,7 @@
   }
 
   function selectNode(id, preserveMultiSelection = false, render = false) {
+    if (presentationMode) return;
     if (playback.active) exitPlayback();
     if (editingId && editingId !== id) finishEditing(editingId, true);
     selectedEdgeIds.splice(0);
@@ -2974,6 +3330,7 @@
   });
 
   function startNodeDrag(event, id) {
+    if (presentationMode) return;
     const isRightButton = event.button === 2;
     const isLeftButton = event.button === 0;
     const pointerId = typeof event.pointerId === 'number' ? event.pointerId : null;
@@ -3002,6 +3359,7 @@
     attachPointerGesture(onPointerMove, onPointerUp);
   }
   function startResize(event, id, handle) {
+    if (presentationMode) return;
     event.preventDefault(); event.stopPropagation();
     if (playback.active || linkDraft || drag || boxSelect) return;
     const n = nodeById(id); if (!n) return;
@@ -3149,6 +3507,7 @@
   }
 
   function startLink(event, id, side) {
+    if (presentationMode) return;
     event.preventDefault(); event.stopPropagation();
     if (playback.active || drag || linkDraft || boxSelect || editingId) return;
     selectedEdgeIds.splice(0);
@@ -3276,9 +3635,13 @@
           // This prevents multiline nodes from expanding into one long line
           // when a corner handle is dragged.
           const fontRatio = clamp(Number(node.fontSize) || 16, 10, 80) / (drag.originFontSize || 16);
-          el.style.width = `${Math.max(10, Math.round(drag.originW * fontRatio))}px`;
+          // Round the rendered width upward on every platform. Fractional CSS
+          // widths can otherwise push the final glyph to the next line on
+          // desktop browsers when font metrics and letter-spacing are rasterized.
+          const resizeWidth = Math.max(10, Math.ceil(drag.originW * fontRatio));
+          el.style.width = `${resizeWidth}px`;
           el.style.height = 'auto';
-          el.style.overflowWrap = 'normal';
+          el.style.overflowWrap = 'break-word';
           el.style.fontSize = `${clamp(Number(node.fontSize) || 16, 10, 80)}px`;
 
           // Measure only the currently resized node. Convert viewport dimensions
@@ -3770,7 +4133,7 @@
   }
 
   function deleteSelected() {
-    if (playback.active) return;
+    if (presentationMode || playback.active) return;
 
     // Build the selection from both selection representations. selectedId is
     // the primary/fallback id, while selectedIds holds the full marquee group.
@@ -3847,7 +4210,7 @@
     commitScene(`Удалено узлов: ${deletedNodeCount}, связей: ${deletedEdgeCount}`);
   }
   function undo() {
-    if (undoIndex <= 0 || playback.active) return;
+    if (presentationMode || undoIndex <= 0 || playback.active) return;
     if (editingId) finishEditing(editingId, true);
     undoIndex--;
     scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
@@ -3855,7 +4218,7 @@
     showToast('Действие отменено');
   }
   function redo() {
-    if (undoIndex >= undoStack.length - 1 || playback.active) return;
+    if (presentationMode || undoIndex >= undoStack.length - 1 || playback.active) return;
     undoIndex++;
     scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
     recordTimeline(); renderScene(); saveProject(); updateActionButtons();
@@ -4010,6 +4373,7 @@
   }
 
   function showCanvasContextMenu(x, y) {
+    if (presentationMode) return;
     if (mainArea && mainArea.classList.contains('project-notes-open')) {
       setProjectNotesOpen(false);
     }
@@ -4022,6 +4386,7 @@
   }
 
   function showNodeContextMenu(id, x, y) {
+    if (presentationMode) return;
     if (mainArea && mainArea.classList.contains('project-notes-open')) {
       setProjectNotesOpen(false);
     }
@@ -4053,13 +4418,34 @@
 
   function updateNodeContextMenu() {
     const n = nodeById(contextNodeId);
-    nodeContextMenu.querySelectorAll('[data-node-color]').forEach(btn => btn.classList.toggle('active', !!n && btn.dataset.nodeColor === (n.color || '#111111')));
-    [['underline', !!(n && n.underline)], ['highlight', !!(n && n.highlight)]].forEach(([action, active]) => {
+    const isTextNode = !!n && n.type !== 'image';
+    if (textNodeContextActions) textNodeContextActions.hidden = !isTextNode;
+    nodeContextMenu.querySelectorAll('[data-node-color]').forEach(btn => {
+      btn.classList.toggle('active', !!n && btn.dataset.nodeColor === (n.color || '#111111'));
+    });
+    nodeContextMenu.querySelectorAll('[data-node-border-color]').forEach(btn => {
+      const active = isTextNode && btn.dataset.nodeBorderColor === (n.borderColor || '#111111');
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    });
+    [['underline', !!(n && n.underline)], ['highlight', !!(n && n.highlight)], ['frame', !!(isTextNode && n.framed)]].forEach(([action, active]) => {
       const btn = nodeContextMenu.querySelector(`[data-node-action="${action}"]`);
       if (!btn) return;
-      btn.classList.toggle('active', active); btn.setAttribute('aria-checked', String(active));
-      const check = btn.querySelector('.check'); if (check) check.textContent = active ? '✓' : '';
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-checked', String(active));
+      const check = btn.querySelector('.check');
+      if (check) check.textContent = active ? '✓' : '';
     });
+    const frameButton = nodeContextMenu.querySelector('[data-node-action="frame"]');
+    const frameLabel = frameButton && frameButton.querySelector('.item-label');
+    if (frameLabel) frameLabel.textContent = n && n.framed ? 'Убрать рамку' : 'Добавить рамку';
+    const applyAllButton = nodeContextMenu.querySelector('[data-node-action="apply-frame-to-all"]');
+    if (applyAllButton) {
+      applyAllButton.disabled = !isTextNode || !scene.nodes.some(node => node.type !== 'image' && node.id !== n.id);
+      applyAllButton.textContent = n && n.framed
+        ? 'Применить рамку ко всем текстовым узлам'
+        : 'Убрать рамку у всех текстовых узлов';
+    }
   }
 
   nodeContextMenu?.addEventListener('click', event => {
@@ -4083,7 +4469,9 @@
     // Color swatches must not cancel the trusted click's default behavior:
     // on mobile Safari preventDefault() here can blur the active text editor
     // and dismiss the software keyboard. Stopping propagation is sufficient.
-    const swatch = menuTarget ? menuTarget.closest('[data-node-color]') : null;
+    const textColorSwatch = menuTarget ? menuTarget.closest('[data-node-color]') : null;
+    const frameColorSwatch = menuTarget ? menuTarget.closest('[data-node-border-color]') : null;
+    const swatch = textColorSwatch || frameColorSwatch;
     if (swatch) {
       event.stopPropagation();
     } else {
@@ -4105,8 +4493,13 @@
     const actionButton = menuTarget ? menuTarget.closest('[data-node-action]') : null;
     const n = nodeById(contextNodeId);
     if (swatch) {
-      if (!n) { closeNodeContextMenu(); return; }
-      n.color = swatch.dataset.nodeColor;
+      if (!n || n.type === 'image') { closeNodeContextMenu(); return; }
+      if (textColorSwatch) {
+        n.color = textColorSwatch.dataset.nodeColor;
+      } else if (frameColorSwatch) {
+        n.borderColor = frameColorSwatch.dataset.nodeBorderColor;
+        n.framed = true;
+      }
       commitScene(); updateNodeContextMenu(); return;
     }
     if (!actionButton) return;
@@ -4114,7 +4507,34 @@
     const action = actionButton.dataset.nodeAction;
     if (action === 'underline') n.underline = !n.underline;
     else if (action === 'highlight') n.highlight = !n.highlight;
-    else if (action === 'delete') {
+    else if (action === 'frame') {
+      if (n.type === 'image') return;
+      n.framed = !n.framed;
+      if (!/^#[0-9a-f]{6}$/i.test(String(n.borderColor || ''))) n.borderColor = '#111111';
+    } else if (action === 'apply-frame-to-all') {
+      if (n.type === 'image') return;
+      const framed = !!n.framed;
+      const borderColor = /^#[0-9a-f]{6}$/i.test(String(n.borderColor || ''))
+        ? n.borderColor.toLowerCase()
+        : '#111111';
+      let changedCount = 0;
+      scene.nodes.forEach(node => {
+        if (node.type === 'image') return;
+        if (!!node.framed !== framed || (node.borderColor || '#111111') !== borderColor) {
+          node.framed = framed;
+          node.borderColor = borderColor;
+          changedCount += 1;
+        }
+      });
+      if (!changedCount) {
+        showToast('Оформление уже применено ко всем текстовым узлам');
+        updateNodeContextMenu();
+        return;
+      }
+      commitScene(framed ? 'Рамка применена ко всем текстовым узлам' : 'Рамки удалены со всех текстовых узлов');
+      updateNodeContextMenu();
+      return;
+    } else if (action === 'delete') {
       const id = n.id;
       closeNodeContextMenu();
       openConfirm('Удалить узел?', 'Узел и все его связи будут удалены. Это действие можно отменить.', 'Удалить', () => {
@@ -4152,6 +4572,7 @@
   let confirmCancelCallback = null;
 
   function openConfirm(title, message, confirmLabel, callback, cancelLabel = 'Отмена', cancelCallback = null) {
+    if (presentationMode) return;
     document.getElementById('modalTitle').textContent = title;
     document.getElementById('modalText').textContent = message;
     document.getElementById('modalConfirm').textContent = confirmLabel;
@@ -4319,6 +4740,7 @@
   }
 
   function openSelectedEdgesActions(edgeId = null, sourceEvent = null) {
+    if (presentationMode) return;
     if (sourceEvent) {
       if (sourceEvent.cancelable) sourceEvent.preventDefault();
       if (sourceEvent.stopPropagation) sourceEvent.stopPropagation();
@@ -4457,29 +4879,70 @@
   }
 
   function wrapCanvasText(ctx, text, maxWidth) {
+    // Mirror the live node's `white-space: pre-wrap` + `overflow-wrap: break-word`.
+    // Normal words wrap at whitespace; only an unbreakable token is split when
+    // it is wider than the content box. Keep repeated spaces and explicit newlines
+    // (the previous split(/\s+/) changed the text geometry during export).
     const result = [];
-    String(text || '').split('\n').forEach(paragraph => {
-      if (!paragraph) { result.push(''); return; }
-      const words = paragraph.split(/\s+/);
+    const safeWidth = Math.max(1, Number(maxWidth) || 1);
+    const paragraphs = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
+    const measure = value => ctx.measureText(value).width;
+
+    paragraphs.forEach(paragraph => {
       let line = '';
-      for (const word of words) {
-        const candidate = line ? line + ' ' + word : word;
-        if (ctx.measureText(candidate).width <= maxWidth || !line) {
-          line = candidate;
-        } else {
-          result.push(line); line = word;
-        }
-        if (ctx.measureText(line).width > maxWidth && line.length > 1) {
-          let piece = '';
-          for (const char of line) {
-            if (piece && ctx.measureText(piece + char).width > maxWidth) { result.push(piece); piece = char; }
-            else piece += char;
+      const tokens = paragraph.match(/\s+|[^\s]+/gu) || [];
+      tokens.forEach(token => {
+        if (/^\s+$/u.test(token)) {
+          // Preserve all whitespace. If it no longer fits, move it with the
+          // following text just as a pre-wrapped line can begin with spaces.
+          for (const character of Array.from(token)) {
+            if (line && measure(line + character) > safeWidth) {
+              result.push(line);
+              line = character;
+            } else if (!line && measure(character) > safeWidth) {
+              result.push(character);
+            } else {
+              line += character;
+            }
           }
-          line = piece;
+          return;
         }
-      }
+
+        if (measure(line + token) <= safeWidth || !line) {
+          if (!line && measure(token) > safeWidth) {
+            // CSS overflow-wrap:break-word allows only overlong words/URLs to break.
+            for (const character of Array.from(token)) {
+              if (line && measure(line + character) > safeWidth) {
+                result.push(line);
+                line = character;
+              } else {
+                line += character;
+              }
+            }
+          } else {
+            line += token;
+          }
+          return;
+        }
+
+        result.push(line);
+        line = '';
+        if (measure(token) <= safeWidth) {
+          line = token;
+          return;
+        }
+        for (const character of Array.from(token)) {
+          if (line && measure(line + character) > safeWidth) {
+            result.push(line);
+            line = character;
+          } else {
+            line += character;
+          }
+        }
+      });
       result.push(line);
     });
+
     return result.length ? result : [''];
   }
 
@@ -4494,6 +4957,9 @@
       }
 
       const PADDING = 100;             // итоговые пиксели с каждой стороны
+      // Export scale maps graph/CSS pixels directly to output pixels. Do not
+      // multiply by window.devicePixelRatio: this keeps DPR-independent sizing
+      // and scales fonts, padding, borders and geometry by the same factor.
       const DESIRED_SCALE = 2;         // отрисовка в 2x для чёткого текста и линий
       const MAX_CANVAS_SIDE = 32767;   // технический предел одного измерения canvas
       const MAX_CANVAS_PIXELS = 64 * 1024 * 1024;
@@ -4505,11 +4971,64 @@
       const extension = outputFormat === 'jpeg' ? 'jpg' : 'png';
       const formatLabel = outputFormat === 'jpeg' ? 'JPG' : 'PNG';
 
+      // Capture the live DOM layout after finishEditing()/renderScene(). The
+      // model dimensions can otherwise be stale (for example, a desktop-sized
+      // node reopened on a narrow phone). offsetWidth/Height are layout pixels
+      // and are not affected by the workspace's CSS zoom transform.
+      const parseCssPixels = (value, fallback = 0) => {
+        const parsed = Number.parseFloat(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+      };
+      const exportNodeMetrics = new Map();
+      nodes.forEach(node => {
+        const element = renderedNodeElements.get(node.id);
+        const textElement = element && element.querySelector('.node-text');
+        const elementStyle = element ? window.getComputedStyle(element) : null;
+        const textStyle = textElement ? window.getComputedStyle(textElement) : elementStyle;
+        const width = Math.max(10, Number(element && element.offsetWidth) || Number(node.width) || 10);
+        const height = Math.max(10, Number(element && element.offsetHeight) || Number(node.height) || 10);
+        const paddingLeft = elementStyle ? parseCssPixels(elementStyle.paddingLeft, 14) : 14;
+        const paddingRight = elementStyle ? parseCssPixels(elementStyle.paddingRight, 14) : 14;
+        const paddingTop = elementStyle ? parseCssPixels(elementStyle.paddingTop, 10) : 10;
+        const paddingBottom = elementStyle ? parseCssPixels(elementStyle.paddingBottom, 10) : 10;
+        const borderLeft = elementStyle ? parseCssPixels(elementStyle.borderLeftWidth, 1) : 1;
+        const borderRight = elementStyle ? parseCssPixels(elementStyle.borderRightWidth, 1) : 1;
+        const borderTop = elementStyle ? parseCssPixels(elementStyle.borderTopWidth, 1) : 1;
+        const borderBottom = elementStyle ? parseCssPixels(elementStyle.borderBottomWidth, 1) : 1;
+        const fontSize = textStyle ? parseCssPixels(textStyle.fontSize, Number(node.fontSize) || 16) : (Number(node.fontSize) || 16);
+        const computedLineHeight = textStyle ? parseCssPixels(textStyle.lineHeight, fontSize * 1.28) : fontSize * 1.28;
+        const letterSpacing = textStyle && textStyle.letterSpacing !== 'normal'
+          ? parseCssPixels(textStyle.letterSpacing, -0.25)
+          : -0.25;
+        exportNodeMetrics.set(node.id, {
+          width,
+          height,
+          paddingLeft,
+          paddingRight,
+          paddingTop,
+          paddingBottom,
+          borderLeft,
+          borderRight,
+          borderTop,
+          borderBottom,
+          contentWidth: Math.max(1, width - paddingLeft - paddingRight - borderLeft - borderRight),
+          fontSize: Math.max(1, fontSize),
+          lineHeight: Math.max(1, computedLineHeight),
+          letterSpacing,
+          fontFamily: textStyle ? textStyle.fontFamily : 'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontWeight: textStyle ? textStyle.fontWeight : '720',
+          fontStyle: textStyle ? textStyle.fontStyle : 'normal',
+          fontVariant: textStyle ? textStyle.fontVariant : 'normal',
+          fontKerning: textStyle ? textStyle.fontKerning : 'auto'
+        });
+      });
+
       function nodePoint(node, side) {
         const x = Number(node.x) || 0;
         const y = Number(node.y) || 0;
-        const w = Math.max(10, Number(node.width) || 10);
-        const h = Math.max(10, Number(node.height) || 10);
+        const metrics = exportNodeMetrics.get(node.id);
+        const w = Math.max(10, metrics ? metrics.width : (Number(node.width) || 10));
+        const h = Math.max(10, metrics ? metrics.height : (Number(node.height) || 10));
         if (side === 'top') return { x: x + w / 2, y };
         if (side === 'right') return { x: x + w, y: y + h / 2 };
         if (side === 'bottom') return { x: x + w / 2, y: y + h };
@@ -4529,9 +5048,11 @@
       nodes.forEach(node => {
         const x = Number(node.x) || 0;
         const y = Number(node.y) || 0;
+        const metrics = exportNodeMetrics.get(node.id);
+        const width = Math.max(10, metrics ? metrics.width : (Number(node.width) || 10));
+        const height = Math.max(10, metrics ? metrics.height : (Number(node.height) || 10));
         includePoint(x, y);
-        includePoint(x + Math.max(10, Number(node.width) || 10),
-                     y + Math.max(10, Number(node.height) || 10));
+        includePoint(x + width, y + height);
       });
 
       const edgeGeometry = [];
@@ -4700,20 +5221,71 @@
           }
           return;
         }
-        const fontSize = Math.max(10, Number(node.fontSize) || 16) * scale;
-        ctx.font = `720 ${fontSize}px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif`;
+        const metrics = exportNodeMetrics.get(node.id) || {
+          width: Number(node.width) || 10,
+          height: Number(node.height) || 10,
+          paddingLeft: 14, paddingRight: 14, paddingTop: 10, paddingBottom: 10,
+          borderLeft: 1, borderRight: 1, borderTop: 1, borderBottom: 1,
+          contentWidth: Math.max(1, (Number(node.width) || 10) - 30),
+          fontSize: Number(node.fontSize) || 16,
+          lineHeight: (Number(node.fontSize) || 16) * 1.28,
+          letterSpacing: -0.25,
+          fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontWeight: '720', fontStyle: 'normal', fontVariant: 'normal', fontKerning: 'auto'
+        };
+        const fontSize = Math.max(1, metrics.fontSize) * scale;
+        ctx.font = `${metrics.fontStyle} ${metrics.fontVariant} ${metrics.fontWeight} ${fontSize}px ${metrics.fontFamily}`;
+        if ('fontKerning' in ctx && metrics.fontKerning) ctx.fontKerning = metrics.fontKerning;
         ctx.textBaseline = 'alphabetic';
-        const px = tx + (Number(node.x) || 0) * scale + 4 * scale;
-        const py = ty + (Number(node.y) || 0) * scale + 2 * scale;
-        const nodeWidth = Math.max(10, Number(node.width) || 10);
-        // Match the live DOM letter spacing and leave a small width allowance
-        // for Canvas-vs-DOM font metric differences to prevent premature wraps.
-        if ('letterSpacing' in ctx) {
-          ctx.letterSpacing = `${-0.25 * scale}px`;
+        const nodeX = Number(node.x) || 0;
+        const nodeY = Number(node.y) || 0;
+        const nodeWidth = Math.max(10, metrics.width);
+        const nodeHeight = Math.max(10, metrics.height);
+        const hasFrame = node.framed === true;
+        // Text origin and available line width now use the actual DOM padding
+        // and border, including the tighter mobile padding, for framed and
+        // unframed nodes alike.
+        const contentOffsetX = metrics.borderLeft + metrics.paddingLeft;
+        const contentOffsetY = metrics.borderTop + metrics.paddingTop;
+        const px = tx + (nodeX + contentOffsetX) * scale;
+        const py = ty + (nodeY + contentOffsetY) * scale;
+        if (hasFrame) {
+          const frameX = tx + nodeX * scale;
+          const frameY = ty + nodeY * scale;
+          const frameW = nodeWidth * scale;
+          const frameH = nodeHeight * scale;
+          const radius = Math.max(0, Math.min(9 * scale, frameW / 2, frameH / 2));
+          const rawBorderColor = typeof node.borderColor === 'string' && /^#[0-9a-f]{6}$/i.test(node.borderColor)
+            ? node.borderColor.toLowerCase()
+            : '#111111';
+          const isDefaultDarkFrameColor = rawBorderColor === '#111111' || rawBorderColor === '#171717';
+          const exportBorderColor = dark && isDefaultDarkFrameColor ? '#e5e5e5' : rawBorderColor;
+          ctx.beginPath();
+          ctx.moveTo(frameX + radius, frameY);
+          ctx.lineTo(frameX + frameW - radius, frameY);
+          ctx.quadraticCurveTo(frameX + frameW, frameY, frameX + frameW, frameY + radius);
+          ctx.lineTo(frameX + frameW, frameY + frameH - radius);
+          ctx.quadraticCurveTo(frameX + frameW, frameY + frameH, frameX + frameW - radius, frameY + frameH);
+          ctx.lineTo(frameX + radius, frameY + frameH);
+          ctx.quadraticCurveTo(frameX, frameY + frameH, frameX, frameY + frameH - radius);
+          ctx.lineTo(frameX, frameY + radius);
+          ctx.quadraticCurveTo(frameX, frameY, frameX + radius, frameY);
+          ctx.closePath();
+          ctx.fillStyle = dark ? '#1c1c1c' : '#ffffff';
+          ctx.fill();
+          ctx.strokeStyle = exportBorderColor;
+          ctx.lineWidth = Math.max(1, 1.5 * scale);
+          ctx.stroke();
         }
-        const maxTextW = Math.max(fontSize * 2, (nodeWidth - 2) * scale);
+        // Canvas and DOM use the same computed letter spacing and content-box
+        // width. The old export subtracted only 2px for ordinary text nodes,
+        // ignoring their 28px horizontal padding and causing line overflow.
+        if ('letterSpacing' in ctx) {
+          ctx.letterSpacing = `${metrics.letterSpacing * scale}px`;
+        }
+        const maxTextW = Math.max(1, metrics.contentWidth * scale);
         const lines = wrapCanvasText(ctx, node.text, maxTextW);
-        const lineHeight = fontSize * 1.28;
+        const lineHeight = Math.max(fontSize, metrics.lineHeight * scale);
         const nodeColor = typeof node.color === 'string' ? node.color.trim() : '';
         const normalizedNodeColor = nodeColor.toLowerCase();
         const isBaseBlack = !nodeColor || normalizedNodeColor === '#111111' || normalizedNodeColor === '#171717';
@@ -4749,6 +5321,7 @@
         if ('letterSpacing' in ctx) {
           ctx.letterSpacing = '0px';
         }
+        if ('fontKerning' in ctx) ctx.fontKerning = 'auto';
       });
 
       const name = (projectTitle.value.trim() || 'NetNorth').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNorth';
@@ -4872,6 +5445,7 @@
   }
 
   function openPlayback() {
+    if (presentationMode) return;
     if (playback.active) {
       togglePlayback();
       return;
@@ -5067,6 +5641,7 @@
   }
 
   function startBoxSelection(event) {
+    if (presentationMode) return;
     const isTouchMarquee = event.pointerType === 'touch' && event.button === 0;
     const isMouseMarquee = event.pointerType !== 'touch' && event.button === 2;
     if ((!isTouchMarquee && !isMouseMarquee) || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
@@ -5214,10 +5789,14 @@
 
   function cancelGestureForPinch() {
     // Revert an in-progress one-finger drag/pan/link before the pinch takes over.
-    // This makes the two-pointer gesture exclusive and prevents accidental node moves.
+    // cancelPointerGesture() clears the shared touch map by design, so preserve
+    // the currently active pointers across this intentional gesture hand-off.
+    const activePointersSnapshot = [...activeTouchPointers.entries()];
     if (drag && drag.startedOnLink) suppressImmediateDraggedLinkClick(1200);
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     else pendingViewportPan = null;
+    activeTouchPointers.clear();
+    activePointersSnapshot.forEach(([pointerId, point]) => activeTouchPointers.set(pointerId, point));
     clearLongPress();
   }
 
@@ -5301,7 +5880,7 @@
       return;
     }
 
-    if (activeTouchPointers.size !== 1) return;
+    if (activeTouchPointers.size !== 1 || presentationMode) return;
 
     const nodeElement = target && target.closest('.node[data-node-id]');
     const edgeElement = target && target.closest('.edge-hit');
@@ -5368,6 +5947,14 @@
   workspace?.addEventListener('pointerdown', handleWorkspaceTouchDown, { passive: false });
 
   stage?.addEventListener('pointerdown', startBoxSelection);
+  document?.addEventListener('click', event => {
+    if (!presentationMode) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target || !target.closest('#stage')) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+
 
   // When a contenteditable node receives focus, the mobile keyboard can shrink
   // the visual viewport after the focus event. Recheck during its animation so
@@ -5392,6 +5979,7 @@
   // native menu never appears over the canvas. We route the intended app action
   // here as well, because stopPropagation() prevents later stage/node listeners.
   document?.addEventListener('contextmenu', event => {
+    if (presentationMode) { event.preventDefault(); event.stopImmediatePropagation(); return; }
     // While the app's mobile context sheet is open, suppress the browser menu
     // everywhere on the screen, not only over the canvas element.
     if (nodeContextMenu.classList.contains('visible')) {
@@ -5476,6 +6064,12 @@
     if (playback.active) return;
     if (event.button !== 0) return;
 
+    if (presentationMode) {
+      if (event.cancelable) event.preventDefault();
+      startPan(event);
+      return;
+    }
+
     const pointerTarget = event.target instanceof Element ? event.target : null;
     const hitNode = pointerTarget && pointerTarget.closest('.node');
     const hitEdge = pointerTarget && pointerTarget.closest('.edge-hit');
@@ -5545,6 +6139,8 @@
   document.getElementById('undoBtn')?.addEventListener('click', undo);
   document.getElementById('redoBtn')?.addEventListener('click', redo);
   document.getElementById('exportBtn')?.addEventListener('click', exportProject);
+  presentationModeBtn?.addEventListener('click', enterPresentationMode);
+  presentationExitBtn?.addEventListener('click', exitPresentationMode);
   document.getElementById('themeToggleBtn')?.addEventListener('click', () => applyTheme(document.body.classList.contains('dark-theme') ? 'light' : 'dark'));
   document.getElementById('exportJsonBtn')?.addEventListener('click', exportProjectJSON);
   document.getElementById('cancelPngExportBtn')?.addEventListener('click', () => exportScreen.classList.remove('visible'));
@@ -5561,6 +6157,7 @@
     if (file) insertImageFile(file, pendingImagePoint);
   });
   document?.addEventListener('paste', event => {
+    if (presentationMode) { event.preventDefault(); return; }
     const target = event.target;
     if (target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return;
     const items = event.clipboardData && event.clipboardData.items;
@@ -5692,6 +6289,12 @@
   }));
   document.querySelectorAll('[data-theme-choice]').forEach(button => button?.addEventListener('click', () => applyTheme(button.dataset.themeChoice)));
   document.getElementById('autoArrangeToggle')?.addEventListener('change', event => setAutoArrangeEnabled(event.currentTarget.checked));
+  document.getElementById('projectViewSwitcher')?.addEventListener('click', event => {
+    const button = event.target.closest('[data-project-view]');
+    if (!button) return;
+    event.preventDefault();
+    setProjectViewMode(button.dataset.projectView);
+  });
   document.getElementById('savedProjectList')?.addEventListener('click', event => {
     const actionsButton = event.target.closest('[data-project-actions-id]');
     if (actionsButton) {
@@ -5762,6 +6365,17 @@
   document.getElementById('importFromStartBtn')?.addEventListener('click', () => importFile.click());
 
   document?.addEventListener('keydown', event => {
+    if (presentationMode) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        exitPresentationMode();
+      } else {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      return;
+    }
     const target = event.target;
     const inTextField = target && (target.isContentEditable || ['INPUT','TEXTAREA','SELECT'].includes(target.tagName));
     if (event.key === 'Escape') {
@@ -5860,6 +6474,7 @@
       applyTheme(localStorage.getItem(THEME_KEY) || 'light', false);
       autoArrangeEnabled = localStorage.getItem(AUTO_ARRANGE_KEY) !== '0';
       emptyHintDismissed = localStorage.getItem(EMPTY_HINT_DISMISSED_KEY) === '1';
+      projectViewMode = normalizeProjectViewMode(localStorage.getItem(PROJECT_VIEW_KEY) || 'list');
     } catch (_) {
       applyTheme('light', false);
       autoArrangeEnabled = true;
@@ -5868,6 +6483,7 @@
     applyTheme('light', false);
     autoArrangeEnabled = true;
   }
+  updateProjectViewSwitcher();
   updateAutoArrangeChoice();
   scene = freshScene();
   projectTitle.value = 'Новая схема';

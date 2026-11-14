@@ -23,6 +23,10 @@
       <span class="tool-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v11m-4-4 4 4 4-4M5 16v4h14v-4"/></svg></span>
       <span>Экспорт</span>
     </button>
+    <button class="top-action presentation-launch" id="presentationModeBtn" type="button" title="Режим презентации" aria-label="Включить режим презентации" aria-pressed="false">
+      <span class="tool-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="1.5"/><path d="M8 21h8M12 17v4M8 9h8M8 12h5"/></svg></span>
+      <span class="presentation-label">Презентация</span>
+    </button>
     <input type="file" class="hidden-file" id="importFile" accept="application/json,.json">
     <input type="file" class="hidden-file" id="imageFile" accept=".png,.jpg,.jpeg">
   </header>
@@ -78,6 +82,9 @@
         <div class="stage" id="stage" aria-label="Рабочее поле"></div>
       </div>
     </div>
+    <button class="presentation-exit" id="presentationExitBtn" type="button" title="Вернуться в редактор (Esc)" aria-label="Выйти из режима презентации" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5 7.5 12l7 7M8 12h12"/></svg>
+    </button>
     <div class="empty-state" id="emptyState" role="status" aria-live="polite">
       <button class="empty-state-close" id="emptyStateCloseBtn" type="button" aria-label="Закрыть подсказку" title="Больше не показывать">×</button>
       <div class="empty-state-mark" aria-hidden="true"></div>
@@ -103,6 +110,28 @@
             <button class="color-swatch" data-node-color="#267344" title="Зелёный" aria-label="Зелёный" style="background:#267344"></button>
             <button class="color-swatch" data-node-color="#7a35a2" title="Фиолетовый" aria-label="Фиолетовый" style="background:#7a35a2"></button>
           </div>
+          <div class="context-divider"></div>
+          <button class="context-item" data-node-action="frame" role="menuitemcheckbox" aria-checked="false"><span class="item-label">Добавить рамку</span><span class="check"></span></button>
+          <div class="context-caption">ЦВЕТ РАМКИ</div>
+          <div class="color-grid frame-color-grid" role="group" aria-label="Цвет рамки текстового узла">
+            <button type="button" class="color-swatch" data-node-border-color="#111111" title="Чёрный" aria-label="Чёрный" style="background:#111111"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#4b4b4b" title="Графитовый" aria-label="Графитовый" style="background:#4b4b4b"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#888888" title="Серый" aria-label="Серый" style="background:#888888"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#bf2929" title="Красный" aria-label="Красный" style="background:#bf2929"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#185abc" title="Синий" aria-label="Синий" style="background:#185abc"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#267344" title="Зелёный" aria-label="Зелёный" style="background:#267344"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#7a35a2" title="Фиолетовый" aria-label="Фиолетовый" style="background:#7a35a2"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#e67e22" title="Оранжевый" aria-label="Оранжевый" style="background:#e67e22"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#ff9f1c" title="Янтарный" aria-label="Янтарный" style="background:#ff9f1c"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#25a9e0" title="Голубой" aria-label="Голубой" style="background:#25a9e0"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#00a6a6" title="Циан" aria-label="Циан" style="background:#00a6a6"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#2ec4b6" title="Бирюзовый" aria-label="Бирюзовый" style="background:#2ec4b6"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#e64980" title="Розовый" aria-label="Розовый" style="background:#e64980"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#f1c40f" title="Жёлтый" aria-label="Жёлтый" style="background:#f1c40f"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#8d5a3b" title="Коричневый" aria-label="Коричневый" style="background:#8d5a3b"></button>
+            <button type="button" class="color-swatch" data-node-border-color="#c65d3a" title="Терракотовый" aria-label="Терракотовый" style="background:#c65d3a"></button>
+          </div>
+          <button type="button" class="context-item frame-apply-all" data-node-action="apply-frame-to-all" role="menuitem">Применить рамку ко всем текстовым узлам</button>
           <div class="context-divider"></div>
           <button class="context-item" data-node-action="underline" role="menuitemcheckbox" aria-checked="false">Подчеркнуть текст <span class="check"></span></button>
           <button class="context-item" data-node-action="highlight" role="menuitemcheckbox" aria-checked="false">Выделить жёлтым <span class="check"></span></button>
@@ -236,7 +265,18 @@
       <section id="startProjectsPanel" hidden>
         <button class="start-back" data-start-back="main">← Главное меню</button>
         <h2>Прошлые проекты</h2>
-        <div class="saved-project-list" id="savedProjectList"></div>
+        <div class="project-view-switcher" id="projectViewSwitcher" role="group" aria-label="Режим отображения проектов">
+          <button type="button" data-project-view="list" aria-pressed="true" class="active" title="Обычный список">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/></svg><span>Список</span>
+          </button>
+          <button type="button" data-project-view="horizontal" aria-pressed="false" title="Горизонтальные карточки">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3.5" width="6" height="13" rx="1"/><path d="M11.5 6h6M11.5 10h6M11.5 14h4"/></svg><span>Горизонтально</span>
+          </button>
+          <button type="button" data-project-view="vertical" aria-pressed="false" title="Вертикальные карточки">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3.5" y="2.5" width="13" height="6" rx="1"/><path d="M5.5 11.5h9M5.5 14.5h9M5.5 17h6"/></svg><span>Вертикально</span>
+          </button>
+        </div>
+        <div class="saved-project-list" id="savedProjectList" data-view="list"></div>
         <button class="start-button" id="importFromStartBtn" style="margin-top:10px"><span>Импортировать JSON</span><span class="start-chevron">↓</span></button>
       </section>
       <section id="startSettingsPanel" hidden>
