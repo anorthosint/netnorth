@@ -5,13 +5,23 @@
   let saveTimer = 0;
   const STORAGE_KEY = 'visualization_workspace_v1';
   const STORAGE_PROJECT_ID_KEY = 'visualization_workspace_project_id_v1';
-  const PROJECT_INDEX_KEY = 'netnotrh_projects_index_v1';
-  const PROJECT_KEY_PREFIX = 'netnotrh_project_';
-  const THEME_KEY = 'netnotrh_theme_v1';
-  const AUTO_ARRANGE_KEY = 'netnotrh_auto_arrange_v1';
-  const EMPTY_HINT_DISMISSED_KEY = 'netnotrh_empty_hint_dismissed_v1';
+  const PROJECT_INDEX_KEY = 'netnorth_projects_index_v1';
+  const PROJECT_KEY_PREFIX = 'netnorth_project_';
+  const THEME_KEY = 'netnorth_theme_v1';
+  const AUTO_ARRANGE_KEY = 'netnorth_auto_arrange_v1';
+  const EMPTY_HINT_DISMISSED_KEY = 'netnorth_empty_hint_dismissed_v1';
+  // Older builds used the transposed spelling `netnotrh_`. Keep these names
+  // only for a one-time, loss-safe migration of existing browser data.
+  const LEGACY_PROJECT_INDEX_KEY = 'netnotrh_projects_index_v1';
+  const LEGACY_PROJECT_KEY_PREFIX = 'netnotrh_project_';
+  const LEGACY_THEME_KEY = 'netnotrh_theme_v1';
+  const LEGACY_AUTO_ARRANGE_KEY = 'netnotrh_auto_arrange_v1';
+  const LEGACY_EMPTY_HINT_DISMISSED_KEY = 'netnotrh_empty_hint_dismissed_v1';
   const PROJECT_VIEW_KEY = 'netnorth_projects_view_v1';
   const SIDEBAR_COLLAPSED_KEY = 'netnorth_sidebar_collapsed_v1';
+  // Keep a safety margin below the smallest commonly encountered localStorage quota.
+  const LOCAL_STORAGE_SAFE_LIMIT_BYTES = 4.5 * 1024 * 1024;
+  let lastLocalSaveErrorToastAt = 0;
   let presentationMode = false;
   let presentationPreviousState = null;
   const stage = document.getElementById('stage');
@@ -22,6 +32,9 @@
   const nodeContextActions = document.getElementById('nodeContextActions');
   const textNodeContextActions = document.getElementById('textNodeContextActions');
   const zoomIndicator = document.getElementById('zoomIndicator');
+  const cameraBookmarksPanel = document.getElementById('cameraBookmarks');
+  const cameraBookmarkHintToggle = document.getElementById('cameraBookmarkHintToggle');
+  const cameraBookmarkHint = document.getElementById('cameraBookmarkHint');
   const CANVAS_PAD = 1400;
   let zoom = 1;
   let stageContentBounds = { maxX: 1200, maxY: 800 };
@@ -99,8 +112,9 @@
   let lastEditorScrollTarget = null;
   let editorScrollResetTimer = 0;
   let sidebarBackdropClickGuard = null;
-  let sidebarLayoutTimer = 0;
   let sidebarCenterWorldX = null;
+  let cameraFlightRaf = 0;
+  let cameraFlightToken = 0;
   let contextCanvasPoint = { x: 0, y: 0 };
   let pendingImagePoint = { x: 0, y: 0 };
   let activeProjectActionId = null;
@@ -108,10 +122,35 @@
   let renameTargetProjectId = null;
   let deleteTargetProjectId = null;
   let projectViewMode = 'list';
+  const cameraState = { bookmarks: { '1': null, '2': null, '3': null } };
   const projectPreviewCache = new Map();
 
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const freshScene = () => ({ nodes: [], edges: [] });
+
+  function normalizeTextNodeDefaults(value) {
+    const hasBorder = value && typeof value.hasBorder === 'boolean'
+      ? value.hasBorder
+      : false;
+    const borderColor = value && typeof value.borderColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(value.borderColor.trim())
+      ? value.borderColor.trim().toLowerCase()
+      : '#111111';
+    return { hasBorder, borderColor };
+  }
+
+  function getTextNodeDefaults() {
+    return {
+      hasBorder: defaultTextNodeHasBorder,
+      borderColor: defaultTextNodeBorderColor
+    };
+  }
+
+  function setTextNodeDefaults(value) {
+    const normalized = normalizeTextNodeDefaults(value);
+    defaultTextNodeHasBorder = normalized.hasBorder;
+    defaultTextNodeBorderColor = normalized.borderColor;
+  }
+
   let scene = freshScene();
   let selectedId = null;
   let editingId = null;
@@ -181,6 +220,10 @@
   let confirmCallback = null;
   let localStorageAvailable = true;
   let autoArrangeEnabled = true;
+  // Project-scoped defaults affect only newly created text nodes. Per-node edits
+  // intentionally do not mutate these defaults.
+  let defaultTextNodeHasBorder = false;
+  let defaultTextNodeBorderColor = '#111111';
 
   const icons = {
     play: '<path d="m8 5 11 7-11 7V5Z"/>',
@@ -404,6 +447,22 @@
         validateProjectSceneStructure(frame.scene, `timeline frame ${index}`);
       });
     }
+    if (data.cameraBookmarks != null && (typeof data.cameraBookmarks !== 'object' || Array.isArray(data.cameraBookmarks))) {
+      throw new Error('Invalid camera bookmarks');
+    }
+    if (data.textNodeDefaults != null) {
+      const defaults = data.textNodeDefaults;
+      if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) {
+        throw new Error('Invalid text node defaults');
+      }
+      if (defaults.hasBorder != null && typeof defaults.hasBorder !== 'boolean') {
+        throw new Error('Invalid default text node frame flag');
+      }
+      if (defaults.borderColor != null &&
+          (typeof defaults.borderColor !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(defaults.borderColor.trim()))) {
+        throw new Error('Invalid default text node border color');
+      }
+    }
     if (data.title != null && typeof data.title !== 'string') throw new Error('Invalid project title');
     if (data.notes != null && (typeof data.notes !== 'string' || data.notes.length > 100000)) {
       throw new Error('Invalid project notes');
@@ -429,6 +488,11 @@
   }
 
   function clearProjectRuntimeCaches(clearImages = false) {
+    cancelCameraFlight();
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = 0;
+    }
     clearQueuedGesturePointerMove();
     if (editorScrollResetTimer) window.clearTimeout(editorScrollResetTimer);
     editorScrollResetTimer = 0;
@@ -491,11 +555,109 @@
   }
 
   function sameJson(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+  function emptyCameraBookmarks() {
+    return { '1': null, '2': null, '3': null };
+  }
+
+  function getCameraBookmarkNodeCenter(node) {
+    if (!node) return null;
+    const element = renderedNodeElements.get(node.id) || null;
+    const width = Math.max(10, Number(element?.offsetWidth) || Number(node.width) || 120);
+    const height = Math.max(10, Number(element?.offsetHeight) || Number(node.height) || 30);
+    return {
+      x: (Number(node.x) || 0) + width / 2,
+      y: (Number(node.y) || 0) + height / 2
+    };
+  }
+
+  function findNearestCameraBookmarkNode(point, nodes = scene.nodes) {
+    if (!point || !Array.isArray(nodes) || !nodes.length) return null;
+    let nearest = null;
+    let nearestDistance = Infinity;
+    nodes.forEach(node => {
+      const center = getCameraBookmarkNodeCenter(node);
+      if (!center) return;
+      const dx = center.x - point.x;
+      const dy = center.y - point.y;
+      const distance = dx * dx + dy * dy;
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearest = node;
+      }
+    });
+    return nearest;
+  }
+
+  function normalizeCameraBookmarks(input, nodes = scene.nodes) {
+    const normalized = emptyCameraBookmarks();
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return normalized;
+    const availableNodes = Array.isArray(nodes) ? nodes : [];
+    const nodeIds = new Set(availableNodes.map(node => node.id));
+    ['1', '2', '3'].forEach(slot => {
+      const bookmark = input[slot];
+      if (!bookmark || typeof bookmark !== 'object' || Array.isArray(bookmark)) return;
+      const x = Number(bookmark.x);
+      const y = Number(bookmark.y);
+      const savedZoom = Number(bookmark.zoom);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(savedZoom)) return;
+      if (Math.abs(x) > 10000000 || Math.abs(y) > 10000000 || savedZoom < .25 || savedZoom > 2.5) return;
+
+      let nodeId = null;
+      if (bookmark.nodeId != null) {
+        if (typeof bookmark.nodeId !== 'string' || !bookmark.nodeId.trim() || bookmark.nodeId.length > 160) return;
+        nodeId = bookmark.nodeId;
+        // A known-but-missing ID means the referenced node was deleted. Never
+        // silently retarget that bookmark to an unrelated node.
+        if (!nodeIds.has(nodeId)) return;
+      } else {
+        // Upgrade bookmarks saved by the previous camera-only format by binding
+        // them to the node nearest their former camera center.
+        const nearest = findNearestCameraBookmarkNode({ x, y }, availableNodes);
+        nodeId = nearest ? nearest.id : null;
+      }
+      if (!nodeId) return;
+      normalized[slot] = { x, y, zoom: savedZoom, nodeId };
+    });
+    return normalized;
+  }
+
+  function pruneInvalidCameraBookmarks(nodes = scene.nodes) {
+    // `scene.nodes` is authoritative. Call this only after a scene mutation has
+    // finished, so transient intermediate node lists cannot invalidate IDs.
+    const finalizedNodes = Array.isArray(nodes) ? nodes : [];
+    const validNodeIds = new Set(
+      finalizedNodes
+        .filter(node => node && typeof node.id === 'string' && node.id.trim())
+        .map(node => node.id)
+    );
+    const removed = [];
+    ['1', '2', '3'].forEach(slot => {
+      const bookmark = cameraState.bookmarks[slot];
+      if (!bookmark) return;
+      const nodeId = typeof bookmark.nodeId === 'string' ? bookmark.nodeId.trim() : '';
+      if (!nodeId || !validNodeIds.has(nodeId)) {
+        cameraState.bookmarks[slot] = null;
+        removed.push(slot);
+      }
+    });
+    if (removed.length) cancelCameraFlight();
+    // UI and persistence are synchronized by the caller after the final scene
+    // render/snapshot. This avoids observing a partially mutated scene.
+    return removed;
+  }
+
+  function hasCameraBookmarks(bookmarks = cameraState.bookmarks) {
+    return !!bookmarks && ['1', '2', '3'].some(slot => !!bookmarks[slot]);
+  }
+
   function nowRelative() { return Math.max(0, Date.now() - projectStartedAt); }
 
 
   function hasProjectContent() {
-    return scene.nodes.length > 0 || Boolean(String(projectNotes || '').trim()) || projectChecklist.length > 0;
+    const hasNonDefaultTextNodeStyle = defaultTextNodeHasBorder || defaultTextNodeBorderColor !== '#111111';
+    return scene.nodes.length > 0 || Boolean(String(projectNotes || '').trim()) || projectChecklist.length > 0 ||
+      hasCameraBookmarks() || hasNonDefaultTextNodeStyle;
   }
 
   function currentProjectWorkedMs() {
@@ -608,20 +770,90 @@
     if (isOpen) syncProjectNotesPanel();
   }
 
-  function showToast(message) {
+  function showToast(message, duration = 2300) {
     toastEl.textContent = message;
     toastEl.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2300);
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), Math.max(1000, Number(duration) || 2300));
   }
 
   function makeProjectId() {
     return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
 
+  function migrateLegacyStorageKey(legacyKey, currentKey) {
+    const legacyValue = localStorage.getItem(legacyKey);
+    if (legacyValue === null) return;
+
+    // The canonical value wins if both spellings exist. Otherwise move the
+    // value by freeing the old key first, then restore it if the new write fails.
+    if (localStorage.getItem(currentKey) !== null) {
+      localStorage.removeItem(legacyKey);
+      return;
+    }
+
+    localStorage.removeItem(legacyKey);
+    try {
+      localStorage.setItem(currentKey, legacyValue);
+    } catch (error) {
+      try {
+        localStorage.setItem(legacyKey, legacyValue);
+      } catch (restoreError) {
+        console.error('Legacy localStorage key could not be restored:', legacyKey, restoreError);
+      }
+      throw error;
+    }
+  }
+
+  function migrateLegacyNetNorthStorage() {
+    if (!localStorageAvailable) return;
+
+    const fixedKeys = [
+      [LEGACY_PROJECT_INDEX_KEY, PROJECT_INDEX_KEY],
+      [LEGACY_THEME_KEY, THEME_KEY],
+      [LEGACY_AUTO_ARRANGE_KEY, AUTO_ARRANGE_KEY],
+      [LEGACY_EMPTY_HINT_DISMISSED_KEY, EMPTY_HINT_DISMISSED_KEY]
+    ];
+    fixedKeys.forEach(([legacyKey, currentKey]) => {
+      try {
+        migrateLegacyStorageKey(legacyKey, currentKey);
+      } catch (error) {
+        console.warn('Could not migrate legacy localStorage key:', legacyKey, error);
+      }
+    });
+
+    // Collect keys before moving them because localStorage indexes change when
+    // entries are removed. Project IDs and their serialized data stay intact.
+    const legacyProjectKeys = [];
+    try {
+      for (let index = 0; index < localStorage.length; index++) {
+        const key = localStorage.key(index);
+        if (key && key.startsWith(LEGACY_PROJECT_KEY_PREFIX)) legacyProjectKeys.push(key);
+      }
+    } catch (error) {
+      console.warn('Could not enumerate legacy project keys:', error);
+    }
+    legacyProjectKeys.forEach(legacyKey => {
+      const projectId = legacyKey.slice(LEGACY_PROJECT_KEY_PREFIX.length);
+      if (!projectId) return;
+      try {
+        migrateLegacyStorageKey(legacyKey, PROJECT_KEY_PREFIX + projectId);
+      } catch (error) {
+        console.warn('Could not migrate legacy project record:', projectId, error);
+      }
+    });
+  }
+
+  function getStoredProjectRecord(id) {
+    const currentValue = localStorage.getItem(PROJECT_KEY_PREFIX + id);
+    return currentValue !== null ? currentValue : localStorage.getItem(LEGACY_PROJECT_KEY_PREFIX + id);
+  }
+
   function readProjectIndex() {
     try {
-      const value = JSON.parse(localStorage.getItem(PROJECT_INDEX_KEY) || '[]');
+      const currentRaw = localStorage.getItem(PROJECT_INDEX_KEY);
+      const raw = currentRaw !== null ? currentRaw : (localStorage.getItem(LEGACY_PROJECT_INDEX_KEY) || '[]');
+      const value = JSON.parse(raw);
       return Array.isArray(value) ? value.filter(item => item && typeof item.id === 'string') : [];
     } catch (_) { return []; }
   }
@@ -631,14 +863,18 @@
     try {
       const previous = readProjectIndex();
       localStorage.setItem(PROJECT_INDEX_KEY, JSON.stringify(retained));
+      localStorage.removeItem(LEGACY_PROJECT_INDEX_KEY);
       const retainedIds = new Set(retained.map(item => item.id));
       previous.forEach(item => {
         if (item && typeof item.id === 'string' && !retainedIds.has(item.id)) {
           localStorage.removeItem(PROJECT_KEY_PREFIX + item.id);
+          localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + item.id);
         }
       });
     } catch (error) {
       console.warn('Project index save failed:', error);
+      // Let the project-save transaction report this failure to the user.
+      throw error;
     }
   }
 
@@ -724,11 +960,95 @@
     } catch (error) { console.warn('Legacy project migration failed:', error); }
   }
 
+  function localStorageEntryBytes(key, value) {
+    // localStorage stores strings; two bytes per UTF-16 code unit is a
+    // conservative cross-browser approximation, excluding small impl. overhead.
+    return (String(key).length + String(value == null ? '' : value).length) * 2;
+  }
+
+  function estimateLocalStorageAfterProjectSave(payload, serialized) {
+    const projectKey = PROJECT_KEY_PREFIX + payload.id;
+    const isActiveProject = currentProjectId === payload.id;
+    const previousIndex = readProjectIndex();
+    const nextIndex = [{
+      id: payload.id,
+      title: payload.data.title || 'Новая схема',
+      updatedAt: Number(payload.data.updatedAt) || Date.now(),
+      preview: buildProjectPreviewData(payload.data.scene)
+    }, ...previousIndex.filter(item => item.id !== payload.id)].slice(0, 30);
+    const retainedIds = new Set(nextIndex.map(item => item.id));
+
+    // These entries are replaced by the upcoming save. Old project records
+    // evicted by the 30-item index limit are excluded because writeProjectIndex
+    // removes them after writing the new index.
+    const replacedKeys = new Set([projectKey, LEGACY_PROJECT_KEY_PREFIX + payload.id, PROJECT_INDEX_KEY, LEGACY_PROJECT_INDEX_KEY]);
+    if (isActiveProject) {
+      replacedKeys.add(STORAGE_KEY);
+      replacedKeys.add(STORAGE_PROJECT_ID_KEY);
+    }
+    previousIndex.forEach(item => {
+      if (item && item.id && !retainedIds.has(item.id)) {
+        replacedKeys.add(PROJECT_KEY_PREFIX + item.id);
+        replacedKeys.add(LEGACY_PROJECT_KEY_PREFIX + item.id);
+      }
+    });
+
+    let projectedBytes = 0;
+    for (let index = 0; index < localStorage.length; index++) {
+      const key = localStorage.key(index);
+      if (!key || replacedKeys.has(key)) continue;
+      projectedBytes += localStorageEntryBytes(key, localStorage.getItem(key));
+    }
+
+    projectedBytes += localStorageEntryBytes(projectKey, serialized);
+    projectedBytes += localStorageEntryBytes(PROJECT_INDEX_KEY, JSON.stringify(nextIndex));
+    if (isActiveProject) {
+      projectedBytes += localStorageEntryBytes(STORAGE_KEY, serialized);
+      projectedBytes += localStorageEntryBytes(STORAGE_PROJECT_ID_KEY, payload.id);
+    }
+
+    // Additional 10% covers key/value bookkeeping and browser-specific quota accounting.
+    return Math.ceil(projectedBytes * 1.1) + 1024;
+  }
+
+  function reportLocalStorageSaveFailure(error) {
+    const now = Date.now();
+    if (now - lastLocalSaveErrorToastAt < 4000) return;
+    lastLocalSaveErrorToastAt = now;
+
+    const isSizeLimit = error && error.code === 'LOCAL_STORAGE_SAFE_LIMIT';
+    const isQuotaError = !!(error && (
+      error.name === 'QuotaExceededError' || error.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+      error.code === 22 || error.code === 1014 || /quota|storage.{0,12}full/i.test(String(error.message || ''))
+    ));
+    let message;
+    if (isSizeLimit) {
+      const sizeMb = (Number(error.estimatedBytes || 0) / (1024 * 1024)).toFixed(1).replace('.', ',');
+      message = `Проект занимает около ${sizeMb} МБ и превышает безопасный лимит локального хранилища. Экспортируйте его через «Экспорт проекта JSON».`;
+    } else if (isQuotaError) {
+      message = 'Хранилище браузера заполнено: проект не удалось сохранить локально. Экспортируйте его через «Экспорт проекта JSON». Освободите место и повторите попытку.';
+    } else {
+      message = 'Не удалось сохранить проект локально. Экспортируйте его через «Экспорт проекта JSON», чтобы не потерять изменения.';
+    }
+
+    // Defer one task so a caller's generic follow-up toast cannot hide this
+    // actionable storage-specific explanation in the same call stack.
+    window.setTimeout(() => showToast(message, 6500), 0);
+  }
+
   function persistProjectSnapshot(payload) {
     if (!localStorageAvailable || !payload || !payload.id) return false;
     const serialized = JSON.stringify(payload.data);
+    const estimatedBytes = estimateLocalStorageAfterProjectSave(payload, serialized);
+    if (estimatedBytes > LOCAL_STORAGE_SAFE_LIMIT_BYTES) {
+      const error = new Error('Projected localStorage usage exceeds the conservative safe limit');
+      error.code = 'LOCAL_STORAGE_SAFE_LIMIT';
+      error.estimatedBytes = estimatedBytes;
+      throw error;
+    }
     // Каждая схема сохраняется по собственному ID независимо от текущего проекта.
     localStorage.setItem(PROJECT_KEY_PREFIX + payload.id, serialized);
+    localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + payload.id);
     // STORAGE_KEY — только копия последнего активного проекта. Не даём старому
     // таймеру перезаписать её данными проекта, который пользователь уже покинул.
     if (currentProjectId === payload.id) {
@@ -749,9 +1069,11 @@
     try {
       return persistProjectSnapshot(payload);
     } catch (error) {
-      // Сохраняем снимок в памяти, чтобы следующая попытка могла повторить запись.
+      // Keep the latest snapshot in memory so the user can export it or retry
+      // after freeing browser storage. Never silently discard unsaved changes.
       pendingSave = payload;
       console.warn('Local save failed:', error);
+      reportLocalStorageSaveFailure(error);
       return false;
     }
   }
@@ -770,8 +1092,10 @@
 
     try {
       localStorage.removeItem(PROJECT_KEY_PREFIX + id);
+      localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + id);
       const updatedIndex = readProjectIndex().filter(item => item.id !== id);
       localStorage.setItem(PROJECT_INDEX_KEY, JSON.stringify(updatedIndex));
+      localStorage.removeItem(LEGACY_PROJECT_INDEX_KEY);
 
       const legacyId = localStorage.getItem(STORAGE_PROJECT_ID_KEY);
       if (legacyId === id) {
@@ -786,7 +1110,8 @@
             const hasNodes = Array.isArray(legacy?.scene?.nodes) && legacy.scene.nodes.length > 0;
             const hasNotes = Boolean(String(legacy?.notes || '').trim());
             const hasTasks = Array.isArray(legacy?.checklist) && legacy.checklist.length > 0;
-            legacyIsEmpty = Boolean(legacy && !hasNodes && !hasNotes && !hasTasks);
+            const hasBookmarks = !!legacy?.cameraBookmarks && ['1', '2', '3'].some(slot => !!legacy.cameraBookmarks[slot]);
+            legacyIsEmpty = Boolean(legacy && !hasNodes && !hasNotes && !hasTasks && !hasBookmarks);
           } catch (_) { legacyIsEmpty = false; }
         }
         // Preserve the legacy mirror whenever it still contains meaningful project content.
@@ -821,7 +1146,7 @@
     if (!currentProjectId || !localStorageAvailable) return true;
 
     try {
-      const raw = localStorage.getItem(PROJECT_KEY_PREFIX + currentProjectId);
+      const raw = getStoredProjectRecord(currentProjectId);
       if (!raw) return true;
       const stored = JSON.parse(raw);
       if (!stored || !stored.scene || !Array.isArray(stored.scene.nodes) || !Array.isArray(stored.scene.edges)) return true;
@@ -830,6 +1155,8 @@
       if ((stored.title || 'Новая схема') !== currentTitle) return true;
       if (String(stored.notes || '') !== projectNotes) return true;
       if (!sameJson(sanitizeProjectChecklist(stored.checklist), projectChecklist)) return true;
+      if (!sameJson(normalizeCameraBookmarks(stored.cameraBookmarks, scene.nodes), cameraState.bookmarks)) return true;
+      if (!sameJson(normalizeTextNodeDefaults(stored.textNodeDefaults), getTextNodeDefaults())) return true;
       // Normalize legacy snapshots so added model defaults do not look like user edits.
       if (!sameJson(snapshot(sanitizeScene(stored.scene)), snapshot())) return true;
 
@@ -852,48 +1179,61 @@
   }
 
   function saveProject() {
-    if (!localStorageAvailable || !currentProjectId) return;
+    if (!localStorageAvailable || !currentProjectId) return false;
 
     // Do not persist a truly blank canvas, but preserve projects that contain
-    // notes or checklist items even before the first graph node is created.
+    // notes, checklist items or camera bookmarks before the first graph node.
     if (!hasProjectContent()) {
       cancelPendingProjectSave(currentProjectId);
-      return;
+      return true;
     }
 
-    // На случай, если ID уже сменился в другом вызывающем коде, сначала
-    // записываем ожидающий снимок прежнего проекта под его собственным ID.
-    if (pendingSave && pendingSave.id !== currentProjectId) flushPendingSave();
-
-    // Фиксируем все данные прямо сейчас. Таймер ниже только записывает готовый
-    // снимок и больше не читает изменившиеся currentProjectId или scene.
-    const sceneSnapshot = snapshot();
-    const timelineSnapshot = timeline.map(frame => ({
-      at: Math.max(0, Number(frame.at) || 0),
-      scene: snapshot(frame.scene)
-    }));
-    const imageAssets = collectProjectImageAssets([
-      sceneSnapshot,
-      ...timelineSnapshot.map(frame => frame.scene)
-    ]);
-    const payload = {
-      id: currentProjectId,
-      data: {
-        version: 2,
-        title: projectTitle.value.trim() || 'Новая схема',
-        scene: sceneSnapshot,
-        timeline: timelineSnapshot,
-        images: imageAssets,
-        projectStartedAt,
-        workedMs: currentProjectWorkedMs(),
-        notes: projectNotes,
-        checklist: clone(projectChecklist),
-        updatedAt: Date.now()
+    try {
+      // If the active project changed, its queued snapshot must be completed
+      // first. Never overwrite an unsaved snapshot from another project when
+      // that write failed because of quota or storage access.
+      if (pendingSave && pendingSave.id !== currentProjectId) {
+        const queuedProjectId = pendingSave.id;
+        const flushed = flushPendingSave();
+        if (!flushed && pendingSave && pendingSave.id === queuedProjectId) return false;
       }
-    };
-    pendingSave = payload;
-    if (saveTimer) clearTimeout(saveTimer);
-    saveTimer = setTimeout(flushPendingSave, 140);
+
+      // Capture all mutable state synchronously; the timer writes only this snapshot.
+      const sceneSnapshot = snapshot();
+      const timelineSnapshot = timeline.map(frame => ({
+        at: Math.max(0, Number(frame.at) || 0),
+        scene: snapshot(frame.scene)
+      }));
+      const imageAssets = collectProjectImageAssets([
+        sceneSnapshot,
+        ...timelineSnapshot.map(frame => frame.scene)
+      ]);
+      const payload = {
+        id: currentProjectId,
+        data: {
+          version: 2,
+          title: projectTitle.value.trim() || 'Новая схема',
+          scene: sceneSnapshot,
+          timeline: timelineSnapshot,
+          images: imageAssets,
+          projectStartedAt,
+          workedMs: currentProjectWorkedMs(),
+          notes: projectNotes,
+          checklist: clone(projectChecklist),
+          cameraBookmarks: clone(cameraState.bookmarks),
+          textNodeDefaults: getTextNodeDefaults(),
+          updatedAt: Date.now()
+        }
+      };
+      pendingSave = payload;
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(flushPendingSave, 140);
+      return true;
+    } catch (error) {
+      console.warn('Project snapshot creation failed:', error);
+      reportLocalStorageSaveFailure(error);
+      return false;
+    }
   }
 
   function pushUndoSnapshot() {
@@ -920,12 +1260,18 @@
   }
 
   function commitScene(message) {
+    const invalidBookmarkSlots = pruneInvalidCameraBookmarks(scene.nodes);
     pushUndoSnapshot();
     recordTimeline();
     renderScene();
+    updateCameraBookmarksUI();
     saveProject();
     updateActionButtons();
-    if (message) showToast(message);
+    if (invalidBookmarkSlots.length) {
+      showToast(`Закладки ${invalidBookmarkSlots.join(', ')} сброшены: связанный узел удалён`);
+    } else if (message) {
+      showToast(message);
+    }
   }
 
   function updateActionButtons() {
@@ -998,7 +1344,7 @@
       // Legacy project-index entries have no thumbnail projection. Parse their
       // project payload only once, then keep a tiny projection in the cache.
       try {
-        const raw = localStorage.getItem(PROJECT_KEY_PREFIX + projectId);
+        const raw = getStoredProjectRecord(projectId);
         if (!raw || raw.length > 16000000) return null;
         const data = JSON.parse(raw);
         if (!data || typeof data !== 'object' || !data.scene ||
@@ -1302,7 +1648,7 @@
           throw new Error('Не удалось сохранить активный проект перед переименованием');
         }
 
-        const savedRaw = localStorage.getItem(projectKey);
+        const savedRaw = getStoredProjectRecord(id);
         if (!savedRaw) {
           throw new Error('Сохранённый активный проект не найден после записи');
         }
@@ -1314,7 +1660,7 @@
           throw new Error('Не удалось завершить ожидающее сохранение проекта');
         }
 
-        const raw = localStorage.getItem(projectKey);
+        const raw = getStoredProjectRecord(id);
         if (!raw) {
           showToast('Сохранённый проект не найден');
           renderProjectList();
@@ -1330,6 +1676,7 @@
       storedData.title = cleanTitle;
       storedData.updatedAt = updatedAt;
       localStorage.setItem(projectKey, JSON.stringify(storedData));
+      localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + id);
 
       if (localStorage.getItem(STORAGE_PROJECT_ID_KEY) === id) {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(storedData));
@@ -1346,6 +1693,7 @@
         index.unshift(indexItem);
       }
       localStorage.setItem(PROJECT_INDEX_KEY, JSON.stringify(index));
+      localStorage.removeItem(LEGACY_PROJECT_INDEX_KEY);
 
       closeRenameProjectModal();
       renderProjectList();
@@ -1473,6 +1821,9 @@
     projectTitle.value = newTitle; projectStartedAt = Date.now();
     projectNotes = '';
     projectChecklist = [];
+    setTextNodeDefaults(null);
+    cameraState.bookmarks = emptyCameraBookmarks();
+    updateCameraBookmarksUI();
     projectWorkedMs = 0;
     projectSessionStartedAt = Date.now();
     syncProjectNotesPanel();
@@ -1496,7 +1847,7 @@
       if (editingId) finishEditing(editingId, true);
       // Важно сбросить изменения текущего проекта до чтения/переключения на другой.
       flushPendingSave();
-      const raw = localStorage.getItem(PROJECT_KEY_PREFIX + id);
+      const raw = getStoredProjectRecord(id);
       if (!raw) { showToast('Проект не найден'); renderProjectList(); return; }
       const data = JSON.parse(raw);
       validateProjectDataStructure(data);
@@ -1517,6 +1868,9 @@
       projectStartedAt = Number(data.projectStartedAt) || Date.now();
       projectNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
       projectChecklist = sanitizeProjectChecklist(data.checklist);
+      setTextNodeDefaults(data.textNodeDefaults);
+      cameraState.bookmarks = normalizeCameraBookmarks(data.cameraBookmarks, scene.nodes);
+      updateCameraBookmarksUI();
       projectWorkedMs = Math.max(0, Number(data.workedMs) || 0);
       projectSessionStartedAt = Date.now();
       syncProjectNotesPanel();
@@ -1639,7 +1993,7 @@
       // index entry, but preserve an existing stored version of an edited project.
       if (localStorageAvailable) {
         let hasStoredBaseline = false;
-        try { hasStoredBaseline = Boolean(localStorage.getItem(PROJECT_KEY_PREFIX + id)); } catch (_) {}
+        try { hasStoredBaseline = Boolean(getStoredProjectRecord(id)); } catch (_) {}
         if (!hasStoredBaseline) removeProjectRecord(id, false);
       }
     }
@@ -1766,8 +2120,8 @@
     if (window.matchMedia('(max-width: 767px)').matches) return;
     if (sidebar.classList.contains('collapsed') === shouldCollapse) return;
 
-    // Preserve the currently inspected world point while the canvas grows or
-    // contracts. The sidebar text itself stays at a fixed width and slides on GPU.
+    // Preserve the currently inspected world point while the grid track,
+    // sidebar content and exterior toggle animate together for 240 ms.
     if (workspace) {
       sidebarCenterWorldX = (workspace.scrollLeft + workspace.clientWidth / 2) / Math.max(zoom, 0.0001);
     }
@@ -1786,11 +2140,6 @@
       } catch (_) { /* The panel remains usable when storage is unavailable. */ }
     }
 
-    if (sidebarLayoutTimer) window.clearTimeout(sidebarLayoutTimer);
-    sidebarLayoutTimer = window.setTimeout(() => {
-      sidebarLayoutTimer = 0;
-      syncCanvasAfterSidebarTransition();
-    }, 280);
   }
 
   function dismissMobileSidebarFromBackdrop(event) {
@@ -1918,6 +2267,9 @@
         if (activeNode && !String(activeNode.text || '').trim()) {
           scene.nodes = scene.nodes.filter(node => node.id !== activeId);
           scene.edges = scene.edges.filter(edge => edge.from !== activeId && edge.to !== activeId);
+          const invalidBookmarkSlots = pruneInvalidCameraBookmarks(scene.nodes);
+          updateCameraBookmarksUI();
+          if (invalidBookmarkSlots.length) saveProject();
         }
         editingId = null;
         editingOriginalText = null;
@@ -2008,12 +2360,183 @@
     };
   }
   function syncZoomLayout(baseWidth, baseHeight) {
-    stage.style.left = `${CANVAS_PAD * zoom}px`;
-    stage.style.top = `${CANVAS_PAD * zoom}px`;
-    stage.style.transform = `translateZ(0) scale(${zoom})`;
-    world.style.width = `${(baseWidth + CANVAS_PAD * 2) * zoom}px`;
-    world.style.height = `${(baseHeight + CANVAS_PAD * 2) * zoom}px`;
+    const left = `${CANVAS_PAD * zoom}px`;
+    const top = `${CANVAS_PAD * zoom}px`;
+    const transform = `translateZ(0) scale(${zoom})`;
+    const worldWidth = `${(baseWidth + CANVAS_PAD * 2) * zoom}px`;
+    const worldHeight = `${(baseHeight + CANVAS_PAD * 2) * zoom}px`;
+    if (stage.style.left !== left) stage.style.left = left;
+    if (stage.style.top !== top) stage.style.top = top;
+    if (stage.style.transform !== transform) stage.style.transform = transform;
+    if (world.style.width !== worldWidth) world.style.width = worldWidth;
+    if (world.style.height !== worldHeight) world.style.height = worldHeight;
     zoomIndicator.textContent = `${Math.round(zoom * 100)}%`;
+  }
+
+  function getCameraView() {
+    const safeZoom = Math.max(.0001, Number(zoom) || 1);
+    return {
+      x: (workspace.scrollLeft + workspace.clientWidth / 2) / safeZoom - CANVAS_PAD,
+      y: (workspace.scrollTop + workspace.clientHeight / 2) / safeZoom - CANVAS_PAD,
+      zoom: safeZoom
+    };
+  }
+
+  function cancelCameraFlight() {
+    cameraFlightToken += 1;
+    if (cameraFlightRaf) cancelAnimationFrame(cameraFlightRaf);
+    cameraFlightRaf = 0;
+    workspace?.classList.remove('camera-flying');
+  }
+
+  function applyCameraView(centerX, centerY, nextZoom) {
+    const next = clamp(Number(nextZoom) || 1, .25, 2.5);
+    zoom = next;
+    const baseWidth = Math.max(
+      (workspace.clientWidth || 1000) / zoom,
+      1200,
+      Math.ceil(stageContentBounds.maxX + 500)
+    );
+    const baseHeight = Math.max(
+      (workspace.clientHeight || 700) / zoom,
+      800,
+      Math.ceil(stageContentBounds.maxY + 400)
+    );
+    const widthValue = `${baseWidth}px`;
+    const heightValue = `${baseHeight}px`;
+    if (stage.style.width !== widthValue) stage.style.width = widthValue;
+    if (stage.style.height !== heightValue) stage.style.height = heightValue;
+    syncZoomLayout(baseWidth, baseHeight);
+    if (renderedConnectionsSvg) {
+      const svgWidth = String(Math.max(baseWidth, 1));
+      const svgHeight = String(Math.max(baseHeight, 1));
+      if (renderedConnectionsSvg.getAttribute('width') !== svgWidth) renderedConnectionsSvg.setAttribute('width', svgWidth);
+      if (renderedConnectionsSvg.getAttribute('height') !== svgHeight) renderedConnectionsSvg.setAttribute('height', svgHeight);
+    }
+    workspace.scrollLeft = Math.max(0, (centerX + CANVAS_PAD) * zoom - workspace.clientWidth / 2);
+    workspace.scrollTop = Math.max(0, (centerY + CANVAS_PAD) * zoom - workspace.clientHeight / 2);
+    scheduleViewportCulling();
+  }
+
+  function flushPendingCameraInput() {
+    if (pendingViewportPan) flushPendingViewportPan();
+    if (pendingViewportZoom) {
+      const queuedZoom = pendingViewportZoom;
+      pendingViewportZoom = null;
+      applyZoom(queuedZoom.nextZoom, queuedZoom.clientX, queuedZoom.clientY, queuedZoom.anchorWorldPoint);
+    }
+  }
+
+  function updateCameraBookmarksUI() {
+    if (!cameraBookmarksPanel) return;
+    ['1', '2', '3'].forEach(slot => {
+      const item = cameraBookmarksPanel.querySelector(`[data-camera-slot="${slot}"]`);
+      const goButton = item?.querySelector('[data-camera-go]');
+      const clearButton = item?.querySelector('[data-camera-clear]');
+      if (!item || !goButton || !clearButton) return;
+      const bookmark = cameraState.bookmarks[slot];
+      const node = bookmark ? nodeById(bookmark.nodeId) : null;
+      const nodeLabel = node
+        ? (node.type === 'image' ? 'изображение' : (String(node.text || '').trim().replace(/\s+/g, ' ').slice(0, 42) || 'текстовый узел'))
+        : '';
+      item.classList.toggle('is-set', !!bookmark);
+      goButton.classList.toggle('is-set', !!bookmark);
+      goButton.title = bookmark
+        ? `Перейти к закладке ${slot}: ${nodeLabel} (клавиша ${slot})`
+        : `Сохранить обзор в слот ${slot} (Ctrl+${slot})`;
+      goButton.setAttribute('aria-label', bookmark
+        ? `Закладка камеры ${slot} привязана к узлу «${nodeLabel}»: перейти к нему`
+        : `Закладка камеры ${slot} пуста: сохранить обзор`);
+      clearButton.hidden = !bookmark;
+    });
+  }
+
+  function saveCameraBookmark(slot) {
+    const key = String(slot);
+    if (!['1', '2', '3'].includes(key)) return false;
+    cancelCameraFlight();
+    // Consume queued wheel/pinch input so this captures the latest requested view.
+    flushPendingCameraInput();
+    const cameraView = getCameraView();
+    const selectedNode = (selectedId && nodeById(selectedId)) ||
+      [...selectedIds].reverse().map(id => nodeById(id)).find(Boolean) || null;
+    const anchorNode = selectedNode || findNearestCameraBookmarkNode(cameraView);
+    if (!anchorNode) {
+      showToast('На холсте пока нет узлов для привязки закладки');
+      return false;
+    }
+    const center = getCameraBookmarkNodeCenter(anchorNode);
+    cameraState.bookmarks[key] = {
+      x: center.x,
+      y: center.y,
+      zoom: cameraView.zoom,
+      nodeId: anchorNode.id
+    };
+    updateCameraBookmarksUI();
+    saveProject();
+    const label = anchorNode.type === 'image'
+      ? 'изображению'
+      : `«${String(anchorNode.text || '').trim().replace(/\s+/g, ' ').slice(0, 30) || 'узлу'}»`;
+    showToast(`Закладка ${key} привязана к ${label}`);
+    return true;
+  }
+
+  function clearCameraBookmark(slot, message = null) {
+    const key = String(slot);
+    if (!['1', '2', '3'].includes(key) || !cameraState.bookmarks[key]) return false;
+    cancelCameraFlight();
+    cameraState.bookmarks[key] = null;
+    updateCameraBookmarksUI();
+    if (hasProjectContent()) saveProject();
+    else if (currentProjectId) deleteEmptyProject(currentProjectId);
+    showToast(message || `Закладка ${key} очищена`);
+    return true;
+  }
+
+  function flyToCameraBookmark(slot) {
+    const key = String(slot);
+    const target = cameraState.bookmarks[key];
+    if (!target) return false;
+    const anchorNode = target.nodeId ? nodeById(target.nodeId) : null;
+    if (!anchorNode) {
+      clearCameraBookmark(key, `Закладка ${key} сброшена: привязанный узел удалён`);
+      return false;
+    }
+
+    cancelCameraFlight();
+    flushPendingCameraInput();
+    const token = cameraFlightToken;
+    const startView = getCameraView();
+    const anchorCenter = getCameraBookmarkNodeCenter(anchorNode);
+    const targetView = {
+      x: anchorCenter.x,
+      y: anchorCenter.y,
+      zoom: target.zoom
+    };
+    const startedAt = performance.now();
+    workspace.classList.add('camera-flying');
+    const reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const duration = reducedMotion ? 140 : 760;
+    const easeOutCubic = progress => 1 - Math.pow(1 - progress, 3);
+
+    const animate = now => {
+      if (token !== cameraFlightToken) return;
+      const progress = clamp((now - startedAt) / duration, 0, 1);
+      const eased = easeOutCubic(progress);
+      const x = startView.x + (targetView.x - startView.x) * eased;
+      const y = startView.y + (targetView.y - startView.y) * eased;
+      const nextZoom = startView.zoom + (targetView.zoom - startView.zoom) * eased;
+      applyCameraView(x, y, progress >= 1 ? targetView.zoom : nextZoom);
+      if (progress < 1) {
+        cameraFlightRaf = requestAnimationFrame(animate);
+      } else {
+        cameraFlightRaf = 0;
+        workspace.classList.remove('camera-flying');
+      }
+    };
+
+    cameraFlightRaf = requestAnimationFrame(animate);
+    return true;
   }
   function scheduleViewportFrame() {
     if (isTicking) return;
@@ -2463,6 +2986,114 @@
     }, Math.max(0, timeout));
   }
 
+  // Insert clipboard/drag text as text nodes only. Never let the browser parse
+  // clipboard HTML inside the editable graph node (DOM-XSS protection).
+  function getEditorSelectionRange(editor) {
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount) {
+      const currentRange = selection.getRangeAt(0);
+      if (editor.contains(currentRange.commonAncestorContainer)) return currentRange.cloneRange();
+    }
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    return range;
+  }
+
+  function getEditorDropRange(editor, clientX, clientY) {
+    let range = null;
+    if (typeof document.caretRangeFromPoint === 'function') {
+      range = document.caretRangeFromPoint(clientX, clientY);
+    } else if (typeof document.caretPositionFromPoint === 'function') {
+      const position = document.caretPositionFromPoint(clientX, clientY);
+      if (position) {
+        range = document.createRange();
+        range.setStart(position.offsetNode, position.offset);
+        range.collapse(true);
+      }
+    }
+    if (range && editor.contains(range.startContainer)) return range;
+    return getEditorSelectionRange(editor);
+  }
+
+  function insertPlainTextIntoEditor(editor, value, inputType, range = null) {
+    if (!(editor instanceof HTMLElement) || !editor.matches('.node-text[contenteditable="true"]')) return false;
+    const text = String(value ?? '').replace(/\r\n?/g, '\n');
+    if (!text) return false;
+
+    const insertionRange = range || getEditorSelectionRange(editor);
+    if (!editor.contains(insertionRange.commonAncestorContainer) && insertionRange.commonAncestorContainer !== editor) {
+      return false;
+    }
+
+    insertionRange.deleteContents();
+    const fragment = document.createDocumentFragment();
+    const lines = text.split('\n');
+    let lastInserted = null;
+    lines.forEach((line, index) => {
+      if (line) {
+        lastInserted = document.createTextNode(line);
+        fragment.appendChild(lastInserted);
+      }
+      if (index < lines.length - 1) {
+        lastInserted = document.createElement('br');
+        fragment.appendChild(lastInserted);
+      }
+    });
+    if (!lastInserted) return false;
+
+    insertionRange.insertNode(fragment);
+    insertionRange.setStartAfter(lastInserted);
+    insertionRange.collapse(true);
+    const selection = window.getSelection();
+    if (selection) {
+      selection.removeAllRanges();
+      selection.addRange(insertionRange);
+    }
+
+    // A synthetic input event keeps the existing model-sync/save listener in use.
+    // The inserted fragment contains only Text and BR nodes, never parsed HTML.
+    let inputEvent;
+    try {
+      inputEvent = new InputEvent('input', {
+        bubbles: true,
+        inputType: inputType || 'insertText',
+        data: text
+      });
+    } catch (_) {
+      inputEvent = new Event('input', { bubbles: true });
+    }
+    editor.dispatchEvent(inputEvent);
+    return true;
+  }
+
+  function bindSafeEditorTransferHandlers(editor) {
+    editor.addEventListener('paste', event => {
+      // Cancel native rich-HTML insertion even when the clipboard has no plain-text fallback.
+      event.preventDefault();
+      const clipboard = event.clipboardData;
+      const plainText = clipboard ? clipboard.getData('text/plain') : '';
+      if (plainText) insertPlainTextIntoEditor(editor, plainText, 'insertFromPaste');
+    });
+
+    editor.addEventListener('dragover', event => {
+      // Make text drops available, while disabling the browser's native HTML drop behavior.
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    });
+
+    editor.addEventListener('drop', event => {
+      // Never allow dropped text/html or files to be interpreted as editable DOM markup.
+      event.preventDefault();
+      const transfer = event.dataTransfer;
+      if (!transfer) return;
+      const plainText = transfer.getData('text/plain') || transfer.getData('text');
+      if (!plainText) return;
+      const range = getEditorDropRange(editor, event.clientX, event.clientY);
+      insertPlainTextIntoEditor(editor, plainText, 'insertFromDrop', range);
+    });
+  }
+
   function appendTextWithLinks(container, value) {
     const text = String(value ?? '');
     const urlPattern = /(?:https?:\/\/|www\.)[^\s<>\"']+/gi;
@@ -2855,6 +3486,7 @@
           textSpan.style.setProperty('-webkit-touch-callout', 'default');
           textSpan.setAttribute('role', 'textbox');
           textSpan.setAttribute('aria-label', 'Текстовый узел');
+          bindSafeEditorTransferHandlers(textSpan);
           textSpan?.addEventListener('input', () => {
             const target = nodeById(targetId);
             const liveText = textSpan.innerText.replace(/\r/g, '').replace(/\n+$/, '');
@@ -3202,8 +3834,8 @@
       color: '#111111',
       underline: false,
       highlight: false,
-      framed: false,
-      borderColor: '#111111'
+      framed: defaultTextNodeHasBorder,
+      borderColor: defaultTextNodeBorderColor
     };
 
     scene.nodes.push(n);
@@ -3279,7 +3911,9 @@
     if (save && n && n.text.trim()) {
       commitScene();
     } else {
-      renderScene(); saveProject(); updateActionButtons();
+      const invalidBookmarkSlots = pruneInvalidCameraBookmarks(scene.nodes);
+      renderScene(); updateCameraBookmarksUI(); saveProject(); updateActionButtons();
+      if (invalidBookmarkSlots.length) showToast(`Закладки ${invalidBookmarkSlots.join(', ')} сброшены: связанный узел удалён`);
     }
   }
 
@@ -4292,15 +4926,21 @@
     if (editingId) finishEditing(editingId, true);
     undoIndex--;
     scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
-    recordTimeline(); renderScene(); saveProject(); updateActionButtons();
-    showToast('Действие отменено');
+    const invalidBookmarkSlots = pruneInvalidCameraBookmarks(scene.nodes);
+    recordTimeline(); renderScene(); updateCameraBookmarksUI(); saveProject(); updateActionButtons();
+    showToast(invalidBookmarkSlots.length
+      ? `Закладки ${invalidBookmarkSlots.join(', ')} сброшены: связанный узел отсутствует в этой версии схемы`
+      : 'Действие отменено');
   }
   function redo() {
     if (presentationMode || undoIndex >= undoStack.length - 1 || playback.active) return;
     undoIndex++;
     scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
-    recordTimeline(); renderScene(); saveProject(); updateActionButtons();
-    showToast('Действие повторено');
+    const invalidBookmarkSlots = pruneInvalidCameraBookmarks(scene.nodes);
+    recordTimeline(); renderScene(); updateCameraBookmarksUI(); saveProject(); updateActionButtons();
+    showToast(invalidBookmarkSlots.length
+      ? `Закладки ${invalidBookmarkSlots.join(', ')} сброшены: связанный узел отсутствует в этой версии схемы`
+      : 'Действие повторено');
   }
 
   function openImageFilePicker(point = pendingImagePoint) {
@@ -4595,6 +5235,14 @@
       const borderColor = /^#[0-9a-f]{6}$/i.test(String(n.borderColor || ''))
         ? n.borderColor.toLowerCase()
         : '#111111';
+      const defaultsChanged = defaultTextNodeHasBorder !== framed || defaultTextNodeBorderColor !== borderColor;
+
+      // The bulk action defines the style for future text nodes as well as
+      // applying it to the current scene. A per-node frame toggle/color change
+      // never reaches this assignment and therefore stays local to that node.
+      defaultTextNodeHasBorder = framed;
+      defaultTextNodeBorderColor = borderColor;
+
       let changedCount = 0;
       scene.nodes.forEach(node => {
         if (node.type === 'image') return;
@@ -4604,12 +5252,15 @@
           changedCount += 1;
         }
       });
-      if (!changedCount) {
+      if (!changedCount && !defaultsChanged) {
         showToast('Оформление уже применено ко всем текстовым узлам');
         updateNodeContextMenu();
         return;
       }
-      commitScene(framed ? 'Рамка применена ко всем текстовым узлам' : 'Рамки удалены со всех текстовых узлов');
+      const message = changedCount
+        ? (framed ? 'Рамка применена ко всем текстовым узлам' : 'Рамки удалены со всех текстовых узлов')
+        : (framed ? 'Рамка по умолчанию включена для новых текстовых узлов' : 'Рамка по умолчанию выключена для новых текстовых узлов');
+      commitScene(message);
       updateNodeContextMenu();
       return;
     } else if (action === 'delete') {
@@ -4945,7 +5596,9 @@
       projectStartedAt,
       workedMs: currentProjectWorkedMs(),
       notes: projectNotes,
-      checklist: clone(projectChecklist)
+      checklist: clone(projectChecklist),
+      cameraBookmarks: clone(cameraState.bookmarks),
+      textNodeDefaults: getTextNodeDefaults()
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -5024,6 +5677,94 @@
     return result.length ? result : [''];
   }
 
+  function createFallbackExportNodeMetrics(node, measureContext = null) {
+    const finitePositive = value => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    };
+    const fontSize = clamp(finitePositive(node.fontSize) || 16, 8, 256);
+    const lineHeight = Math.max(fontSize, fontSize * 1.28);
+    const fontFamily = 'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
+    const fontWeight = '720';
+    const fontStyle = 'normal';
+    const fontVariant = 'normal';
+    const fontKerning = 'auto';
+    const letterSpacing = -0.25;
+
+    if (node.type === 'image') {
+      const width = finitePositive(node.width) || 360;
+      const aspectRatio = finitePositive(node.aspectRatio);
+      const height = finitePositive(node.height) || (aspectRatio ? width / aspectRatio : 240);
+      return {
+        width: Math.max(10, width), height: Math.max(10, height),
+        paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 0,
+        borderLeft: 0, borderRight: 0, borderTop: 0, borderBottom: 0,
+        contentWidth: Math.max(1, width), fontSize, lineHeight, letterSpacing,
+        fontFamily, fontWeight, fontStyle, fontVariant, fontKerning
+      };
+    }
+
+    const mobileOuterMax = getMobileTextNodeMaxWidth();
+    const horizontalPadding = mobileOuterMax ? 14 : 12;
+    const verticalPadding = 10;
+    const border = node.framed === true ? 1.5 : 1;
+    const horizontalExtras = horizontalPadding * 2 + border * 2;
+    const verticalExtras = verticalPadding * 2 + border * 2;
+    const modelWidth = finitePositive(node.width);
+    const modelHeight = finitePositive(node.height);
+    const isFixedSize = node.autoSize === false;
+
+    let contentWidth = 0;
+    if (mobileOuterMax) {
+      const mobileNodeOuterWidth = isFixedSize && modelWidth >= 10
+        ? Math.min(modelWidth, mobileOuterMax)
+        : mobileOuterMax;
+      contentWidth = Math.max(40, mobileNodeOuterWidth - horizontalExtras);
+    } else if (isFixedSize && modelWidth >= horizontalExtras + 10) {
+      contentWidth = modelWidth - horizontalExtras;
+    } else if (measureContext) {
+      measureContext.font = `${fontStyle} ${fontVariant} ${fontWeight} ${fontSize}px ${fontFamily}`;
+      if ('fontKerning' in measureContext) measureContext.fontKerning = fontKerning;
+      if ('letterSpacing' in measureContext) measureContext.letterSpacing = `${letterSpacing}px`;
+      const paragraphs = String(node.text || '').replace(/\r\n?/g, '\n').split('\n');
+      contentWidth = Math.max(fontSize * 0.65, ...paragraphs.map(line => measureContext.measureText(line || ' ').width));
+    } else {
+      contentWidth = Math.max(fontSize * 0.65, Math.min(960, modelWidth || 360) - horizontalExtras);
+    }
+
+    if (measureContext) {
+      measureContext.font = `${fontStyle} ${fontVariant} ${fontWeight} ${fontSize}px ${fontFamily}`;
+      if ('fontKerning' in measureContext) measureContext.fontKerning = fontKerning;
+      if ('letterSpacing' in measureContext) measureContext.letterSpacing = `${letterSpacing}px`;
+    }
+
+    const fallbackText = String(node.text || '');
+    const lines = measureContext
+      ? wrapCanvasText(measureContext, fallbackText, contentWidth)
+      : fallbackText.split(/\r\n?|\n/);
+    const measuredLineWidth = measureContext
+      ? Math.max(fontSize * 0.65, ...lines.map(line => measureContext.measureText(line || ' ').width))
+      : Math.max(fontSize * 0.65, ...lines.map(line => Array.from(line || ' ').length * fontSize * 0.55));
+
+    const width = isFixedSize && modelWidth >= 10
+      ? Math.min(mobileOuterMax || Infinity, modelWidth)
+      : Math.max(10, Math.min(mobileOuterMax || Infinity, measuredLineWidth + horizontalExtras));
+    const estimatedHeight = Math.max(1, lines.length) * lineHeight + verticalExtras;
+    // Text nodes have auto height even when their width was manually fixed;
+    // retain a larger known model height only as an additional safety fallback.
+    const height = Math.max(estimatedHeight, modelHeight > 10 ? modelHeight : 0);
+
+    return {
+      width, height,
+      paddingLeft: horizontalPadding, paddingRight: horizontalPadding,
+      paddingTop: verticalPadding, paddingBottom: verticalPadding,
+      borderLeft: border, borderRight: border, borderTop: border, borderBottom: border,
+      contentWidth: Math.max(1, width - horizontalExtras),
+      fontSize, lineHeight, letterSpacing,
+      fontFamily, fontWeight, fontStyle, fontVariant, fontKerning
+    };
+  }
+
   async function exportPng(format = 'png') {
     exportScreen.classList.remove('visible');
     if (editingId) finishEditing(editingId, true);
@@ -5034,6 +5775,11 @@
         await document.fonts.ready;
       }
 
+      // Rebuild the live scene after fonts are ready. This guarantees every
+      // current node has a fresh, connected DOM element and current layout
+      // metrics before export reads renderedNodeElements.
+      renderScene(scene);
+      void stage.offsetWidth;
       const PADDING = 100;             // итоговые пиксели с каждой стороны
       // Export scale maps graph/CSS pixels directly to output pixels. Do not
       // multiply by window.devicePixelRatio: this keeps DPR-independent sizing
@@ -5058,29 +5804,35 @@
         return Number.isFinite(parsed) ? parsed : fallback;
       };
       const exportNodeMetrics = new Map();
+      const fallbackMeasureCanvas = document.createElement('canvas');
+      const fallbackMeasureContext = fallbackMeasureCanvas.getContext('2d');
       nodes.forEach(node => {
         const element = renderedNodeElements.get(node.id);
-        const textElement = element && element.querySelector('.node-text');
-        const elementStyle = element ? window.getComputedStyle(element) : null;
+        const isLiveElement = !!(element && element.isConnected && element.parentElement === stage);
+        const textElement = isLiveElement ? element.querySelector('.node-text') : null;
+        const elementStyle = isLiveElement ? window.getComputedStyle(element) : null;
         const textStyle = textElement ? window.getComputedStyle(textElement) : elementStyle;
-        const width = Math.max(10, Number(element && element.offsetWidth) || Number(node.width) || 10);
-        const height = Math.max(10, Number(element && element.offsetHeight) || Number(node.height) || 10);
-        const paddingLeft = elementStyle ? parseCssPixels(elementStyle.paddingLeft, 14) : 14;
-        const paddingRight = elementStyle ? parseCssPixels(elementStyle.paddingRight, 14) : 14;
-        const paddingTop = elementStyle ? parseCssPixels(elementStyle.paddingTop, 10) : 10;
-        const paddingBottom = elementStyle ? parseCssPixels(elementStyle.paddingBottom, 10) : 10;
-        const borderLeft = elementStyle ? parseCssPixels(elementStyle.borderLeftWidth, 1) : 1;
-        const borderRight = elementStyle ? parseCssPixels(elementStyle.borderRightWidth, 1) : 1;
-        const borderTop = elementStyle ? parseCssPixels(elementStyle.borderTopWidth, 1) : 1;
-        const borderBottom = elementStyle ? parseCssPixels(elementStyle.borderBottomWidth, 1) : 1;
-        const fontSize = textStyle ? parseCssPixels(textStyle.fontSize, Number(node.fontSize) || 16) : (Number(node.fontSize) || 16);
-        const computedLineHeight = textStyle ? parseCssPixels(textStyle.lineHeight, fontSize * 1.28) : fontSize * 1.28;
+        const fallback = createFallbackExportNodeMetrics(node, fallbackMeasureContext);
+        const liveWidth = isLiveElement ? Number(element.offsetWidth) : 0;
+        const liveHeight = isLiveElement ? Number(element.offsetHeight) : 0;
+        const width = liveWidth > 0 ? liveWidth : fallback.width;
+        const height = liveHeight > 0 ? liveHeight : fallback.height;
+        const paddingLeft = elementStyle ? parseCssPixels(elementStyle.paddingLeft, fallback.paddingLeft) : fallback.paddingLeft;
+        const paddingRight = elementStyle ? parseCssPixels(elementStyle.paddingRight, fallback.paddingRight) : fallback.paddingRight;
+        const paddingTop = elementStyle ? parseCssPixels(elementStyle.paddingTop, fallback.paddingTop) : fallback.paddingTop;
+        const paddingBottom = elementStyle ? parseCssPixels(elementStyle.paddingBottom, fallback.paddingBottom) : fallback.paddingBottom;
+        const borderLeft = elementStyle ? parseCssPixels(elementStyle.borderLeftWidth, fallback.borderLeft) : fallback.borderLeft;
+        const borderRight = elementStyle ? parseCssPixels(elementStyle.borderRightWidth, fallback.borderRight) : fallback.borderRight;
+        const borderTop = elementStyle ? parseCssPixels(elementStyle.borderTopWidth, fallback.borderTop) : fallback.borderTop;
+        const borderBottom = elementStyle ? parseCssPixels(elementStyle.borderBottomWidth, fallback.borderBottom) : fallback.borderBottom;
+        const fontSize = textStyle ? parseCssPixels(textStyle.fontSize, fallback.fontSize) : fallback.fontSize;
+        const computedLineHeight = textStyle ? parseCssPixels(textStyle.lineHeight, fallback.lineHeight) : fallback.lineHeight;
         const letterSpacing = textStyle && textStyle.letterSpacing !== 'normal'
-          ? parseCssPixels(textStyle.letterSpacing, -0.25)
-          : -0.25;
+          ? parseCssPixels(textStyle.letterSpacing, fallback.letterSpacing)
+          : fallback.letterSpacing;
         exportNodeMetrics.set(node.id, {
-          width,
-          height,
+          width: Math.max(10, width),
+          height: Math.max(10, height),
           paddingLeft,
           paddingRight,
           paddingTop,
@@ -5093,11 +5845,11 @@
           fontSize: Math.max(1, fontSize),
           lineHeight: Math.max(1, computedLineHeight),
           letterSpacing,
-          fontFamily: textStyle ? textStyle.fontFamily : 'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
-          fontWeight: textStyle ? textStyle.fontWeight : '720',
-          fontStyle: textStyle ? textStyle.fontStyle : 'normal',
-          fontVariant: textStyle ? textStyle.fontVariant : 'normal',
-          fontKerning: textStyle ? textStyle.fontKerning : 'auto'
+          fontFamily: textStyle ? textStyle.fontFamily : fallback.fontFamily,
+          fontWeight: textStyle ? textStyle.fontWeight : fallback.fontWeight,
+          fontStyle: textStyle ? textStyle.fontStyle : fallback.fontStyle,
+          fontVariant: textStyle ? textStyle.fontVariant : fallback.fontVariant,
+          fontKerning: textStyle ? textStyle.fontKerning : fallback.fontKerning
         });
       });
 
@@ -5288,29 +6040,21 @@
       nodes.forEach(node => {
         if (node.type === 'image') {
           const imageEl = imageAssets.get(node.id);
+          const imageMetrics = exportNodeMetrics.get(node.id) ||
+            createFallbackExportNodeMetrics(node, fallbackMeasureContext);
           if (imageEl) {
             ctx.drawImage(
               imageEl,
               tx + (Number(node.x) || 0) * scale,
               ty + (Number(node.y) || 0) * scale,
-              Math.max(1, Number(node.width) || imageEl.naturalWidth) * scale,
-              Math.max(1, Number(node.height) || imageEl.naturalHeight) * scale
+              Math.max(10, imageMetrics.width) * scale,
+              Math.max(10, imageMetrics.height) * scale
             );
           }
           return;
         }
-        const metrics = exportNodeMetrics.get(node.id) || {
-          width: Number(node.width) || 10,
-          height: Number(node.height) || 10,
-          paddingLeft: 14, paddingRight: 14, paddingTop: 10, paddingBottom: 10,
-          borderLeft: 1, borderRight: 1, borderTop: 1, borderBottom: 1,
-          contentWidth: Math.max(1, (Number(node.width) || 10) - 30),
-          fontSize: Number(node.fontSize) || 16,
-          lineHeight: (Number(node.fontSize) || 16) * 1.28,
-          letterSpacing: -0.25,
-          fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
-          fontWeight: '720', fontStyle: 'normal', fontVariant: 'normal', fontKerning: 'auto'
-        };
+        const metrics = exportNodeMetrics.get(node.id) ||
+          createFallbackExportNodeMetrics(node, fallbackMeasureContext);
         const fontSize = Math.max(1, metrics.fontSize) * scale;
         ctx.font = `${metrics.fontStyle} ${metrics.fontVariant} ${metrics.fontWeight} ${fontSize}px ${metrics.fontFamily}`;
         if ('fontKerning' in ctx && metrics.fontKerning) ctx.fontKerning = metrics.fontKerning;
@@ -5440,6 +6184,8 @@
         const importedProjectStartedAt = Number(data.projectStartedAt) || Date.now();
         const importedNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
         const importedChecklist = sanitizeProjectChecklist(data.checklist);
+        const importedCameraBookmarksData = data.cameraBookmarks;
+        const importedTextNodeDefaults = normalizeTextNodeDefaults(data.textNodeDefaults);
         const importedWorkedMs = Math.max(0, Number(data.workedMs) || 0);
 
         // Commit the previous project while its image cache is still available.
@@ -5470,6 +6216,9 @@
         projectStartedAt = importedProjectStartedAt;
         projectNotes = importedNotes;
         projectChecklist = importedChecklist;
+        setTextNodeDefaults(importedTextNodeDefaults);
+        cameraState.bookmarks = normalizeCameraBookmarks(importedCameraBookmarksData, scene.nodes);
+        updateCameraBookmarksUI();
         projectWorkedMs = importedWorkedMs;
         projectSessionStartedAt = Date.now();
         syncProjectNotesPanel();
@@ -6219,6 +6968,7 @@
 
   workspace?.addEventListener('wheel', event => {
     if (playback.active) return;
+    cancelCameraFlight();
     event.preventDefault();
     // Keep the coordinate frame stable until a drag/link gesture is released.
     if (drag || linkDraft) return;
@@ -6282,11 +7032,10 @@
     startPan(event);
   }, { passive: false });
   document.getElementById('app')?.addEventListener('transitionend', event => {
+    // Grid is the layout clock for the desktop sidebar. Its transitionend fires
+    // only after the workspace reaches its final width; stage/SVG bounds and the
+    // camera center are synchronized once against that settled viewport.
     if (event.target !== event.currentTarget || event.propertyName !== 'grid-template-columns') return;
-    if (sidebarLayoutTimer) {
-      window.clearTimeout(sidebarLayoutTimer);
-      sidebarLayoutTimer = 0;
-    }
     syncCanvasAfterSidebarTransition();
   });
   sidebarToggle?.addEventListener('click', () => {
@@ -6319,7 +7068,18 @@
   document.getElementById('exportBtn')?.addEventListener('click', exportProject);
   presentationModeBtn?.addEventListener('click', enterPresentationMode);
   presentationExitBtn?.addEventListener('click', exitPresentationMode);
-  document.getElementById('themeToggleBtn')?.addEventListener('click', () => applyTheme(document.body.classList.contains('dark-theme') ? 'light' : 'dark'));
+  const themeToggleButton = document.getElementById('themeToggleBtn');
+  themeToggleButton?.addEventListener('click', () => applyTheme(document.body.classList.contains('dark-theme') ? 'light' : 'dark'));
+  // Space is reserved for canvas/workspace interactions. Do not allow the
+  // browser's native button activation (which normally fires on keyup) to
+  // toggle the theme when this control keeps keyboard focus after a click.
+  const preventThemeButtonSpaceActivation = event => {
+    if (event.code !== 'Space' && event.key !== ' ') return;
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  themeToggleButton?.addEventListener('keydown', preventThemeButtonSpaceActivation, true);
+  themeToggleButton?.addEventListener('keyup', preventThemeButtonSpaceActivation, true);
   document.getElementById('exportJsonBtn')?.addEventListener('click', exportProjectJSON);
   document.getElementById('cancelPngExportBtn')?.addEventListener('click', () => exportScreen.classList.remove('visible'));
   document.getElementById('downloadPngBtn')?.addEventListener('click', () => {
@@ -6413,6 +7173,40 @@
       event.stopImmediatePropagation();
     }
   });
+  cameraBookmarkHintToggle?.addEventListener('click', () => {
+    const isExpanded = cameraBookmarkHintToggle.getAttribute('aria-expanded') !== 'true';
+    cameraBookmarkHintToggle.setAttribute('aria-expanded', String(isExpanded));
+    cameraBookmarkHintToggle.setAttribute(
+      'aria-label',
+      isExpanded ? 'Скрыть горячие клавиши закладок камеры' : 'Показать горячие клавиши закладок камеры'
+    );
+    cameraBookmarkHintToggle.title = isExpanded ? 'Скрыть горячие клавиши' : 'Показать горячие клавиши';
+    cameraBookmarkHint?.classList.toggle('is-expanded', isExpanded);
+    cameraBookmarkHint?.setAttribute('aria-hidden', String(!isExpanded));
+  });
+
+  cameraBookmarksPanel?.addEventListener('click', event => {
+    const clearButton = event.target.closest('[data-camera-clear]');
+    if (clearButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      clearCameraBookmark(clearButton.dataset.cameraClear);
+      return;
+    }
+    const goButton = event.target.closest('[data-camera-go]');
+    if (!goButton) return;
+    event.preventDefault();
+    const slot = goButton.dataset.cameraGo;
+    if (cameraState.bookmarks[slot]) flyToCameraBookmark(slot);
+    else saveCameraBookmark(slot);
+  });
+
+  // Direct canvas interaction takes control away from an in-progress camera flight.
+  workspace?.addEventListener('pointerdown', event => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target || !target.closest('.camera-bookmarks')) cancelCameraFlight();
+  }, { capture: true });
+
   document.getElementById('clearBtn')?.addEventListener('click', () => openConfirm('Очистить рабочее поле?', 'Все узлы и связи будут удалены из текущей схемы. Это действие можно отменить.', 'Очистить', () => {
     if (playback.active) exitPlayback();
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
@@ -6572,6 +7366,19 @@
       return;
     }
     if (inTextField) return;
+    if (!startScreen.classList.contains('visible') && !event.altKey) {
+      const numberKey = ({ Digit1: '1', Digit2: '2', Digit3: '3', Numpad1: '1', Numpad2: '2', Numpad3: '3' })[event.code];
+      if (numberKey && (event.ctrlKey || event.metaKey) && !event.shiftKey) {
+        event.preventDefault();
+        saveCameraBookmark(numberKey);
+        return;
+      }
+      if (numberKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && cameraState.bookmarks[numberKey]) {
+        event.preventDefault();
+        flyToCameraBookmark(numberKey);
+        return;
+      }
+    }
     // Физическая клавиша работает одинаково при русской и английской раскладке.
     if ((event.ctrlKey || event.metaKey) && (event.code === 'KeyZ' || event.key.toLowerCase() === 'z')) {
       event.preventDefault(); if (event.shiftKey) redo(); else undo(); return;
@@ -6647,6 +7454,7 @@
     localStorageAvailable = true;
   } catch (_) { localStorageAvailable = false; }
   if (localStorageAvailable) {
+    migrateLegacyNetNorthStorage();
     migrateLegacyProject();
     try {
       applyTheme(localStorage.getItem(THEME_KEY) || 'light', false);
@@ -6664,6 +7472,7 @@
   }
   updateProjectViewSwitcher();
   updateAutoArrangeChoice();
+  updateCameraBookmarksUI();
   scene = freshScene();
   projectTitle.value = 'Новая схема';
   projectStartedAt = Date.now();

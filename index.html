@@ -71,6 +71,40 @@
     <button class="tool-button" id="importBtn" title="Открыть ранее экспортированный проект">
       <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M12 14V3m-4 4 4-4 4 4M5 14v6h14v-6"/></svg></span><span class="label">Импорт проекта</span>
     </button>
+    <div class="sidebar-separator"></div>
+    <div class="section-label">ЗАКЛАДКИ КАМЕРЫ</div>
+    <div class="camera-control-rail" id="cameraControlRail" aria-label="Управление закладками камеры">
+      <div class="camera-bookmarks" id="cameraBookmarks" role="group" aria-label="Закладки камеры">
+        <div class="camera-bookmark-item" data-camera-slot="1">
+          <button type="button" class="camera-bookmark-go" data-camera-go="1" title="Сохранить обзор в слот 1 (Ctrl+1)" aria-label="Закладка камеры 1 пуста: сохранить обзор">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-3.8-6 3.8z"/></svg><span>1</span><i class="camera-bookmark-status" aria-hidden="true"></i>
+          </button>
+          <button type="button" class="camera-bookmark-clear" data-camera-clear="1" aria-label="Очистить закладку 1" title="Очистить закладку 1" hidden>×</button>
+        </div>
+        <div class="camera-bookmark-item" data-camera-slot="2">
+          <button type="button" class="camera-bookmark-go" data-camera-go="2" title="Сохранить обзор в слот 2 (Ctrl+2)" aria-label="Закладка камеры 2 пуста: сохранить обзор">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-3.8-6 3.8z"/></svg><span>2</span><i class="camera-bookmark-status" aria-hidden="true"></i>
+          </button>
+          <button type="button" class="camera-bookmark-clear" data-camera-clear="2" aria-label="Очистить закладку 2" title="Очистить закладку 2" hidden>×</button>
+        </div>
+        <div class="camera-bookmark-item" data-camera-slot="3">
+          <button type="button" class="camera-bookmark-go" data-camera-go="3" title="Сохранить обзор в слот 3 (Ctrl+3)" aria-label="Закладка камеры 3 пуста: сохранить обзор">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-3.8-6 3.8z"/></svg><span>3</span><i class="camera-bookmark-status" aria-hidden="true"></i>
+          </button>
+          <button type="button" class="camera-bookmark-clear" data-camera-clear="3" aria-label="Очистить закладку 3" title="Очистить закладку 3" hidden>×</button>
+        </div>
+      </div>
+      <button type="button" class="camera-bookmark-hint-toggle" id="cameraBookmarkHintToggle"
+        aria-expanded="false" aria-controls="cameraBookmarkHint"
+        aria-label="Показать горячие клавиши закладок камеры" title="Показать горячие клавиши">
+        <svg class="camera-bookmark-hint-toggle-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9.5 5 5 5-5"/></svg>
+      </button>
+      <div class="camera-bookmark-hint" id="cameraBookmarkHint" role="note"
+        aria-label="Горячие клавиши закладок камеры" aria-hidden="true">
+        <div class="camera-bookmark-hint-row"><kbd>Ctrl + 1 / 2 / 3</kbd><span>Сохранить обзор</span></div>
+        <div class="camera-bookmark-hint-row"><kbd>1 / 2 / 3</kbd><span>Перейти к узлу</span></div>
+      </div>
+    </div>
     <div class="sidebar-spacer"></div>
     <div class="sidebar-bottom">
       <button class="tool-button" id="clearBtn" title="Очистить рабочее поле">
@@ -97,7 +131,6 @@
       <span>Удерживайте: выделение · Двойной тап: текст или изображение</span>
     </div>
     <div class="mode-indicator" id="modeIndicator"></div>
-    <div class="zoom-indicator" id="zoomIndicator">100%</div>
     <div class="context-menu" id="nodeContextMenu" role="menu" aria-label="Контекстное меню NetNorth">
       <div id="canvasContextActions" hidden>
         <button class="context-item" data-canvas-action="create-text" role="menuitem">Создать текстовый узел</button>
@@ -161,6 +194,7 @@
       <input type="range" id="playbackRange" class="playback-track" min="0" max="1000" value="0" aria-label="Позиция воспроизведения">
       <div class="playback-bottom"><span id="playbackTime">0:00</span><span id="playbackStep">Шаг 1</span></div>
     </div>
+    <div class="zoom-indicator" id="zoomIndicator" aria-label="Текущий масштаб">100%</div>
     <div class="modal-backdrop" id="modalBackdrop">
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
         <h2 id="modalTitle">Очистить рабочее поле?</h2>
