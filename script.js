@@ -19,8 +19,14 @@
   const LEGACY_EMPTY_HINT_DISMISSED_KEY = 'netnotrh_empty_hint_dismissed_v1';
   const PROJECT_VIEW_KEY = 'netnorth_projects_view_v1';
   const SIDEBAR_COLLAPSED_KEY = 'netnorth_sidebar_collapsed_v1';
-  // Keep a safety margin below the smallest commonly encountered localStorage quota.
-  const LOCAL_STORAGE_SAFE_LIMIT_BYTES = 4.5 * 1024 * 1024;
+  const PROJECT_DB_NAME = 'netnorth_db';
+  const PROJECT_DB_VERSION = 1;
+  const PROJECT_DB_STORE = 'projects';
+  let projectDatabasePromise = null;
+  let projectStorageMigrationPromise = Promise.resolve();
+  let activeSavePromise = null;
+  let activeSavedProjectId = null;
+  let activeSavedProjectData = null;
   let lastLocalSaveErrorToastAt = 0;
   let presentationMode = false;
   let presentationPreviousState = null;
@@ -844,9 +850,140 @@
     });
   }
 
+  function openProjectDatabase() {
+    if (!window.indexedDB) return Promise.reject(new Error('IndexedDB is not available'));
+    if (projectDatabasePromise) return projectDatabasePromise;
+
+    const opening = new Promise((resolve, reject) => {
+      let request;
+      try {
+        request = window.indexedDB.open(PROJECT_DB_NAME, PROJECT_DB_VERSION);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(PROJECT_DB_STORE)) {
+          database.createObjectStore(PROJECT_DB_STORE, { keyPath: 'key' });
+        }
+      };
+      request.onsuccess = () => {
+        const database = request.result;
+        database.onversionchange = () => database.close();
+        resolve(database);
+      };
+      request.onerror = () => reject(request.error || new Error('Could not open the project database'));
+      request.onblocked = () => reject(new Error('The project database is blocked by another tab'));
+    });
+
+    projectDatabasePromise = opening.catch(error => {
+      projectDatabasePromise = null;
+      throw error;
+    });
+    return projectDatabasePromise;
+  }
+
+  function runProjectDbTransaction(mode, createRequest) {
+    return openProjectDatabase().then(database => new Promise((resolve, reject) => {
+      let transaction;
+      let request;
+      let result;
+      let settled = false;
+      const fail = error => {
+        if (settled) return;
+        settled = true;
+        reject(error || new Error('Project database transaction failed'));
+      };
+
+      try {
+        transaction = database.transaction(PROJECT_DB_STORE, mode);
+        const store = transaction.objectStore(PROJECT_DB_STORE);
+        request = createRequest(store);
+        if (request) {
+          request.onsuccess = () => { result = request.result; };
+          request.onerror = () => fail(request.error);
+        }
+        transaction.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          resolve(result);
+        };
+        transaction.onerror = () => fail(transaction.error);
+        transaction.onabort = () => fail(transaction.error || new Error('Project database transaction was aborted'));
+      } catch (error) {
+        fail(error);
+      }
+    }));
+  }
+
+  function projectRecordKey(id) {
+    return PROJECT_KEY_PREFIX + String(id);
+  }
+
+  async function readProjectDataFromIndexedDB(id) {
+    const record = await runProjectDbTransaction('readonly', store => store.get(projectRecordKey(id)));
+    return record && record.data && typeof record.data === 'object' ? record.data : null;
+  }
+
+  async function putProjectDataInIndexedDB(id, data) {
+    await runProjectDbTransaction('readwrite', store => store.put({
+      key: projectRecordKey(id),
+      id: String(id),
+      data,
+      updatedAt: Number(data && data.updatedAt) || Date.now()
+    }));
+    return true;
+  }
+
+  async function deleteProjectDataFromIndexedDB(id) {
+    if (!window.indexedDB) return false;
+    await runProjectDbTransaction('readwrite', store => store.delete(projectRecordKey(id)));
+    return true;
+  }
+
+  // Synchronous localStorage fallback retained for older projects and browsers
+  // where IndexedDB is unavailable. New project bodies are stored in IndexedDB.
   function getStoredProjectRecord(id) {
-    const currentValue = localStorage.getItem(PROJECT_KEY_PREFIX + id);
-    return currentValue !== null ? currentValue : localStorage.getItem(LEGACY_PROJECT_KEY_PREFIX + id);
+    try {
+      const currentValue = localStorage.getItem(PROJECT_KEY_PREFIX + id);
+      return currentValue !== null ? currentValue : localStorage.getItem(LEGACY_PROJECT_KEY_PREFIX + id);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function getStoredProjectData(id) {
+    if (!id) return null;
+    let indexedDbError = null;
+    try {
+      const indexedData = await readProjectDataFromIndexedDB(id);
+      if (indexedData) return indexedData;
+    } catch (error) {
+      indexedDbError = error;
+    }
+
+    const raw = getStoredProjectRecord(id);
+    if (!raw) {
+      if (indexedDbError) console.warn('IndexedDB read failed and no localStorage fallback exists:', indexedDbError);
+      return null;
+    }
+
+    const data = JSON.parse(raw);
+    validateProjectDataStructure(data);
+    try {
+      await putProjectDataInIndexedDB(id, data);
+      if (localStorageAvailable) {
+        localStorage.removeItem(PROJECT_KEY_PREFIX + id);
+        localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + id);
+        if (localStorage.getItem(STORAGE_PROJECT_ID_KEY) === id) localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch (migrationError) {
+      // Keep the localStorage copy intact when IndexedDB cannot accept it.
+      console.warn('Could not migrate the opened project to IndexedDB:', id, migrationError);
+    }
+    return data;
   }
 
   function readProjectIndex() {
@@ -858,24 +995,30 @@
     } catch (_) { return []; }
   }
 
-  function writeProjectIndex(index) {
+  async function writeProjectIndex(index) {
     const retained = index.slice(0, 30);
-    try {
-      const previous = readProjectIndex();
-      localStorage.setItem(PROJECT_INDEX_KEY, JSON.stringify(retained));
-      localStorage.removeItem(LEGACY_PROJECT_INDEX_KEY);
-      const retainedIds = new Set(retained.map(item => item.id));
-      previous.forEach(item => {
-        if (item && typeof item.id === 'string' && !retainedIds.has(item.id)) {
-          localStorage.removeItem(PROJECT_KEY_PREFIX + item.id);
-          localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + item.id);
-        }
-      });
-    } catch (error) {
-      console.warn('Project index save failed:', error);
-      // Let the project-save transaction report this failure to the user.
-      throw error;
+    const previous = readProjectIndex();
+    localStorage.setItem(PROJECT_INDEX_KEY, JSON.stringify(retained));
+    localStorage.removeItem(LEGACY_PROJECT_INDEX_KEY);
+
+    const retainedIds = new Set(retained.map(item => item.id));
+    const evictedIds = previous
+      .filter(item => item && typeof item.id === 'string' && !retainedIds.has(item.id))
+      .map(item => item.id);
+
+    for (const id of evictedIds) {
+      localStorage.removeItem(PROJECT_KEY_PREFIX + id);
+      localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + id);
+      projectPreviewCache.delete(id);
+      try {
+        await deleteProjectDataFromIndexedDB(id);
+      } catch (error) {
+        // The index is authoritative for visibility. A database cleanup failure
+        // must not turn an otherwise successful new-project save into a failure.
+        console.warn('Could not remove an evicted IndexedDB project:', id, error);
+      }
     }
+    return retained;
   }
 
   function buildProjectPreviewData(inputScene) {
@@ -926,7 +1069,7 @@
     return { nodes, edges };
   }
 
-  function upsertProjectIndex(data, id = currentProjectId) {
+  async function upsertProjectIndex(data, id = currentProjectId) {
     if (!localStorageAvailable || !id) return;
     projectPreviewCache.delete(id);
     const index = readProjectIndex().filter(item => item.id !== id);
@@ -936,79 +1079,110 @@
       updatedAt: Date.now(),
       preview: buildProjectPreviewData(data.scene)
     });
-    writeProjectIndex(index);
+    await writeProjectIndex(index);
   }
 
-  function migrateLegacyProject() {
+  async function migrateLegacyProject() {
     if (!localStorageAvailable) return;
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+
     try {
-      let index = readProjectIndex();
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!index.length && raw) {
-        const data = JSON.parse(raw);
-        validateProjectDataStructure(data);
-        if (data && data.scene && Array.isArray(data.scene.nodes) && Array.isArray(data.scene.edges)) {
-          const known = index.some(item => item.id === 'previous-session');
-          if (!known) {
-            localStorage.setItem(PROJECT_KEY_PREFIX + 'previous-session', raw);
-            localStorage.setItem(STORAGE_PROJECT_ID_KEY, 'previous-session');
-            index.unshift({ id: 'previous-session', title: data.title || 'Предыдущая схема', updatedAt: Date.now() });
-            writeProjectIndex(index);
-          }
+      const data = JSON.parse(raw);
+      if (!data || !data.scene || !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) {
+        // STORAGE_KEY is no longer used for project bodies. Remove stale non-project values.
+        localStorage.removeItem(STORAGE_KEY);
+        return;
+      }
+      validateProjectDataStructure(data);
+      const id = localStorage.getItem(STORAGE_PROJECT_ID_KEY) || 'previous-session';
+      let alreadyStored = false;
+      try { alreadyStored = Boolean(await readProjectDataFromIndexedDB(id)); } catch (_) {}
+
+      if (!alreadyStored) {
+        try {
+          await putProjectDataInIndexedDB(id, data);
+        } catch (databaseError) {
+          // Fallback for browsers without a working IndexedDB implementation.
+          // Avoid writing a second full copy when the per-project local key exists.
+          if (getStoredProjectRecord(id) === null) localStorage.setItem(PROJECT_KEY_PREFIX + id, raw);
+          console.warn('Legacy project retained in localStorage because IndexedDB is unavailable:', databaseError);
+        }
+      } else {
+        localStorage.removeItem(PROJECT_KEY_PREFIX + id);
+        localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + id);
+      }
+
+      // Keep the legacy snapshot until the compact project index is committed.
+      // If index storage fails, the original source remains discoverable for retry.
+      const index = readProjectIndex();
+      const existing = index.find(item => item.id === id);
+      if (existing) {
+        existing.title = data.title || existing.title || 'Предыдущая схема';
+        existing.preview = existing.preview || buildProjectPreviewData(data.scene);
+        existing.updatedAt = Number(data.updatedAt) || existing.updatedAt || Date.now();
+      } else {
+        index.unshift({
+          id,
+          title: data.title || 'Предыдущая схема',
+          updatedAt: Number(data.updatedAt) || Date.now(),
+          preview: buildProjectPreviewData(data.scene)
+        });
+      }
+      await writeProjectIndex(index);
+      // The IndexedDB/local fallback body and its index are durable now. Remove
+      // the old full active-project mirror only after both steps have succeeded.
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.setItem(STORAGE_PROJECT_ID_KEY, id);
+    } catch (error) {
+      // Leave the original legacy snapshot in place if migration could not be completed.
+      console.warn('Legacy project migration failed:', error);
+    }
+  }
+
+  async function migrateLocalStorageProjectRecordsToIndexedDB() {
+    if (!localStorageAvailable || !window.indexedDB) return;
+    const keys = [];
+    try {
+      for (let index = 0; index < localStorage.length; index++) {
+        const key = localStorage.key(index);
+        if (key && (key.startsWith(PROJECT_KEY_PREFIX) || key.startsWith(LEGACY_PROJECT_KEY_PREFIX))) {
+          keys.push(key);
         }
       }
-    } catch (error) { console.warn('Legacy project migration failed:', error); }
-  }
-
-  function localStorageEntryBytes(key, value) {
-    // localStorage stores strings; two bytes per UTF-16 code unit is a
-    // conservative cross-browser approximation, excluding small impl. overhead.
-    return (String(key).length + String(value == null ? '' : value).length) * 2;
-  }
-
-  function estimateLocalStorageAfterProjectSave(payload, serialized) {
-    const projectKey = PROJECT_KEY_PREFIX + payload.id;
-    const isActiveProject = currentProjectId === payload.id;
-    const previousIndex = readProjectIndex();
-    const nextIndex = [{
-      id: payload.id,
-      title: payload.data.title || 'Новая схема',
-      updatedAt: Number(payload.data.updatedAt) || Date.now(),
-      preview: buildProjectPreviewData(payload.data.scene)
-    }, ...previousIndex.filter(item => item.id !== payload.id)].slice(0, 30);
-    const retainedIds = new Set(nextIndex.map(item => item.id));
-
-    // These entries are replaced by the upcoming save. Old project records
-    // evicted by the 30-item index limit are excluded because writeProjectIndex
-    // removes them after writing the new index.
-    const replacedKeys = new Set([projectKey, LEGACY_PROJECT_KEY_PREFIX + payload.id, PROJECT_INDEX_KEY, LEGACY_PROJECT_INDEX_KEY]);
-    if (isActiveProject) {
-      replacedKeys.add(STORAGE_KEY);
-      replacedKeys.add(STORAGE_PROJECT_ID_KEY);
+    } catch (error) {
+      console.warn('Could not enumerate local project records for IndexedDB migration:', error);
+      return;
     }
-    previousIndex.forEach(item => {
-      if (item && item.id && !retainedIds.has(item.id)) {
-        replacedKeys.add(PROJECT_KEY_PREFIX + item.id);
-        replacedKeys.add(LEGACY_PROJECT_KEY_PREFIX + item.id);
+
+    let projectIndex = readProjectIndex();
+    let indexChanged = false;
+    for (const key of keys) {
+      const isLegacyKey = key.startsWith(LEGACY_PROJECT_KEY_PREFIX);
+      const prefix = isLegacyKey ? LEGACY_PROJECT_KEY_PREFIX : PROJECT_KEY_PREFIX;
+      const id = key.slice(prefix.length);
+      if (!id) continue;
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+
+      try {
+        const data = JSON.parse(raw);
+        validateProjectDataStructure(data);
+        await putProjectDataInIndexedDB(id, data);
+        localStorage.removeItem(key);
+        const item = projectIndex.find(project => project.id === id);
+        if (item && (!item.preview || !Array.isArray(item.preview.nodes))) {
+          item.preview = buildProjectPreviewData(data.scene);
+          indexChanged = true;
+        }
+      } catch (error) {
+        // Keep a local copy if IndexedDB is unavailable or the record is invalid.
+        console.warn('Project remains in localStorage after migration attempt:', id, error);
       }
-    });
-
-    let projectedBytes = 0;
-    for (let index = 0; index < localStorage.length; index++) {
-      const key = localStorage.key(index);
-      if (!key || replacedKeys.has(key)) continue;
-      projectedBytes += localStorageEntryBytes(key, localStorage.getItem(key));
     }
-
-    projectedBytes += localStorageEntryBytes(projectKey, serialized);
-    projectedBytes += localStorageEntryBytes(PROJECT_INDEX_KEY, JSON.stringify(nextIndex));
-    if (isActiveProject) {
-      projectedBytes += localStorageEntryBytes(STORAGE_KEY, serialized);
-      projectedBytes += localStorageEntryBytes(STORAGE_PROJECT_ID_KEY, payload.id);
-    }
-
-    // Additional 10% covers key/value bookkeeping and browser-specific quota accounting.
-    return Math.ceil(projectedBytes * 1.1) + 1024;
+    // Retry small legacy settings/index moves after large project bodies have been transferred.
+    migrateLegacyNetNorthStorage();
+    if (indexChanged) await writeProjectIndex(projectIndex);
   }
 
   function reportLocalStorageSaveFailure(error) {
@@ -1016,66 +1190,100 @@
     if (now - lastLocalSaveErrorToastAt < 4000) return;
     lastLocalSaveErrorToastAt = now;
 
-    const isSizeLimit = error && error.code === 'LOCAL_STORAGE_SAFE_LIMIT';
     const isQuotaError = !!(error && (
       error.name === 'QuotaExceededError' || error.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
       error.code === 22 || error.code === 1014 || /quota|storage.{0,12}full/i.test(String(error.message || ''))
     ));
-    let message;
-    if (isSizeLimit) {
-      const sizeMb = (Number(error.estimatedBytes || 0) / (1024 * 1024)).toFixed(1).replace('.', ',');
-      message = `Проект занимает около ${sizeMb} МБ и превышает безопасный лимит локального хранилища. Экспортируйте его через «Экспорт проекта JSON».`;
-    } else if (isQuotaError) {
-      message = 'Хранилище браузера заполнено: проект не удалось сохранить локально. Экспортируйте его через «Экспорт проекта JSON». Освободите место и повторите попытку.';
-    } else {
-      message = 'Не удалось сохранить проект локально. Экспортируйте его через «Экспорт проекта JSON», чтобы не потерять изменения.';
-    }
+    const message = isQuotaError
+      ? 'IndexedDB недоступна, а резервное хранилище браузера заполнено. Экспортируйте проект через «Экспорт проекта JSON» и освободите место.'
+      : 'Не удалось сохранить проект в IndexedDB или резервное хранилище браузера. Экспортируйте его через «Экспорт проекта JSON», чтобы не потерять изменения.';
 
-    // Defer one task so a caller's generic follow-up toast cannot hide this
-    // actionable storage-specific explanation in the same call stack.
     window.setTimeout(() => showToast(message, 6500), 0);
   }
 
-  function persistProjectSnapshot(payload) {
-    if (!localStorageAvailable || !payload || !payload.id) return false;
-    const serialized = JSON.stringify(payload.data);
-    const estimatedBytes = estimateLocalStorageAfterProjectSave(payload, serialized);
-    if (estimatedBytes > LOCAL_STORAGE_SAFE_LIMIT_BYTES) {
-      const error = new Error('Projected localStorage usage exceeds the conservative safe limit');
-      error.code = 'LOCAL_STORAGE_SAFE_LIMIT';
-      error.estimatedBytes = estimatedBytes;
-      throw error;
+  async function persistProjectSnapshot(payload) {
+    if (!localStorageAvailable || !payload || !payload.id) {
+      throw new Error('Project storage is unavailable');
     }
-    // Каждая схема сохраняется по собственному ID независимо от текущего проекта.
-    localStorage.setItem(PROJECT_KEY_PREFIX + payload.id, serialized);
-    localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + payload.id);
-    // STORAGE_KEY — только копия последнего активного проекта. Не даём старому
-    // таймеру перезаписать её данными проекта, который пользователь уже покинул.
+
+    if (projectStorageMigrationPromise) {
+      try { await projectStorageMigrationPromise; } catch (_) {}
+    }
+
+    let indexedDbStored = false;
+    let indexedDbError = null;
+    try {
+      await putProjectDataInIndexedDB(payload.id, payload.data);
+      indexedDbStored = true;
+    } catch (error) {
+      indexedDbError = error;
+      // Transparent localStorage fallback for older/restricted browsers.
+      const serialized = JSON.stringify(payload.data);
+      try {
+        localStorage.setItem(PROJECT_KEY_PREFIX + payload.id, serialized);
+        localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + payload.id);
+      } catch (fallbackError) {
+        fallbackError.indexedDBError = indexedDbError;
+        throw fallbackError;
+      }
+    }
+
+    if (indexedDbStored) {
+      // The object store is now the single source of truth for project bodies.
+      localStorage.removeItem(PROJECT_KEY_PREFIX + payload.id);
+      localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + payload.id);
+    }
+
     if (currentProjectId === payload.id) {
-      localStorage.setItem(STORAGE_KEY, serialized);
+      // Free the old duplicated body first: localStorage may be full precisely
+      // because older builds mirrored the entire active project into STORAGE_KEY.
+      localStorage.removeItem(STORAGE_KEY);
       localStorage.setItem(STORAGE_PROJECT_ID_KEY, payload.id);
     }
-    upsertProjectIndex(payload.data, payload.id);
+
+    await upsertProjectIndex(payload.data, payload.id);
+    if (currentProjectId === payload.id) {
+      activeSavedProjectId = payload.id;
+      activeSavedProjectData = payload.data;
+    }
     if (startScreen.classList.contains('visible') && !document.getElementById('startProjectsPanel').hidden) renderProjectList();
     return true;
   }
 
-  function flushPendingSave() {
+  async function flushPendingSave() {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = 0;
+
+    if (activeSavePromise) {
+      const inFlight = activeSavePromise;
+      const result = await inFlight;
+      if (!result) return false;
+      if (pendingSave) return flushPendingSave();
+      return true;
+    }
+
     const payload = pendingSave;
     pendingSave = null;
-    if (!payload) return false;
-    try {
-      return persistProjectSnapshot(payload);
-    } catch (error) {
-      // Keep the latest snapshot in memory so the user can export it or retry
-      // after freeing browser storage. Never silently discard unsaved changes.
-      pendingSave = payload;
-      console.warn('Local save failed:', error);
-      reportLocalStorageSaveFailure(error);
-      return false;
-    }
+    if (!payload) return true;
+
+    const writePromise = (async () => {
+      try {
+        await persistProjectSnapshot(payload);
+        return true;
+      } catch (error) {
+        // A newer queued snapshot wins; otherwise retain this one for retry/export.
+        if (!pendingSave) pendingSave = payload;
+        console.warn('Project save failed:', error);
+        reportLocalStorageSaveFailure(error);
+        return false;
+      }
+    })();
+    activeSavePromise = writePromise;
+    const result = await writePromise;
+    if (activeSavePromise === writePromise) activeSavePromise = null;
+    if (!result) return false;
+    if (pendingSave) return flushPendingSave();
+    return true;
   }
 
   function cancelPendingProjectSave(id) {
@@ -1086,11 +1294,33 @@
     }
   }
 
-  function removeProjectRecord(id, cleanupLegacy = false) {
+  async function removeProjectRecord(id, cleanupLegacy = false) {
     if (!id || !localStorageAvailable) return false;
     projectPreviewCache.delete(id);
 
     try {
+      await projectStorageMigrationPromise;
+      // Wait for an already-started write so it cannot recreate a record after deletion.
+      if (activeSavePromise) {
+        const activeSaved = await activeSavePromise;
+        if (!activeSaved) throw new Error('A project write is still pending');
+      }
+      // A debounced save may have been queued while an in-flight write settled.
+      // Explicit deletion wins: cancel that snapshot before removing either copy.
+      cancelPendingProjectSave(id);
+      let indexedDbDeleteError = null;
+      try {
+        await deleteProjectDataFromIndexedDB(id);
+      } catch (error) {
+        indexedDbDeleteError = error;
+      }
+      const localFallbackRecord = getStoredProjectRecord(id);
+      if (indexedDbDeleteError && localFallbackRecord === null) {
+        throw indexedDbDeleteError;
+      }
+      if (indexedDbDeleteError) {
+        console.warn('IndexedDB was unavailable during deletion; removing the local fallback copy:', id, indexedDbDeleteError);
+      }
       localStorage.removeItem(PROJECT_KEY_PREFIX + id);
       localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + id);
       const updatedIndex = readProjectIndex().filter(item => item.id !== id);
@@ -1114,14 +1344,16 @@
             legacyIsEmpty = Boolean(legacy && !hasNodes && !hasNotes && !hasTasks && !hasBookmarks);
           } catch (_) { legacyIsEmpty = false; }
         }
-        // Preserve the legacy mirror whenever it still contains meaningful project content.
-        // Remove an absent mirror's dangling id, or a mirror confirmed to be truly empty.
         if (!legacyRaw || legacyIsEmpty) {
           localStorage.removeItem(STORAGE_KEY);
           localStorage.removeItem(STORAGE_PROJECT_ID_KEY);
         }
       }
 
+      if (activeSavedProjectId === id) {
+        activeSavedProjectId = null;
+        activeSavedProjectData = null;
+      }
       if (startScreen.classList.contains('visible') && !document.getElementById('startProjectsPanel').hidden) {
         renderProjectList();
       }
@@ -1132,11 +1364,11 @@
     }
   }
 
-  function deleteEmptyProject(id = currentProjectId) {
+  async function deleteEmptyProject(id = currentProjectId) {
     if (!id) return false;
     cancelPendingProjectSave(id);
-    const removed = removeProjectRecord(id, true);
-    if (currentProjectId === id) currentProjectId = null;
+    const removed = await removeProjectRecord(id, true);
+    if (removed && currentProjectId === id) currentProjectId = null;
     return removed;
   }
 
@@ -1144,11 +1376,10 @@
     // A notes-only or checklist-only project is still meaningful project content.
     if (!hasProjectContent()) return false;
     if (!currentProjectId || !localStorageAvailable) return true;
+    if (activeSavedProjectId !== currentProjectId || !activeSavedProjectData) return true;
 
     try {
-      const raw = getStoredProjectRecord(currentProjectId);
-      if (!raw) return true;
-      const stored = JSON.parse(raw);
+      const stored = activeSavedProjectData;
       if (!stored || !stored.scene || !Array.isArray(stored.scene.nodes) || !Array.isArray(stored.scene.edges)) return true;
 
       const currentTitle = projectTitle.value.trim() || 'Новая схема';
@@ -1157,12 +1388,8 @@
       if (!sameJson(sanitizeProjectChecklist(stored.checklist), projectChecklist)) return true;
       if (!sameJson(normalizeCameraBookmarks(stored.cameraBookmarks, scene.nodes), cameraState.bookmarks)) return true;
       if (!sameJson(normalizeTextNodeDefaults(stored.textNodeDefaults), getTextNodeDefaults())) return true;
-      // Normalize legacy snapshots so added model defaults do not look like user edits.
       if (!sameJson(snapshot(sanitizeScene(stored.scene)), snapshot())) return true;
 
-      // Version 1 projects may not contain the image asset dictionary. Their
-      // timeline snapshots can have a legacy shape even when the current scene
-      // and all user-facing project data are identical, so ignore that mismatch.
       if (stored.images && Array.isArray(stored.timeline) && stored.timeline.length) {
         const storedTimeline = stored.timeline
           .filter(frame => frame && frame.scene && Array.isArray(frame.scene.nodes) && Array.isArray(frame.scene.edges))
@@ -1171,8 +1398,7 @@
       }
 
       const storedStartedAt = Number(stored.projectStartedAt) || Number(projectStartedAt);
-      if (storedStartedAt !== Number(projectStartedAt)) return true;
-      return false;
+      return storedStartedAt !== Number(projectStartedAt);
     } catch (_) {
       return true;
     }
@@ -1181,24 +1407,19 @@
   function saveProject() {
     if (!localStorageAvailable || !currentProjectId) return false;
 
-    // Do not persist a truly blank canvas, but preserve projects that contain
-    // notes, checklist items or camera bookmarks before the first graph node.
     if (!hasProjectContent()) {
       cancelPendingProjectSave(currentProjectId);
       return true;
     }
 
     try {
-      // If the active project changed, its queued snapshot must be completed
-      // first. Never overwrite an unsaved snapshot from another project when
-      // that write failed because of quota or storage access.
+      // Project switches await the previous snapshot before changing currentProjectId.
+      // Keep a defensive guard so a stale snapshot is never overwritten by another ID.
       if (pendingSave && pendingSave.id !== currentProjectId) {
-        const queuedProjectId = pendingSave.id;
-        const flushed = flushPendingSave();
-        if (!flushed && pendingSave && pendingSave.id === queuedProjectId) return false;
+        console.warn('A previous project snapshot is still queued; refusing to replace it.');
+        return false;
       }
 
-      // Capture all mutable state synchronously; the timer writes only this snapshot.
       const sceneSnapshot = snapshot();
       const timelineSnapshot = timeline.map(frame => ({
         at: Math.max(0, Number(frame.at) || 0),
@@ -1227,7 +1448,7 @@
       };
       pendingSave = payload;
       if (saveTimer) clearTimeout(saveTimer);
-      saveTimer = setTimeout(flushPendingSave, 140);
+      saveTimer = setTimeout(() => { void flushPendingSave(); }, 140);
       return true;
     } catch (error) {
       console.warn('Project snapshot creation failed:', error);
@@ -1601,15 +1822,11 @@
     deleteTargetProjectId = null;
   }
 
-  function renameProject(id, title) {
+  async function renameProject(id, title) {
     const cleanTitle = String(title ?? '').trim().slice(0, 90);
     if (!cleanTitle) {
       showToast('Введи название проекта');
-      // Empty input is recoverable: keep the modal open and return the caret
-      // to the field so the user can immediately type a project name.
-      if (projectRenameBackdrop.classList.contains('visible')) {
-        projectRenameInput.focus({ preventScroll: true });
-      }
+      if (projectRenameBackdrop.classList.contains('visible')) projectRenameInput.focus({ preventScroll: true });
       return false;
     }
     if (!id) {
@@ -1618,9 +1835,6 @@
     }
 
     const isActiveProject = currentProjectId === id;
-
-    // A new empty canvas exists only in memory. Rename it there, but do not
-    // create a project record or an index entry until the first node is added.
     if (isActiveProject && !hasProjectContent()) {
       projectTitle.value = cleanTitle;
       closeRenameProjectModal();
@@ -1628,72 +1842,39 @@
       showToast('Название проекта обновлено');
       return true;
     }
-
     if (!localStorageAvailable) {
       showToast('Локальное хранилище недоступно');
       return false;
     }
 
     try {
-      const updatedAt = Date.now();
-      const projectKey = PROJECT_KEY_PREFIX + id;
+      await projectStorageMigrationPromise;
       let storedData;
-
       if (isActiveProject) {
         projectTitle.value = cleanTitle;
-
-        // Persist the latest active scene, then never read pendingSave after flush.
-        saveProject();
-        if (!flushPendingSave()) {
+        if (!saveProject() || !await flushPendingSave()) {
           throw new Error('Не удалось сохранить активный проект перед переименованием');
         }
-
-        const savedRaw = getStoredProjectRecord(id);
-        if (!savedRaw) {
-          throw new Error('Сохранённый активный проект не найден после записи');
-        }
-        storedData = JSON.parse(savedRaw);
+        storedData = activeSavedProjectId === id ? activeSavedProjectData : await getStoredProjectData(id);
       } else {
-        // Finish a queued write for this target before reading its stored snapshot.
-        const hasQueuedSaveForTarget = Boolean(pendingSave && pendingSave.id === id);
-        if (hasQueuedSaveForTarget && !flushPendingSave()) {
+        // Wait for any asynchronous write before reading and renaming a stored body.
+        // This avoids a late save replacing the renamed IndexedDB record with stale data.
+        if ((activeSavePromise || pendingSave) && !await flushPendingSave()) {
           throw new Error('Не удалось завершить ожидающее сохранение проекта');
         }
-
-        const raw = getStoredProjectRecord(id);
-        if (!raw) {
-          showToast('Сохранённый проект не найден');
-          renderProjectList();
-          return false;
-        }
-        storedData = JSON.parse(raw);
+        storedData = await getStoredProjectData(id);
       }
 
       if (!storedData || typeof storedData !== 'object') {
-        throw new Error('Некорректные данные проекта');
+        showToast('Сохранённый проект не найден');
+        renderProjectList();
+        return false;
       }
 
-      storedData.title = cleanTitle;
-      storedData.updatedAt = updatedAt;
-      localStorage.setItem(projectKey, JSON.stringify(storedData));
-      localStorage.removeItem(LEGACY_PROJECT_KEY_PREFIX + id);
-
-      if (localStorage.getItem(STORAGE_PROJECT_ID_KEY) === id) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(storedData));
-      }
-
-      // Update the index only after the actual project snapshot is stored.
-      const index = readProjectIndex();
-      let indexItem = index.find(project => project.id === id);
-      if (indexItem) {
-        indexItem.title = cleanTitle;
-        indexItem.updatedAt = updatedAt;
-      } else {
-        indexItem = { id, title: cleanTitle, updatedAt };
-        index.unshift(indexItem);
-      }
-      localStorage.setItem(PROJECT_INDEX_KEY, JSON.stringify(index));
-      localStorage.removeItem(LEGACY_PROJECT_INDEX_KEY);
+      const updatedData = JSON.parse(JSON.stringify(storedData));
+      updatedData.title = cleanTitle;
+      updatedData.updatedAt = Date.now();
+      await persistProjectSnapshot({ id, data: updatedData });
 
       closeRenameProjectModal();
       renderProjectList();
@@ -1701,12 +1882,13 @@
       return true;
     } catch (error) {
       console.warn('Project rename failed:', error);
+      reportLocalStorageSaveFailure(error);
       showToast('Не удалось переименовать проект');
       return false;
     }
   }
 
-  function deleteProject(id) {
+  async function deleteProject(id) {
     if (!id) return false;
     if (!localStorageAvailable) {
       showToast('Локальное хранилище недоступно');
@@ -1716,9 +1898,15 @@
     const isActiveProject = currentProjectId === id;
     if (isActiveProject && playback.active) exitPlayback();
 
-    // Cancel the pending debounced write before deleting storage or clearing scene.
+    // Cancel a debounced snapshot and wait for any already-started IDB transaction.
     cancelPendingProjectSave(id);
-    const removed = removeProjectRecord(id, true);
+    if (activeSavePromise && !await activeSavePromise) {
+      showToast('Не удалось завершить сохранение перед удалением');
+      return false;
+    }
+    // Also cancel any snapshot queued while the active transaction was finishing.
+    cancelPendingProjectSave(id);
+    const removed = await removeProjectRecord(id, true);
     if (!removed) {
       showToast('Не удалось удалить проект');
       return false;
@@ -1728,6 +1916,8 @@
       clearProjectRuntimeCaches(true);
       projectTitle.value = 'Новая схема';
       currentProjectId = null;
+      activeSavedProjectId = null;
+      activeSavedProjectData = null;
       projectSessionStartedAt = 0;
       projectNotes = '';
       projectChecklist = [];
@@ -1807,18 +1997,22 @@
     return `${baseTitle} (${maxNumber + 1})`;
   }
 
-  function beginNewProject() {
+  async function beginNewProject() {
     if (playback.active) exitPlayback();
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     if (editingId) finishEditing(editingId, true);
-    // Сбрасываем последнее сохранение старого проекта до смены ID.
-    flushPendingSave();
+    // Finish the previous project's asynchronous IndexedDB write before changing its ID.
+    if (!await flushPendingSave()) {
+      showToast('Не удалось сохранить предыдущий проект. Новый холст не создан');
+      return;
+    }
     clearProjectRuntimeCaches(true);
     const newTitle = generateNewProjectTitle();
     currentProjectId = makeProjectId();
     scene = freshScene(); selectedId = null; selectedIds.splice(0); editingId = null; editingOriginalText = null;
     connectionSourceId = null; linkDraft = null; drag = null; boxSelect = null; contextNodeId = null;
     projectTitle.value = newTitle; projectStartedAt = Date.now();
+    activeSavedProjectId = null; activeSavedProjectData = null;
     projectNotes = '';
     projectChecklist = [];
     setTextNodeDefaults(null);
@@ -1837,7 +2031,7 @@
     updateActionButtons();
   }
 
-  function openSavedProject(id) {
+  async function openSavedProject(id) {
     if (playback.active) exitPlayback();
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     if (!localStorageAvailable) { showToast('Локальные проекты недоступны в этом браузере'); return; }
@@ -1845,11 +2039,14 @@
     let imageStoreReplaced = false;
     try {
       if (editingId) finishEditing(editingId, true);
-      // Важно сбросить изменения текущего проекта до чтения/переключения на другой.
-      flushPendingSave();
-      const raw = getStoredProjectRecord(id);
-      if (!raw) { showToast('Проект не найден'); renderProjectList(); return; }
-      const data = JSON.parse(raw);
+      // Commit the active project before reading another record from IndexedDB.
+      if (!await flushPendingSave()) {
+        showToast('Не удалось сохранить текущий проект перед переключением');
+        return;
+      }
+      await projectStorageMigrationPromise;
+      const data = await getStoredProjectData(id);
+      if (!data) { showToast('Проект не найден'); renderProjectList(); return; }
       validateProjectDataStructure(data);
       const imageAssets = normalizeProjectImageAssets(data.images);
 
@@ -1858,7 +2055,10 @@
       Object.entries(imageAssets).forEach(([key, value]) => imageStore.set(key, value));
       imageStoreReplaced = true;
 
+      currentProjectId = id;
       scene = sanitizeScene(data.scene);
+      activeSavedProjectId = id;
+      activeSavedProjectData = data;
       projectTitle.value = typeof data.title === 'string' && data.title.trim() ? data.title : 'Новая схема';
       timeline = Array.isArray(data.timeline)
         ? data.timeline
@@ -1899,12 +2099,14 @@
     // The start menu is no longer editing an active project. Keeping the scene in
     // memory is harmless; clearing its ID prevents pagehide from saving discarded edits.
     currentProjectId = null;
+    activeSavedProjectId = null;
+    activeSavedProjectData = null;
     projectSessionStartedAt = 0;
     setProjectNotesOpen(false);
     showStartScreen(true);
   }
 
-  function confirmExit() {
+  async function confirmExit() {
     if (editingId) finishEditing(editingId, true);
 
     if (!currentProjectId) {
@@ -1914,7 +2116,11 @@
 
     // Пустые холсты удаляются без подтверждения и не засоряют список проектов.
     if (!hasProjectContent()) {
-      deleteEmptyProject(currentProjectId);
+      const removed = await deleteEmptyProject(currentProjectId);
+      if (!removed && currentProjectId) {
+        showToast('Не удалось удалить пустой проект');
+        return;
+      }
       completeExitToStartScreen();
       return;
     }
@@ -1924,13 +2130,12 @@
 
     if (!hasChanges) {
       // Даже если изменений нет, не оставляем таймер сохранения висеть при выходе.
-      if (hasPendingWrite && !flushPendingSave()) {
+      if ((hasPendingWrite || activeSavePromise) && !await flushPendingSave()) {
         showToast('Не удалось завершить сохранение. Попробуй ещё раз');
         return;
       }
       checkpointProjectWorkTime();
-      saveProject();
-      if (pendingSave && !flushPendingSave()) {
+      if (!saveProject() || !await flushPendingSave()) {
         showToast('Не удалось завершить сохранение. Попробуй ещё раз');
         return;
       }
@@ -1951,7 +2156,7 @@
 
   function showStartScreen(skipExitConfirmation = false) {
     if (!skipExitConfirmation && !startScreen.classList.contains('visible') && currentProjectId) {
-      confirmExit();
+      void confirmExit();
       return;
     }
     showStartPanel('startMainPanel');
@@ -1963,10 +2168,14 @@
     exitConfirmBackdrop.setAttribute('aria-hidden', 'true');
   }
 
-  function saveAndExitToStartScreen() {
+  async function saveAndExitToStartScreen() {
     if (editingId) finishEditing(editingId, true);
     if (!hasProjectContent()) {
-      deleteEmptyProject(currentProjectId);
+      const removed = await deleteEmptyProject(currentProjectId);
+      if (!removed && currentProjectId) {
+        showToast('Не удалось удалить пустой проект');
+        return;
+      }
       completeExitToStartScreen();
       return;
     }
@@ -1976,8 +2185,11 @@
     }
 
     checkpointProjectWorkTime();
-    saveProject();
-    const saved = flushPendingSave();
+    if (!saveProject()) {
+      showToast('Не удалось подготовить проект к сохранению');
+      return;
+    }
+    const saved = await flushPendingSave();
     if (!saved) {
       showToast('Не удалось сохранить проект. Попробуй ещё раз');
       return;
@@ -1985,16 +2197,40 @@
     completeExitToStartScreen();
   }
 
-  function exitWithoutSavingToStartScreen() {
+  async function exitWithoutSavingToStartScreen() {
     const id = currentProjectId;
     if (id) {
+      // Resolve legacy localStorage migration before capturing the saved baseline.
+      try { await projectStorageMigrationPromise; } catch (_) {}
+      const baseline = activeSavedProjectId === id && activeSavedProjectData
+        ? activeSavedProjectData
+        : (localStorageAvailable ? await getStoredProjectData(id).catch(() => null) : null);
+      const hadQueuedWrite = Boolean(pendingSave && pendingSave.id === id);
+      const hadInFlightWrite = Boolean(activeSavePromise);
+
       cancelPendingProjectSave(id);
-      // A brand-new unsaved project has no baseline to keep. Remove any orphaned
-      // index entry, but preserve an existing stored version of an edited project.
-      if (localStorageAvailable) {
-        let hasStoredBaseline = false;
-        try { hasStoredBaseline = Boolean(getStoredProjectRecord(id)); } catch (_) {}
-        if (!hasStoredBaseline) removeProjectRecord(id, false);
+      if (activeSavePromise) {
+        await activeSavePromise;
+        cancelPendingProjectSave(id);
+      }
+
+      if (!baseline) {
+        if (localStorageAvailable && !await removeProjectRecord(id, false)) {
+          showToast('Не удалось удалить несохранённый проект');
+          return;
+        }
+      } else if (hadQueuedWrite || hadInFlightWrite) {
+        // The IDB body may have committed even when updating the local project
+        // index failed. Restore the captured baseline after any pending/in-flight
+        // write, not only when the in-memory baseline object changed.
+        try {
+          await persistProjectSnapshot({ id, data: baseline });
+        } catch (error) {
+          console.warn('Could not restore the saved project baseline after discard:', error);
+          reportLocalStorageSaveFailure(error);
+          showToast('Не удалось отменить последнее сохранение');
+          return;
+        }
       }
     }
     completeExitToStartScreen();
@@ -2488,7 +2724,7 @@
     cameraState.bookmarks[key] = null;
     updateCameraBookmarksUI();
     if (hasProjectContent()) saveProject();
-    else if (currentProjectId) deleteEmptyProject(currentProjectId);
+    else if (currentProjectId) void deleteEmptyProject(currentProjectId);
     showToast(message || `Закладка ${key} очищена`);
     return true;
   }
@@ -4997,8 +5233,9 @@
           return;
         }
 
-        if (pixelWidth > 512 || pixelHeight > 512) {
-          const resizeScale = Math.min(512 / pixelWidth, 512 / pixelHeight);
+        const MAX_IMAGE_SIDE = 1920;
+        if (pixelWidth > MAX_IMAGE_SIDE || pixelHeight > MAX_IMAGE_SIDE) {
+          const resizeScale = Math.min(MAX_IMAGE_SIDE / pixelWidth, MAX_IMAGE_SIDE / pixelHeight);
           const targetWidth = Math.max(1, Math.round(pixelWidth * resizeScale));
           const targetHeight = Math.max(1, Math.round(pixelHeight * resizeScale));
           const tempCanvas = document.createElement('canvas');
@@ -5009,11 +5246,13 @@
             showToast('Не удалось подготовить изображение');
             return;
           }
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
           ctx.fillStyle = '#ffffff';
           ctx.fillRect(0, 0, targetWidth, targetHeight);
           ctx.drawImage(sourceImage, 0, 0, targetWidth, targetHeight);
           try {
-            imageData = tempCanvas.toDataURL('image/jpeg', 0.65);
+            imageData = tempCanvas.toDataURL('image/jpeg', 0.88);
           } catch (error) {
             console.warn('Image compression failed:', error);
             showToast('Не удалось сжать изображение');
@@ -6169,7 +6408,7 @@
     if (!file) return;
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       const previousImageStore = new Map(imageStore);
       let imageStoreReplaced = false;
       try {
@@ -6191,7 +6430,11 @@
         // Commit the previous project while its image cache is still available.
         if (playback.active) exitPlayback();
         if (editingId) finishEditing(editingId, true);
-        flushPendingSave();
+        if (!await flushPendingSave()) {
+          showToast('Не удалось сохранить текущий проект перед импортом');
+          importFile.value = '';
+          return;
+        }
         clearProjectRuntimeCaches(false);
         imageStore.clear();
         Object.entries(imageAssets).forEach(([key, value]) => imageStore.set(key, value));
@@ -6211,6 +6454,8 @@
 
         scene = importedScene;
         currentProjectId = makeProjectId();
+        activeSavedProjectId = null;
+        activeSavedProjectData = null;
         projectTitle.value = importedTitle;
         timeline = importedTimeline;
         projectStartedAt = importedProjectStartedAt;
@@ -7239,12 +7484,12 @@
 
   document.getElementById('createCanvasBtn')?.addEventListener('click', () => {
     closeProjectActionsMenu();
-    beginNewProject();
+    void beginNewProject();
   });
   document.querySelector('.brand')?.addEventListener('click', event => {
     event.preventDefault();
     closeProjectActionsMenu();
-    confirmExit();
+    void confirmExit();
   });
   document.getElementById('openPreviousBtn')?.addEventListener('click', () => {
     closeProjectActionsMenu();
@@ -7279,7 +7524,7 @@
     const openButton = event.target.closest('[data-project-open-id]');
     if (openButton) {
       closeProjectActionsMenu();
-      openSavedProject(openButton.dataset.projectOpenId);
+      void openSavedProject(openButton.dataset.projectOpenId);
     }
   });
 
@@ -7308,10 +7553,10 @@
   // Handle validation in JavaScript so an empty title reaches our toast instead
   // of being blocked by the browser's native `required` validation.
   projectRenameForm.noValidate = true;
-  projectRenameForm?.addEventListener('submit', event => {
+  projectRenameForm?.addEventListener('submit', async event => {
     event.preventDefault();
     const submittedTitle = projectRenameInput.value;
-    const renamed = renameProject(renameTargetProjectId, submittedTitle);
+    const renamed = await renameProject(renameTargetProjectId, submittedTitle);
 
     if (renamed) {
       projectRenameInput.blur();
@@ -7330,7 +7575,7 @@
   });
 
   projectDeleteCancelBtn?.addEventListener('click', closeDeleteProjectModal);
-  projectDeleteConfirmBtn?.addEventListener('click', () => deleteProject(deleteTargetProjectId));
+  projectDeleteConfirmBtn?.addEventListener('click', () => { void deleteProject(deleteTargetProjectId); });
   projectDeleteBackdrop?.addEventListener('pointerdown', event => {
     if (event.target === projectDeleteBackdrop) closeDeleteProjectModal();
   });
@@ -7401,7 +7646,7 @@
       saveProject();
     }
     if (id && !hasProjectContent()) {
-      deleteEmptyProject(id);
+      void deleteEmptyProject(id);
       return;
     }
 
@@ -7417,14 +7662,15 @@
       }
 
       // If the model is already saved, complete a queued write without prompting.
-      if (pendingSave && (!id || pendingSave.id === id)) flushPendingSave();
+      if ((pendingSave && (!id || pendingSave.id === id)) || activeSavePromise) void flushPendingSave();
       return;
     }
 
-    // pagehide means navigation/closing is proceeding. Persist the latest snapshot
-    // synchronously here, because the 140 ms debounce may never fire.
+    // pagehide means navigation/closing is proceeding. Start the IDB transaction
+    // immediately because the 140 ms debounce may never fire; browsers may not
+    // guarantee completion after a page lifecycle event.
     if (id && hasProjectContent() && dirty) saveProject();
-    if (pendingSave) flushPendingSave();
+    if (pendingSave || activeSavePromise) void flushPendingSave();
   }
   window?.addEventListener('beforeunload', flushBeforeLeavingPage);
   window?.addEventListener('pagehide', flushBeforeLeavingPage);
@@ -7448,14 +7694,24 @@
 
   // Initial state: projects are opened from the start menu, rather than loaded invisibly.
   try {
+    // A full localStorage quota must not disable IndexedDB project storage.
+    // Check API accessibility without attempting a quota-consuming write.
     const storage = window.localStorage;
-    const testKey = STORAGE_KEY + '_test';
-    storage.setItem(testKey, '1'); storage.removeItem(testKey);
+    void storage.length;
+    void storage.getItem(PROJECT_INDEX_KEY);
     localStorageAvailable = true;
   } catch (_) { localStorageAvailable = false; }
   if (localStorageAvailable) {
     migrateLegacyNetNorthStorage();
-    migrateLegacyProject();
+    projectStorageMigrationPromise = (async () => {
+      await migrateLegacyProject();
+      await migrateLocalStorageProjectRecordsToIndexedDB();
+      if (startScreen.classList.contains('visible') && !document.getElementById('startProjectsPanel').hidden) {
+        renderProjectList();
+      }
+    })().catch(error => {
+      console.warn('Project storage migration could not be completed:', error);
+    });
     try {
       applyTheme(localStorage.getItem(THEME_KEY) || 'light', false);
       autoArrangeEnabled = localStorage.getItem(AUTO_ARRANGE_KEY) !== '0';
@@ -7496,8 +7752,8 @@
 
       if (currentProjectId && hasProjectContent()) {
         saveProject();
-        // Persist synchronously: background timers may be throttled or suspended.
-        flushPendingSave();
+        // Start the IndexedDB transaction immediately; page lifecycle events cannot await it.
+        void flushPendingSave();
       }
       return;
     }

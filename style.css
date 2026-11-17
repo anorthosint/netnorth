@@ -76,7 +76,8 @@
        sidebar grid track, which collapses immediately to zero width. This lets
        the tab travel in sync with the composited sidebar-content layer. */
     position: fixed;
-    z-index: 1003;
+    /* Keep the workspace control below the start screen and modal layers. */
+    z-index: 900;
     top: calc(66px + (100vh - 66px) / 2);
     left: var(--sidebar-panel-width, 226px);
     right: auto;
@@ -94,8 +95,25 @@
     box-shadow: 3px 1px 8px rgba(0,0,0,.055);
     cursor: pointer;
     transform: translate3d(0,-50%,0);
-    transition: transform .24s cubic-bezier(.2,.75,.25,1), background-color .16s ease, color .16s ease, border-color .16s ease;
+    opacity: 1;
+    visibility: visible;
+    transition: transform .24s cubic-bezier(.2,.75,.25,1), background-color .16s ease, color .16s ease, border-color .16s ease, opacity .16s ease, visibility 0s linear .16s;
     will-change: transform;
+  }
+  /* A fixed toggle must never sit above the full-screen start menu or modal
+     backdrops. Keep it in the DOM so its normal transform state is preserved. */
+  body:has(.start-screen.visible) .sidebar-toggle,
+  body:has(.modal-backdrop.visible) .sidebar-toggle,
+  body:has(.project-modal-backdrop.visible) .sidebar-toggle,
+  body:has(.exit-confirm-backdrop.visible) .sidebar-toggle,
+  body:has(.export-screen.visible) .sidebar-toggle {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  /* When an overlay closes, reveal immediately and let opacity fade back in. */
+  body:not(:has(.start-screen.visible)):not(:has(.modal-backdrop.visible)):not(:has(.project-modal-backdrop.visible)):not(:has(.exit-confirm-backdrop.visible)):not(:has(.export-screen.visible)) .sidebar-toggle {
+    transition-delay: 0s;
   }
   .sidebar-toggle-icon { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; transform: rotate(0deg); transition: transform .24s cubic-bezier(.2,.75,.25,1); transform-origin: center; will-change: transform; }
   .sidebar-toggle svg { display: block; width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
