@@ -27,6 +27,11 @@
   let activeSavePromise = null;
   let activeSavedProjectId = null;
   let activeSavedProjectData = null;
+  // Distinguish imported/new session projects from projects opened from storage.
+  // The opened baseline is immutable for the whole editing session, even when
+  // autosave updates activeSavedProjectData in the background.
+  let isNewUnsavedSessionProject = false;
+  let initialOpenedProjectBaseline = null;
   let lastLocalSaveErrorToastAt = 0;
   let presentationMode = false;
   let presentationPreviousState = null;
@@ -91,6 +96,7 @@
   const projectDeleteCancelBtn = document.getElementById('projectDeleteCancelBtn');
   const projectDeleteConfirmBtn = document.getElementById('projectDeleteConfirmBtn');
   const exportScreen = document.getElementById('exportScreen');
+  const exportFileNameInput = document.getElementById('exportFileNameInput');
   const mobileMenuToggle = document.getElementById('mobileMenuToggle');
   const sidebarBackdrop = document.getElementById('sidebarBackdrop');
   const sidebar = document.querySelector('.sidebar');
@@ -111,6 +117,11 @@
   const projectChecklistProgress = document.getElementById('projectChecklistProgress');
   const selectedIds = [];
   const selectedEdgeIds = [];
+  // The internal clipboard intentionally outlives project-runtime cache resets.
+  // Image payloads are embedded in copied image nodes so cross-project pastes
+  // remain valid even after imageStore is cleared for the next project.
+  let internalClipboard = null;
+  let internalClipboardPasteRequested = false;
   let currentProjectId = null;
   let boxSelect = null;
   let suppressContextMenuUntil = 0;
@@ -494,6 +505,9 @@
   }
 
   function clearProjectRuntimeCaches(clearImages = false) {
+    // Keep internalClipboard intact for cross-project copy/paste; only discard
+    // the one-shot keyboard-to-paste-event handoff when changing project state.
+    internalClipboardPasteRequested = false;
     cancelCameraFlight();
     if (saveTimer) {
       clearTimeout(saveTimer);
@@ -927,6 +941,11 @@
     return record && record.data && typeof record.data === 'object' ? record.data : null;
   }
 
+  async function readAllProjectRecordsFromIndexedDB() {
+    const records = await runProjectDbTransaction('readonly', store => store.getAll());
+    return Array.isArray(records) ? records : [];
+  }
+
   async function putProjectDataInIndexedDB(id, data) {
     await runProjectDbTransaction('readwrite', store => store.put({
       key: projectRecordKey(id),
@@ -1180,6 +1199,55 @@
         console.warn('Project remains in localStorage after migration attempt:', id, error);
       }
     }
+    // Rebuild missing index entries from IndexedDB too. This recovers projects
+    // whose bodies survived in the database while their compact local index was
+    // cleared, partially written, or lost during a previous migration.
+    try {
+      const indexedRecords = await readAllProjectRecordsFromIndexedDB();
+      const indexedById = new Map();
+      indexedRecords.forEach(record => {
+        const id = String(record && (record.id || (typeof record.key === 'string' && record.key.startsWith(PROJECT_KEY_PREFIX)
+          ? record.key.slice(PROJECT_KEY_PREFIX.length)
+          : '')) || '');
+        const data = record && record.data;
+        if (!id || !data || typeof data !== 'object' || !data.scene ||
+            !Array.isArray(data.scene.nodes) || !Array.isArray(data.scene.edges)) return;
+        indexedById.set(id, { id, data, updatedAt: Number(data.updatedAt || record.updatedAt) || Date.now() });
+      });
+
+      for (const { id, data, updatedAt } of indexedById.values()) {
+        const existing = projectIndex.find(item => item.id === id);
+        if (!existing) {
+          projectIndex.push({
+            id,
+            title: typeof data.title === 'string' && data.title.trim() ? data.title : 'Новая схема',
+            updatedAt,
+            preview: buildProjectPreviewData(data.scene)
+          });
+          indexChanged = true;
+        } else {
+          if (!existing.preview || !Array.isArray(existing.preview.nodes)) {
+            existing.preview = buildProjectPreviewData(data.scene);
+            indexChanged = true;
+          }
+          if (!existing.title && data.title) {
+            existing.title = data.title;
+            indexChanged = true;
+          }
+          if (!Number(existing.updatedAt) && updatedAt) {
+            existing.updatedAt = updatedAt;
+            indexChanged = true;
+          }
+        }
+      }
+
+      if (indexChanged) {
+        projectIndex.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+      }
+    } catch (error) {
+      console.warn('Could not recover missing project index entries from IndexedDB:', error);
+    }
+
     // Retry small legacy settings/index moves after large project bodies have been transferred.
     migrateLegacyNetNorthStorage();
     if (indexChanged) await writeProjectIndex(projectIndex);
@@ -1404,6 +1472,26 @@
     }
   }
 
+  function hasChangesSinceInitialOpenedBaseline() {
+    const stored = initialOpenedProjectBaseline;
+    if (!stored || isNewUnsavedSessionProject) return false;
+
+    try {
+      if (!stored.scene || !Array.isArray(stored.scene.nodes) || !Array.isArray(stored.scene.edges)) return true;
+      const currentTitle = projectTitle.value.trim() || 'Новая схема';
+      if ((stored.title || 'Новая схема') !== currentTitle) return true;
+      if (String(stored.notes || '') !== projectNotes) return true;
+      if (!sameJson(sanitizeProjectChecklist(stored.checklist), projectChecklist)) return true;
+      if (!sameJson(normalizeCameraBookmarks(stored.cameraBookmarks, scene.nodes), cameraState.bookmarks)) return true;
+      if (!sameJson(normalizeTextNodeDefaults(stored.textNodeDefaults), getTextNodeDefaults())) return true;
+      if (!sameJson(snapshot(sanitizeScene(stored.scene)), snapshot())) return true;
+      const openedAt = Number(stored.projectStartedAt) || Number(projectStartedAt);
+      return openedAt !== Number(projectStartedAt);
+    } catch (_) {
+      return true;
+    }
+  }
+
   function saveProject() {
     if (!localStorageAvailable || !currentProjectId) return false;
 
@@ -1516,11 +1604,16 @@
     }
   }
 
-  function showStartPanel(panelName) {
+  async function showStartPanel(panelName) {
     ['startMainPanel', 'startProjectsPanel', 'startSettingsPanel'].forEach(id => {
       document.getElementById(id).hidden = id !== panelName;
     });
-    if (panelName === 'startProjectsPanel') renderProjectList();
+    if (panelName === 'startProjectsPanel') {
+      // The index may be incomplete until legacy bodies have migrated and
+      // IndexedDB-only records have been recovered into it.
+      try { await projectStorageMigrationPromise; } catch (_) {}
+      if (!document.getElementById('startProjectsPanel').hidden) renderProjectList();
+    }
     if (panelName === 'startSettingsPanel') {
       updateThemeChoices();
       updateAutoArrangeChoice();
@@ -1918,6 +2011,8 @@
       currentProjectId = null;
       activeSavedProjectId = null;
       activeSavedProjectData = null;
+      isNewUnsavedSessionProject = false;
+      initialOpenedProjectBaseline = null;
       projectSessionStartedAt = 0;
       projectNotes = '';
       projectChecklist = [];
@@ -2009,6 +2104,8 @@
     clearProjectRuntimeCaches(true);
     const newTitle = generateNewProjectTitle();
     currentProjectId = makeProjectId();
+    isNewUnsavedSessionProject = true;
+    initialOpenedProjectBaseline = null;
     scene = freshScene(); selectedId = null; selectedIds.splice(0); editingId = null; editingOriginalText = null;
     connectionSourceId = null; linkDraft = null; drag = null; boxSelect = null; contextNodeId = null;
     projectTitle.value = newTitle; projectStartedAt = Date.now();
@@ -2056,6 +2153,11 @@
       imageStoreReplaced = true;
 
       currentProjectId = id;
+      isNewUnsavedSessionProject = false;
+      // Keep a private immutable copy of the exact project as it was opened.
+      // Autosaves may replace activeSavedProjectData, but this baseline is used
+      // by "Exit without saving" to restore the original stored version.
+      initialOpenedProjectBaseline = clone(data);
       scene = sanitizeScene(data.scene);
       activeSavedProjectId = id;
       activeSavedProjectData = data;
@@ -2101,6 +2203,8 @@
     currentProjectId = null;
     activeSavedProjectId = null;
     activeSavedProjectData = null;
+    isNewUnsavedSessionProject = false;
+    initialOpenedProjectBaseline = null;
     projectSessionStartedAt = 0;
     setProjectNotesOpen(false);
     showStartScreen(true);
@@ -2114,12 +2218,35 @@
       return;
     }
 
-    // Пустые холсты удаляются без подтверждения и не засоряют список проектов.
-    if (!hasProjectContent()) {
-      const removed = await deleteEmptyProject(currentProjectId);
-      if (!removed && currentProjectId) {
-        showToast('Не удалось удалить пустой проект');
-        return;
+    const hasContent = hasProjectContent();
+    const isNewProjectWithContent = isNewUnsavedSessionProject && hasContent;
+    const changedSinceOpened = !isNewUnsavedSessionProject && hasChangesSinceInitialOpenedBaseline();
+
+    // A new/imported session must be explicitly saved or discarded even if
+    // autosave has already created its first IndexedDB record. For opened
+    // projects compare with the immutable open-time baseline, not the latest
+    // autosaved snapshot, so "Exit without saving" remains meaningful.
+    if (isNewProjectWithContent || changedSinceOpened) {
+      exitConfirmBackdrop.classList.add('visible');
+      exitConfirmBackdrop.setAttribute('aria-hidden', 'false');
+      requestAnimationFrame(() => {
+        if (exitConfirmBackdrop.classList.contains('visible')) {
+          exitSaveBtn.focus({ preventScroll: true });
+        }
+      });
+      return;
+    }
+
+    // Empty new canvases are not retained. An opened project that was already
+    // empty remains in the list; an emptied existing project was handled above
+    // as a change against its original baseline and can be saved or discarded.
+    if (!hasContent) {
+      if (isNewUnsavedSessionProject) {
+        const removed = await deleteEmptyProject(currentProjectId);
+        if (!removed && currentProjectId) {
+          showToast('Не удалось удалить пустой проект');
+          return;
+        }
       }
       completeExitToStartScreen();
       return;
@@ -2194,35 +2321,39 @@
       showToast('Не удалось сохранить проект. Попробуй ещё раз');
       return;
     }
+    isNewUnsavedSessionProject = false;
+    initialOpenedProjectBaseline = null;
     completeExitToStartScreen();
   }
 
   async function exitWithoutSavingToStartScreen() {
     const id = currentProjectId;
     if (id) {
-      // Resolve legacy localStorage migration before capturing the saved baseline.
+      const discardEntireProject = isNewUnsavedSessionProject;
+      // Resolve migration before canceling queued work or restoring the baseline.
       try { await projectStorageMigrationPromise; } catch (_) {}
-      const baseline = activeSavedProjectId === id && activeSavedProjectData
-        ? activeSavedProjectData
-        : (localStorageAvailable ? await getStoredProjectData(id).catch(() => null) : null);
-      const hadQueuedWrite = Boolean(pendingSave && pendingSave.id === id);
-      const hadInFlightWrite = Boolean(activeSavePromise);
+      const baseline = discardEntireProject
+        ? null
+        : (initialOpenedProjectBaseline
+            ? clone(initialOpenedProjectBaseline)
+            : (activeSavedProjectId === id && activeSavedProjectData
+                ? clone(activeSavedProjectData)
+                : (localStorageAvailable ? await getStoredProjectData(id).catch(() => null) : null)));
 
       cancelPendingProjectSave(id);
       if (activeSavePromise) {
-        await activeSavePromise;
+        try { await activeSavePromise; } catch (_) {}
         cancelPendingProjectSave(id);
       }
 
-      if (!baseline) {
-        if (localStorageAvailable && !await removeProjectRecord(id, false)) {
+      if (discardEntireProject) {
+        if (!await removeProjectRecord(id, true)) {
           showToast('Не удалось удалить несохранённый проект');
           return;
         }
-      } else if (hadQueuedWrite || hadInFlightWrite) {
-        // The IDB body may have committed even when updating the local project
-        // index failed. Restore the captured baseline after any pending/in-flight
-        // write, not only when the in-memory baseline object changed.
+      } else if (baseline) {
+        // Always restore the open-time version. Autosave may already have
+        // committed edits to IndexedDB even when no write is currently pending.
         try {
           await persistProjectSnapshot({ id, data: baseline });
         } catch (error) {
@@ -2231,6 +2362,9 @@
           showToast('Не удалось отменить последнее сохранение');
           return;
         }
+      } else {
+        showToast('Не удалось восстановить исходную версию проекта');
+        return;
       }
     }
     completeExitToStartScreen();
@@ -5313,6 +5447,135 @@
     });
   }
 
+  function copySelectedNodesToInternalClipboard() {
+    const selectedNodeIdSet = new Set(selectedIds);
+    if (selectedId) selectedNodeIdSet.add(selectedId);
+
+    const selectedNodes = scene.nodes.filter(node => selectedNodeIdSet.has(node.id));
+    if (!selectedNodes.length) return 0;
+
+    // Measure the union of the selected nodes, preferring current rendered
+    // dimensions but retaining model dimensions when an element is not mounted.
+    const bounds = selectedNodes.reduce((result, node) => {
+      const element = renderedNodeElements.get(node.id) || null;
+      const x = Number(node.x) || 0;
+      const y = Number(node.y) || 0;
+      const width = Math.max(10, Number(element?.offsetWidth) || Number(node.width) || 120);
+      const height = Math.max(10, Number(element?.offsetHeight) || Number(node.height) || 30);
+      result.left = Math.min(result.left, x);
+      result.top = Math.min(result.top, y);
+      result.right = Math.max(result.right, x + width);
+      result.bottom = Math.max(result.bottom, y + height);
+      return result;
+    }, { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity });
+
+    const copiedNodes = selectedNodes.map(node => {
+      const copiedNode = clone(node);
+      if (copiedNode.type === 'image') {
+        const imageData = (node.imageKey && imageStore.get(node.imageKey)) || node.image || '';
+        copiedNode.image = imageData;
+      }
+      return copiedNode;
+    });
+    const copiedNodeIds = new Set(copiedNodes.map(node => node.id));
+    const copiedEdges = scene.edges
+      .filter(edge => copiedNodeIds.has(edge.from) && copiedNodeIds.has(edge.to))
+      .map(edge => clone(edge));
+
+    internalClipboard = {
+      nodes: copiedNodes,
+      edges: copiedEdges,
+      centerX: (bounds.left + bounds.right) / 2,
+      centerY: (bounds.top + bounds.bottom) / 2
+    };
+    return copiedNodes.length;
+  }
+
+  function pasteInternalClipboardAtVisibleCenter() {
+    if (presentationMode || !internalClipboard || !Array.isArray(internalClipboard.nodes) || !internalClipboard.nodes.length) {
+      return 0;
+    }
+
+    if (playback.active) exitPlayback();
+    if (editingId) finishEditing(editingId, true);
+
+    const targetCenter = getVisibleCanvasCenter();
+    let offsetX = targetCenter.x - (Number(internalClipboard.centerX) || 0);
+    let offsetY = targetCenter.y - (Number(internalClipboard.centerY) || 0);
+    // Avoid placing a fresh copy exactly on top of its source when the camera
+    // has not moved since Ctrl/Cmd+C.
+    if (Math.abs(offsetX) < 1 && Math.abs(offsetY) < 1) {
+      offsetX += 28;
+      offsetY += 28;
+    }
+
+    const idMap = new Map();
+    const usedIds = new Set([
+      ...scene.nodes.map(node => node.id),
+      ...scene.edges.map(edge => edge.id)
+    ]);
+    const makeUniqueId = () => {
+      let id = safeId();
+      while (usedIds.has(id)) id = safeId();
+      usedIds.add(id);
+      return id;
+    };
+    const newNodes = internalClipboard.nodes.map(sourceNode => {
+      const node = clone(sourceNode);
+      const oldId = node.id;
+      const newId = makeUniqueId();
+      idMap.set(oldId, newId);
+      node.id = newId;
+      node.x = Math.max(0, Math.round((Number(node.x) || 0) + offsetX));
+      node.y = Math.max(0, Math.round((Number(node.y) || 0) + offsetY));
+
+      if (node.type === 'image') {
+        const imageData = typeof node.image === 'string' && node.image ? node.image : '';
+        const imageKey = `image:${newId}`;
+        if (imageData) imageStore.set(imageKey, imageData);
+        node.imageKey = imageKey;
+        if (imageData) node.image = imageData;
+        else delete node.image;
+      } else {
+        delete node.imageKey;
+        delete node.image;
+      }
+      return node;
+    });
+
+    const newEdges = internalClipboard.edges
+      .map(sourceEdge => {
+        const edge = clone(sourceEdge);
+        const newFrom = idMap.get(edge.from);
+        const newTo = idMap.get(edge.to);
+        if (!newFrom || !newTo) return null;
+        edge.id = makeUniqueId();
+        edge.from = newFrom;
+        edge.to = newTo;
+        return edge;
+      })
+      .filter(Boolean);
+
+    scene.nodes.push(...newNodes);
+    scene.edges.push(...newEdges);
+    selectedIds.splice(0, selectedIds.length, ...newNodes.map(node => node.id));
+    selectedId = newNodes.length ? newNodes[newNodes.length - 1].id : null;
+    selectedEdgeIds.splice(0);
+    editingId = null;
+    editingOriginalText = null;
+    shouldFocusNewNode = false;
+    mode = 'select';
+    syncModeButtons();
+    modeIndicator.classList.remove('visible');
+    stage.style.cursor = 'default';
+    closeNodeContextMenu();
+
+    commitScene(newNodes.length > 1
+      ? `Вставлено элементов: ${newNodes.length}`
+      : 'Элемент вставлен');
+    return newNodes.length;
+  }
+
   function positionContextMenu(x, y) {
     if (window.innerWidth < 768) {
       nodeContextMenu.style.left = '0px';
@@ -5816,11 +6079,503 @@
   }
   function exportProject() {
     if (editingId) finishEditing(editingId, true);
-    if (!scene.nodes.length) { showToast('Добавь хотя бы один узел для экспорта'); return; }
+    if (!hasProjectContent()) { showToast('Проект пуст — нечего экспортировать'); return; }
+    if (exportFileNameInput) exportFileNameInput.value = projectTitle.value.trim() || 'NetNorth';
+    const defaultFormat = document.querySelector('input[name="exportFormat"][value="png"]');
+    if (defaultFormat) defaultFormat.checked = true;
     exportScreen.classList.add('visible');
   }
 
-  function exportProjectJSON() {
+  function exportStandaloneHtml(fileName) {
+    exportScreen.classList.remove('visible');
+    if (editingId) finishEditing(editingId, true);
+    if (!scene.nodes.length) { showToast('Добавь хотя бы один узел для экспорта'); return; }
+
+    try {
+      const dark = document.body.classList.contains('dark-theme');
+      const activeTheme = dark ? 'dark' : 'light';
+      const sceneSnapshot = snapshot(scene);
+      const measureCanvas = document.createElement('canvas');
+      const measureContext = measureCanvas.getContext('2d');
+      const nodes = sceneSnapshot.nodes.map(node => {
+        const liveElement = renderedNodeElements.get(node.id);
+        const live = !!(liveElement && liveElement.isConnected);
+        const fallback = node.type === 'image'
+          ? { width: Math.max(10, Number(node.width) || 360), height: Math.max(10, Number(node.height) || 240) }
+          : createFallbackExportNodeMetrics(node, measureContext);
+        const width = live && Number(liveElement.offsetWidth) > 0
+          ? Number(liveElement.offsetWidth)
+          : Number(fallback.width) || Math.max(10, Number(node.width) || 180);
+        const height = live && Number(liveElement.offsetHeight) > 0
+          ? Number(liveElement.offsetHeight)
+          : Number(fallback.height) || Math.max(10, Number(node.height) || 42);
+        const normalizedColor = typeof node.color === 'string' ? node.color.toLowerCase() : '#111111';
+        const isDefaultTextColor = !normalizedColor || normalizedColor === '#111111' || normalizedColor === '#171717';
+        const textColor = isDefaultTextColor
+          ? (dark && !node.highlight ? '#f2f2f2' : '#111111')
+          : normalizedColor;
+        const normalizedBorder = typeof node.borderColor === 'string' ? node.borderColor.toLowerCase() : '#111111';
+        const isDefaultBorder = normalizedBorder === '#111111' || normalizedBorder === '#171717';
+        const borderColor = dark && isDefaultBorder ? '#e5e5e5' : normalizedBorder;
+        const imageKey = typeof node.imageKey === 'string' ? node.imageKey : '';
+        const imageData = node.type === 'image' && imageKey ? (imageStore.get(imageKey) || '') : '';
+        return {
+          id: String(node.id),
+          type: node.type === 'image' ? 'image' : 'text',
+          x: Number(node.x) || 0,
+          y: Number(node.y) || 0,
+          width: Math.max(10, width),
+          height: Math.max(10, height),
+          text: String(node.text || ''),
+          fontSize: clamp(Number(node.fontSize) || 16, 8, 80),
+          color: textColor,
+          framed: node.type !== 'image' && !!node.framed,
+          borderColor,
+          highlight: node.type !== 'image' && !!node.highlight,
+          underline: node.type !== 'image' && !!node.underline,
+          imageKey
+        };
+      });
+      const validSides = new Set(['top', 'right', 'bottom', 'left']);
+      const edges = sceneSnapshot.edges.map(edge => ({
+        id: String(edge.id || ''),
+        from: String(edge.from || ''),
+        to: String(edge.to || ''),
+        fromSide: validSides.has(edge.fromSide) ? edge.fromSide : 'right',
+        toSide: validSides.has(edge.toSide) ? edge.toSide : 'left',
+        style: ['curved', 'straight', 'square', 'dashed'].includes(edge.style) ? edge.style : 'curved',
+        color: typeof edge.color === 'string' && /^#[0-9a-f]{6}$/i.test(edge.color) ? edge.color.toLowerCase() : '#171717',
+        arrowhead: edge.arrowhead !== false,
+        bidirectional: edge.bidirectional === true
+      }));
+      const imageAssets = collectProjectImageAssets([sceneSnapshot]);
+      // Include every referenced image directly from the immutable image store.
+      nodes.forEach(node => {
+        if (node.type !== 'image' || !node.imageKey || imageAssets[node.imageKey]) return;
+        const imageData = imageStore.get(node.imageKey);
+        if (typeof imageData === 'string' && imageData) imageAssets[node.imageKey] = imageData;
+      });
+
+      const title = projectTitle.value.trim() || 'NetNorth';
+      const safeFileName = String(fileName || title || 'NetNorth')
+        .replace(/\.html$/i, '')
+        .replace(/[\\/:*?"<>|]+/g, '_')
+        .replace(/[\u0000-\u001f]/g, '')
+        .trim()
+        .slice(0, 90) || 'NetNorth';
+      const escapeHtml = value => String(value).replace(/[&<>"']/g, character => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[character]));
+      const viewerData = {
+        title,
+        theme: activeTheme,
+        nodes,
+        edges,
+        images: imageAssets
+      };
+      const json = JSON.stringify(viewerData)
+        .replace(/<\/script/gi, '<\\/script')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+
+      const html = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="${activeTheme}">
+<title>${escapeHtml(title)} — NetNorth</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+  body { background: ${dark ? '#111111' : '#ffffff'}; color: ${dark ? '#f1f1f1' : '#171717'}; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #viewer { position: fixed; inset: 0; overflow: hidden; touch-action: none; cursor: grab; -webkit-user-select: none; user-select: none; }
+  #viewer.is-dragging { cursor: grabbing; }
+  #world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
+  #edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+  .node { position: absolute; z-index: 2; box-sizing: border-box; min-width: 0; min-height: 0; padding: 10px 12px; border: 1px solid transparent; border-radius: 2px; background: transparent; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; hyphens: manual; line-height: 1.28; font-size: 16px; font-weight: 720; letter-spacing: -.25px; color: ${dark ? '#f2f2f2' : '#111111'}; }
+  .node-text { display: inline; color: inherit; font: inherit; line-height: inherit; letter-spacing: inherit; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+  .node.framed { border: 1.5px solid var(--node-border-color, #111111); border-radius: 9px; background: ${dark ? 'rgba(28,28,28,.97)' : 'rgba(255,255,255,.96)'}; box-shadow: 0 2px 8px rgba(0,0,0,.07); }
+  .node.highlight .node-text { color: #111111; background: #ffea00; box-shadow: 2px 0 0 #ffea00, -2px 0 0 #ffea00; }
+  .node.underlined .node-text { text-decoration: none; background-image: linear-gradient(currentColor, currentColor); background-repeat: repeat-x; background-size: 100% 1.5px; background-position: left calc(100% - 1px); -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+  .node.image-node { padding: 0; border-color: transparent; border-radius: 0; background: transparent; line-height: 0; font-size: 0; white-space: normal; overflow: hidden; }
+  .node-image { display: block; width: 100%; height: 100%; object-fit: fill; pointer-events: none; user-select: none; -webkit-user-drag: none; }
+  a.node-link { color: ${dark ? '#82baff' : '#145fc3'}; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; cursor: pointer; overflow-wrap: break-word; word-break: normal; -webkit-user-drag: none; }
+  #fitButton { position: fixed; z-index: 10; top: max(14px, env(safe-area-inset-top)); right: max(14px, env(safe-area-inset-right)); display: grid; place-items: center; width: 38px; height: 38px; padding: 0; border: 1px solid ${dark ? 'rgba(255,255,255,.17)' : 'rgba(0,0,0,.12)'}; border-radius: 9px; color: ${dark ? '#eeeeee' : '#252525'}; background: ${dark ? 'rgba(34,34,34,.68)' : 'rgba(255,255,255,.72)'}; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); cursor: pointer; opacity: .72; transition: opacity .16s ease, background .16s ease, transform .16s ease; }
+  #fitButton:hover { opacity: 1; transform: translateY(-1px); }
+  #fitButton:active { transform: scale(.96); }
+  #fitButton svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  #watermark { position: fixed; z-index: 9; right: max(15px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); color: ${dark ? '#ffffff' : '#111111'}; opacity: .35; font-size: 11px; font-weight: 750; letter-spacing: .12em; pointer-events: none; }
+  @media (prefers-reduced-motion: reduce) { #fitButton { transition: none; } }
+</style>
+</head>
+<body>
+<div id="viewer" aria-label="Интерактивная схема NetNorth">
+  <div id="world"><svg id="edges" aria-hidden="true"></svg></div>
+</div>
+<button id="fitButton" type="button" aria-label="Вписать в экран" title="Вписать в экран"><svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3M8 8h8v8H8z"/></svg></button>
+<div id="watermark">NetNorth</div>
+<script type="application/json" id="scene-data">${json}</script>
+<script>
+(function () {
+  'use strict';
+  const dataElement = document.getElementById('scene-data');
+  let data;
+  try { data = JSON.parse(dataElement.textContent || '{}'); } catch (_) { return; }
+  const viewer = document.getElementById('viewer');
+  const world = document.getElementById('world');
+  const svg = document.getElementById('edges');
+  const fitButton = document.getElementById('fitButton');
+  const NS = 'http://www.w3.org/2000/svg';
+  const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+  const edges = Array.isArray(data.edges) ? data.edges : [];
+  const images = data.images || {};
+  const nodeById = new Map(nodes.map(node => [node.id, node]));
+  const numberOr = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+  const validSide = side => ['top', 'right', 'bottom', 'left'].includes(side) ? side : 'right';
+  const nodeWidth = node => Math.max(10, numberOr(node.width, 180));
+  const nodeHeight = node => Math.max(10, numberOr(node.height, 42));
+  const pointFor = (node, side) => {
+    const width = nodeWidth(node), height = nodeHeight(node);
+    if (side === 'top') return { x: node.x + width / 2, y: node.y };
+    if (side === 'right') return { x: node.x + width, y: node.y + height / 2 };
+    if (side === 'bottom') return { x: node.x + width / 2, y: node.y + height };
+    return { x: node.x, y: node.y + height / 2 };
+  };
+  const vectorFor = side => ({ top: {x:0,y:-1}, right:{x:1,y:0}, bottom:{x:0,y:1}, left:{x:-1,y:0} }[side] || {x:1,y:0});
+  const compactPoints = points => points.filter((point, index) => {
+    if (!index) return true;
+    const previous = points[index - 1];
+    return Math.abs(point.x - previous.x) > .001 || Math.abs(point.y - previous.y) > .001;
+  });
+  function buildSquareContexts() {
+    const groups = new Map();
+    edges.forEach(edge => {
+      if (edge.style !== 'square') return;
+      const fromSide = validSide(edge.fromSide), toSide = validSide(edge.toSide);
+      const key = edge.from + '::' + fromSide;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push({ edge, fromSide, toSide });
+    });
+    const contexts = new Map();
+    const median = values => {
+      if (!values.length) return 0;
+      const ordered = values.slice().sort((a, b) => a - b);
+      const middle = Math.floor(ordered.length / 2);
+      return ordered.length % 2 ? ordered[middle] : (ordered[middle - 1] + ordered[middle]) / 2;
+    };
+    groups.forEach(group => {
+      if (group.length < 2) return;
+      const first = group[0];
+      const source = nodeById.get(first.edge.from);
+      if (!source) return;
+      const sourcePoint = pointFor(source, first.fromSide);
+      const horizontal = first.fromSide === 'left' || first.fromSide === 'right';
+      const direction = first.fromSide === 'right' || first.fromSide === 'bottom' ? 1 : -1;
+      const origin = horizontal ? sourcePoint.x : sourcePoint.y;
+      const outward = [];
+      const fallback = [];
+      group.forEach(item => {
+        const target = nodeById.get(item.edge.to);
+        if (!target) return;
+        const targetPoint = pointFor(target, item.toSide);
+        const coordinate = horizontal ? targetPoint.x : targetPoint.y;
+        const distance = (coordinate - origin) * direction;
+        if (distance > .5) outward.push(distance);
+        if (Math.abs(coordinate - origin) > .5) fallback.push(Math.abs(coordinate - origin));
+      });
+      const distanceToBranch = median(outward.length ? outward : fallback);
+      const axis = origin + direction * distanceToBranch * .5;
+      group.forEach(item => contexts.set(item.edge.id, { axis, horizontal, fromSide: first.fromSide, siblingCount: group.length }));
+    });
+    return contexts;
+  }
+  function squarePoints(a, b, fromSide, toSide, context) {
+    const fromVector = vectorFor(fromSide), toVector = vectorFor(toSide);
+    const fromHorizontal = fromVector.x !== 0, toHorizontal = toVector.x !== 0;
+    if (context && Number.isFinite(context.axis)) {
+      const axis = context.axis;
+      let points;
+      if (fromHorizontal) {
+        if (toHorizontal) {
+          points = [a, {x:axis,y:a.y}, {x:axis,y:b.y}, b];
+        } else {
+          const sideDirection = toSide === 'top' ? -1 : 1;
+          const stub = Math.min(24, Math.max(8, Math.abs(b.y - a.y) * .2));
+          const branchY = b.y + sideDirection * stub;
+          points = [a, {x:axis,y:a.y}, {x:axis,y:branchY}, {x:b.x,y:branchY}, b];
+        }
+      } else if (!toHorizontal) {
+        points = [a, {x:a.x,y:axis}, {x:b.x,y:axis}, b];
+      } else {
+        const sideDirection = toSide === 'left' ? -1 : 1;
+        const stub = Math.min(24, Math.max(8, Math.abs(b.x - a.x) * .2));
+        const branchX = b.x + sideDirection * stub;
+        points = [a, {x:a.x,y:axis}, {x:branchX,y:axis}, {x:branchX,y:b.y}, b];
+      }
+      return compactPoints(points);
+    }
+    const axisDistance = fromHorizontal ? Math.abs(b.x - a.x) : Math.abs(b.y - a.y);
+    const span = Math.max(0, Math.min(80, Math.max(8, axisDistance * .25), axisDistance * .45));
+    const start = {x:a.x + fromVector.x * span, y:a.y + fromVector.y * span};
+    const end = {x:b.x + toVector.x * span, y:b.y + toVector.y * span};
+    let bends;
+    if (fromHorizontal && toHorizontal) {
+      const middleX = (start.x + end.x) / 2;
+      bends = [{x:middleX,y:start.y},{x:middleX,y:end.y}];
+    } else if (!fromHorizontal && !toHorizontal) {
+      const middleY = (start.y + end.y) / 2;
+      bends = [{x:start.x,y:middleY},{x:end.x,y:middleY}];
+    } else if (fromHorizontal) bends = [{x:end.x,y:start.y}];
+    else bends = [{x:start.x,y:end.y}];
+    return compactPoints([a,start,...bends,end,b]);
+  }
+  function edgePath(a, b, fromSide, toSide, style, context) {
+    if (style === 'straight') return 'M ' + a.x + ' ' + a.y + ' L ' + b.x + ' ' + b.y;
+    if (style === 'square') return squarePoints(a,b,fromSide,toSide,context).map((point,index) => (index ? 'L ' : 'M ') + point.x + ' ' + point.y).join(' ');
+    const curve = Math.max(28, Math.min(110, Math.max(Math.abs(b.x-a.x),Math.abs(b.y-a.y))*.42));
+    const c1 = {x:a.x,y:a.y}, c2 = {x:b.x,y:b.y};
+    if (fromSide === 'right') c1.x += curve;
+    if (fromSide === 'left') c1.x -= curve;
+    if (fromSide === 'top') c1.y -= curve;
+    if (fromSide === 'bottom') c1.y += curve;
+    if (toSide === 'right') c2.x += curve;
+    if (toSide === 'left') c2.x -= curve;
+    if (toSide === 'top') c2.y -= curve;
+    if (toSide === 'bottom') c2.y += curve;
+    return 'M ' + a.x + ' ' + a.y + ' C ' + c1.x + ' ' + c1.y + ', ' + c2.x + ' ' + c2.y + ', ' + b.x + ' ' + b.y;
+  }
+  function svgElement(name, attributes) {
+    const element = document.createElementNS(NS, name);
+    Object.keys(attributes || {}).forEach(key => element.setAttribute(key, String(attributes[key])));
+    return element;
+  }
+  function buildLinks(container, text) {
+    const value = String(text || '');
+    const pattern = /(?:https?:\\/\\/|www\\.)[^\\s<>"']+/gi;
+    let last = 0, match;
+    while ((match = pattern.exec(value))) {
+      const raw = match[0];
+      const trailingMatch = raw.match(/[.,!?;:)\\]}]+$/);
+      const trailing = trailingMatch ? trailingMatch[0] : '';
+      const visible = trailing ? raw.slice(0, -trailing.length) : raw;
+      if (!visible) continue;
+      if (match.index > last) container.appendChild(document.createTextNode(value.slice(last, match.index)));
+      const anchor = document.createElement('a');
+      anchor.className = 'node-link';
+      anchor.textContent = visible;
+      anchor.href = /^www\\./i.test(visible) ? 'https://' + visible : visible;
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      container.appendChild(anchor);
+      if (trailing) container.appendChild(document.createTextNode(trailing));
+      last = pattern.lastIndex;
+    }
+    if (last < value.length) container.appendChild(document.createTextNode(value.slice(last)));
+  }
+  function renderGraph() {
+    const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    nodes.forEach(node => {
+      node.x = numberOr(node.x, 0); node.y = numberOr(node.y, 0);
+      const width = nodeWidth(node), height = nodeHeight(node);
+      bounds.minX = Math.min(bounds.minX, node.x);
+      bounds.minY = Math.min(bounds.minY, node.y);
+      bounds.maxX = Math.max(bounds.maxX, node.x + width);
+      bounds.maxY = Math.max(bounds.maxY, node.y + height);
+    });
+    if (!nodes.length) { bounds.minX = 0; bounds.minY = 0; bounds.maxX = 1; bounds.maxY = 1; }
+    const graphWidth = Math.max(1, bounds.maxX), graphHeight = Math.max(1, bounds.maxY);
+    world.style.width = graphWidth + 'px';
+    world.style.height = graphHeight + 'px';
+    svg.setAttribute('width', graphWidth);
+    svg.setAttribute('height', graphHeight);
+    svg.setAttribute('viewBox', '0 0 ' + graphWidth + ' ' + graphHeight);
+    const defs = svgElement('defs');
+    svg.appendChild(defs);
+    const contexts = buildSquareContexts();
+    edges.forEach((edge, index) => {
+      const from = nodeById.get(edge.from), to = nodeById.get(edge.to);
+      if (!from || !to) return;
+      const fromSide = validSide(edge.fromSide), toSide = validSide(edge.toSide);
+      const a = pointFor(from, fromSide), b = pointFor(to, toSide);
+      const rawColor = /^#[0-9a-f]{6}$/i.test(edge.color || '') ? edge.color.toLowerCase() : '#171717';
+      const isDefault = rawColor === '#171717' || rawColor === '#111111';
+      const color = data.theme === 'dark' && isDefault ? '#e5e5e5' : rawColor;
+      const markerId = 'arrow-' + index;
+      if (edge.arrowhead !== false) {
+        const marker = svgElement('marker', { id: markerId, viewBox: '0 0 10 10', refX: 8, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
+        marker.appendChild(svgElement('path', { d: 'M 0 1 L 9 5 L 0 9 z', fill: color }));
+        defs.appendChild(marker);
+      }
+      const pathAttributes = { d: edgePath(a,b,fromSide,toSide,edge.style,contexts.get(edge.id)), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+      if (edge.style === 'dashed') pathAttributes['stroke-dasharray'] = '6 6';
+      if (edge.arrowhead !== false) pathAttributes['marker-end'] = 'url(#' + markerId + ')';
+      if (edge.arrowhead !== false && edge.bidirectional === true) pathAttributes['marker-start'] = 'url(#' + markerId + ')';
+      svg.appendChild(svgElement('path', pathAttributes));
+    });
+    nodes.forEach(node => {
+      const element = document.createElement('div');
+      const isImage = node.type === 'image';
+      element.className = 'node' + (isImage ? ' image-node' : '') + (node.framed ? ' framed' : '') + (node.highlight ? ' highlight' : '') + (node.underline ? ' underlined' : '');
+      element.style.left = node.x + 'px';
+      element.style.top = node.y + 'px';
+      element.style.width = nodeWidth(node) + 'px';
+      element.style.height = nodeHeight(node) + 'px';
+      if (isImage) {
+        element.style.padding = '0';
+        const img = document.createElement('img');
+        img.className = 'node-image';
+        img.alt = 'Изображение';
+        img.draggable = false;
+        img.src = images[node.imageKey] || '';
+        element.appendChild(img);
+      } else {
+        element.style.fontSize = numberOr(node.fontSize, 16) + 'px';
+        element.style.color = node.color || (data.theme === 'dark' && !node.highlight ? '#f2f2f2' : '#111111');
+        if (node.framed) element.style.setProperty('--node-border-color', node.borderColor || (data.theme === 'dark' ? '#e5e5e5' : '#111111'));
+        const text = document.createElement('span');
+        text.className = 'node-text';
+        text.style.color = node.color || (data.theme === 'dark' && !node.highlight ? '#f2f2f2' : '#111111');
+        buildLinks(text, node.text);
+        element.appendChild(text);
+      }
+      world.appendChild(element);
+    });
+    return bounds;
+  }
+  const bounds = renderGraph();
+  let scale = 1, tx = 0, ty = 0;
+  const MIN_SCALE = .2, MAX_SCALE = 3;
+  const clampScale = value => Math.max(MIN_SCALE, Math.min(MAX_SCALE, value));
+  function applyTransform() { world.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + scale + ')'; }
+  function fitToScreen() {
+    const rect = viewer.getBoundingClientRect();
+    const width = Math.max(1, bounds.maxX - bounds.minX);
+    const height = Math.max(1, bounds.maxY - bounds.minY);
+    const padding = Math.min(70, Math.max(28, Math.min(rect.width, rect.height) * .06));
+    scale = clampScale(Math.min((rect.width - padding * 2) / width, (rect.height - padding * 2) / height));
+    tx = (rect.width - width * scale) / 2 - bounds.minX * scale;
+    ty = (rect.height - height * scale) / 2 - bounds.minY * scale;
+    applyTransform();
+  }
+  fitButton.addEventListener('click', fitToScreen);
+  window.addEventListener('resize', fitToScreen);
+  let pointers = new Map();
+  let pan = null;
+  let pinch = null;
+  function distance(a,b) { return Math.hypot(a.x-b.x,a.y-b.y); }
+  function midpoint(a,b) { return {x:(a.x+b.x)/2,y:(a.y+b.y)/2}; }
+  function onPointerDown(event) {
+    if (event.button !== undefined && event.button !== 0) return;
+    if (event.target === fitButton || fitButton.contains(event.target)) return;
+    event.preventDefault();
+    const point = {x:event.clientX,y:event.clientY};
+    const link = event.target.closest ? event.target.closest('a.node-link') : null;
+    pointers.set(event.pointerId, { point, start: point, link, moved: false });
+    try { viewer.setPointerCapture(event.pointerId); } catch (_) {}
+    if (pointers.size === 1) {
+      pan = { id:event.pointerId, start:point, tx, ty };
+      pinch = null;
+    } else if (pointers.size >= 2) {
+      // A multi-touch gesture is navigation, never a link activation.
+      pointers.forEach(pointerState => { pointerState.moved = true; });
+      const list = Array.from(pointers.values()).slice(0,2);
+      const middle = midpoint(list[0].point,list[1].point);
+      pinch = { distance:Math.max(1,distance(list[0].point,list[1].point)), scale, worldX:(middle.x-tx)/scale, worldY:(middle.y-ty)/scale };
+      pan = null;
+    }
+    viewer.classList.add('is-dragging');
+  }
+  function onPointerMove(event) {
+    const state = pointers.get(event.pointerId);
+    if (!state) return;
+    event.preventDefault();
+    state.point = {x:event.clientX,y:event.clientY};
+    if (distance(state.start,state.point) > 5) state.moved = true;
+    if (pointers.size >= 2 && pinch) {
+      const list = Array.from(pointers.values()).slice(0,2);
+      const middle = midpoint(list[0].point,list[1].point);
+      const nextScale = clampScale(pinch.scale * (distance(list[0].point,list[1].point) / pinch.distance));
+      scale = nextScale;
+      tx = middle.x - pinch.worldX * scale;
+      ty = middle.y - pinch.worldY * scale;
+      applyTransform();
+      return;
+    }
+    if (pan && pan.id === event.pointerId) {
+      tx = pan.tx + (state.point.x - pan.start.x);
+      ty = pan.ty + (state.point.y - pan.start.y);
+      applyTransform();
+    }
+  }
+  function onPointerUp(event) {
+    const state = pointers.get(event.pointerId);
+    if (!state) return;
+    if (distance(state.start, {x:event.clientX,y:event.clientY}) > 5) state.moved = true;
+    const cancelled = event.type === 'pointercancel' || event.type === 'lostpointercapture';
+    if (!cancelled && state.link && !state.moved && pointers.size === 1) {
+      const href = state.link.href;
+      window.open(href, '_blank', 'noopener,noreferrer');
+    }
+    pointers.delete(event.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 1) {
+      const remaining = Array.from(pointers.entries())[0];
+      const id = remaining[0], current = remaining[1];
+      pan = { id, start:current.point, tx, ty };
+    } else if (pointers.size === 0) pan = null;
+    if (pointers.size === 0) viewer.classList.remove('is-dragging');
+    try { viewer.releasePointerCapture(event.pointerId); } catch (_) {}
+  }
+  function zoomAt(clientX, clientY, factor) {
+    const rect = viewer.getBoundingClientRect();
+    const x = clientX - rect.left, y = clientY - rect.top;
+    const worldX = (x - tx) / scale, worldY = (y - ty) / scale;
+    scale = clampScale(scale * factor);
+    tx = x - worldX * scale;
+    ty = y - worldY * scale;
+    applyTransform();
+  }
+  viewer.addEventListener('pointerdown', onPointerDown);
+  viewer.addEventListener('pointermove', onPointerMove);
+  viewer.addEventListener('pointerup', onPointerUp);
+  viewer.addEventListener('pointercancel', onPointerUp);
+  viewer.addEventListener('lostpointercapture', onPointerUp);
+  viewer.addEventListener('click', event => {
+    const link = event.target.closest ? event.target.closest('a.node-link') : null;
+    if (link) {
+      event.preventDefault();
+      if (event.detail === 0) window.open(link.href, '_blank', 'noopener,noreferrer');
+    }
+  });
+  viewer.addEventListener('wheel', event => {
+    event.preventDefault();
+    zoomAt(event.clientX,event.clientY,Math.exp(-event.deltaY*.0015));
+  }, {passive:false});
+  document.addEventListener('contextmenu', event => event.preventDefault());
+  requestAnimationFrame(fitToScreen);
+})();
+</script>
+</body>
+</html>`;
+
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = safeFileName + '.html';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      showToast('Интерактивный HTML экспортирован');
+    } catch (error) {
+      console.error('Standalone HTML export failed:', error);
+      showToast('Не удалось создать HTML-файл');
+    }
+  }
+
+  function exportProjectJSON(customFileName = null) {
     const sceneSnapshot = snapshot();
     const timelineSnapshot = timeline.map(frame => ({
       at: Math.max(0, Number(frame.at) || 0),
@@ -5842,8 +6597,8 @@
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    const name = (data.title || 'NetNorth').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNorth';
-    a.href = url; a.download = `${name}.json`; document.body.appendChild(a); a.click(); a.remove();
+    const cleanName = String(customFileName ?? (projectTitle.value.trim() || 'NetNorth')).replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNorth';
+    a.href = url; a.download = `${cleanName}.json`; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     showToast('Проект сохранён в JSON');
   }
@@ -6004,7 +6759,7 @@
     };
   }
 
-  async function exportPng(format = 'png') {
+  async function exportPng(format = 'png', customFileName = null) {
     exportScreen.classList.remove('visible');
     if (editingId) finishEditing(editingId, true);
     if (!scene.nodes.length) { showToast('Добавь хотя бы один узел для экспорта'); return; }
@@ -6385,7 +7140,7 @@
         if ('fontKerning' in ctx) ctx.fontKerning = 'auto';
       });
 
-      const name = (projectTitle.value.trim() || 'NetNorth').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNorth';
+      const name = String(customFileName ?? (projectTitle.value.trim() || 'NetNorth')).replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNorth';
       canvas.toBlob(blob => {
         if (!blob) { showToast(`Не удалось подготовить ${formatLabel}`); return; }
         const url = URL.createObjectURL(blob);
@@ -6454,6 +7209,8 @@
 
         scene = importedScene;
         currentProjectId = makeProjectId();
+        isNewUnsavedSessionProject = true;
+        initialOpenedProjectBaseline = null;
         activeSavedProjectId = null;
         activeSavedProjectData = null;
         projectTitle.value = importedTitle;
@@ -7325,11 +8082,24 @@
   };
   themeToggleButton?.addEventListener('keydown', preventThemeButtonSpaceActivation, true);
   themeToggleButton?.addEventListener('keyup', preventThemeButtonSpaceActivation, true);
-  document.getElementById('exportJsonBtn')?.addEventListener('click', exportProjectJSON);
   document.getElementById('cancelPngExportBtn')?.addEventListener('click', () => exportScreen.classList.remove('visible'));
   document.getElementById('downloadPngBtn')?.addEventListener('click', () => {
     const option = document.querySelector('input[name="exportFormat"]:checked');
-    exportPng(option ? option.value : 'png');
+    const fileName = exportFileNameInput?.value?.trim() || projectTitle.value.trim() || 'NetNorth';
+    if (option && option.value === 'json') {
+      exportScreen.classList.remove('visible');
+      exportProjectJSON(fileName);
+      return;
+    }
+    if (option && option.value === 'html') {
+      exportStandaloneHtml(fileName);
+      return;
+    }
+    if (!scene.nodes.length) {
+      showToast('Добавь хотя бы один узел для экспорта картинки');
+      return;
+    }
+    exportPng(option ? option.value : 'png', fileName);
   });
   exportScreen?.addEventListener('pointerdown', event => { if (event.target === exportScreen) exportScreen.classList.remove('visible'); });
   document.getElementById('importBtn')?.addEventListener('click', () => importFile.click());
@@ -7340,23 +8110,45 @@
     if (file) insertImageFile(file, pendingImagePoint);
   });
   document?.addEventListener('paste', event => {
-    if (presentationMode) { event.preventDefault(); return; }
+    if (presentationMode) {
+      internalClipboardPasteRequested = false;
+      event.preventDefault();
+      return;
+    }
     const target = event.target;
-    if (target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return;
+    if (target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) {
+      internalClipboardPasteRequested = false;
+      return;
+    }
+
     const items = event.clipboardData && event.clipboardData.items;
-    if (!items) return;
     let imageFileFromClipboard = null;
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (item.kind === 'file' && ['image/png', 'image/jpeg'].includes(String(item.type || '').toLowerCase())) {
-        imageFileFromClipboard = item.getAsFile();
-        if (imageFileFromClipboard) break;
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file' && ['image/png', 'image/jpeg'].includes(String(item.type || '').toLowerCase())) {
+          imageFileFromClipboard = item.getAsFile();
+          if (imageFileFromClipboard) break;
+        }
       }
     }
-    if (!imageFileFromClipboard) return;
-    event.preventDefault();
-    pendingImagePoint = getVisibleCanvasCenter();
-    insertImageFile(imageFileFromClipboard, pendingImagePoint);
+
+    // System clipboard images always have priority over the internal node clipboard.
+    if (imageFileFromClipboard) {
+      internalClipboardPasteRequested = false;
+      event.preventDefault();
+      pendingImagePoint = getVisibleCanvasCenter();
+      insertImageFile(imageFileFromClipboard, pendingImagePoint);
+      return;
+    }
+
+    if (internalClipboardPasteRequested && internalClipboard && internalClipboard.nodes && internalClipboard.nodes.length) {
+      internalClipboardPasteRequested = false;
+      event.preventDefault();
+      pasteInternalClipboardAtVisibleCenter();
+      return;
+    }
+    internalClipboardPasteRequested = false;
   });
   document.getElementById('playHistoryBtn')?.addEventListener('click', () => playback.active ? togglePlayback() : openPlayback());
   document.getElementById('playPauseBtn')?.addEventListener('click', togglePlayback);
@@ -7611,6 +8403,35 @@
       return;
     }
     if (inTextField) return;
+
+    const hasPrimaryModifier = event.ctrlKey || event.metaKey;
+    const isCopyKey = event.code === 'KeyC' || String(event.key || '').toLowerCase() === 'c';
+    const isPasteKey = event.code === 'KeyV' || String(event.key || '').toLowerCase() === 'v';
+    if (!startScreen.classList.contains('visible') && hasPrimaryModifier && !event.shiftKey && !event.altKey) {
+      if (isCopyKey) {
+        // Preserve the browser's normal copy behavior when ordinary text is selected.
+        const selectedText = window.getSelection()?.toString() || '';
+        if (!selectedText) {
+          const copiedCount = copySelectedNodesToInternalClipboard();
+          if (copiedCount) {
+            event.preventDefault();
+            showToast(copiedCount > 1 ? `Скопировано элементов: ${copiedCount}` : 'Элемент скопирован');
+            return;
+          }
+        }
+      } else if (isPasteKey && internalClipboard && internalClipboard.nodes && internalClipboard.nodes.length) {
+        // Let the native paste event inspect clipboard files first; its handler
+        // gives PNG/JPEG files priority and otherwise pastes this internal group.
+        internalClipboardPasteRequested = true;
+        window.setTimeout(() => {
+          if (!internalClipboardPasteRequested) return;
+          internalClipboardPasteRequested = false;
+          pasteInternalClipboardAtVisibleCenter();
+        }, 30);
+        return;
+      }
+    }
+
     if (!startScreen.classList.contains('visible') && !event.altKey) {
       const numberKey = ({ Digit1: '1', Digit2: '2', Digit3: '3', Numpad1: '1', Numpad2: '2', Numpad3: '3' })[event.code];
       if (numberKey && (event.ctrlKey || event.metaKey) && !event.shiftKey) {
@@ -7706,9 +8527,6 @@
     projectStorageMigrationPromise = (async () => {
       await migrateLegacyProject();
       await migrateLocalStorageProjectRecordsToIndexedDB();
-      if (startScreen.classList.contains('visible') && !document.getElementById('startProjectsPanel').hidden) {
-        renderProjectList();
-      }
     })().catch(error => {
       console.warn('Project storage migration could not be completed:', error);
     });

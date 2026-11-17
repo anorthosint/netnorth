@@ -19,7 +19,7 @@
     <input id="projectTitle" class="project-title" value="Новая схема" aria-label="Название проекта" maxlength="90" spellcheck="false">
     <div class="topbar-spacer"></div>
     <button class="top-action" id="themeToggleBtn" title="Переключить светлую и тёмную тему"><span>Тема</span></button>
-    <button class="top-action" id="exportBtn" title="Экспортировать схему как PNG или JPG">
+    <button class="top-action" id="exportBtn" title="Экспортировать проект">
       <span class="tool-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v11m-4-4 4 4 4-4M5 16v4h14v-4"/></svg></span>
       <span>Экспорт</span>
     </button>
@@ -64,9 +64,6 @@
     </button>
     <button class="tool-button" id="projectNotesToggle" type="button" aria-controls="projectNotesPanel" aria-expanded="false" title="Заметки и задачи проекта">
       <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M6 3.5h9l3 3V20.5H6zM15 3.5v4h3M9 11h6M9 14.5h6M9 18h4"/></svg></span><span class="label">Заметки</span>
-    </button>
-    <button class="tool-button" id="exportJsonBtn" title="Сохранить проект для последующего импорта">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M12 3v11m-4-4 4 4 4-4M5 16v4h14v-4"/></svg></span><span class="label">Экспорт проекта JSON</span>
     </button>
     <button class="tool-button" id="importBtn" title="Открыть ранее экспортированный проект">
       <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M12 14V3m-4 4 4-4 4 4M5 14v6h14v-6"/></svg></span><span class="label">Импорт проекта</span>
@@ -377,11 +374,15 @@
 </div>
 <div class="export-screen" id="exportScreen" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
   <div class="export-panel">
-    <h2 id="exportTitle">Экспорт изображения</h2>
-    <p>Схема будет автоматически вписана в изображение. Фон будет однотонным: белым в светлой теме или чёрным в тёмной.</p>
+    <h2 id="exportTitle">Экспорт проекта</h2>
+    <p>Выбери формат и название файла для сохранения.</p>
+    <label for="exportFileNameInput" class="export-filename-label">Имя файла</label>
+    <input type="text" id="exportFileNameInput" class="export-filename-input" placeholder="Название файла" autocomplete="off">
     <div class="export-options" role="radiogroup" aria-label="Формат файла">
       <label class="export-option"><input type="radio" name="exportFormat" value="png" checked><span><strong>PNG</strong><br><span style="color:#888">Без потери качества</span></span></label>
       <label class="export-option"><input type="radio" name="exportFormat" value="jpeg"><span><strong>JPG</strong><br><span style="color:#888">Меньший размер файла</span></span></label>
+      <label class="export-option"><input type="radio" name="exportFormat" value="json"><span><strong>JSON</strong><br><span style="color:#888">Резервная копия проекта со всеми узлами, заметками и историей</span></span></label>
+      <label class="export-option"><input type="radio" name="exportFormat" value="html"><span><strong>Интерактивный HTML</strong><br><span style="color:#888">Автономный файл для Telegram и браузера: можно двигать, приближать и кликать по ссылкам</span></span></label>
     </div>
     <div class="export-actions"><button type="button" id="cancelPngExportBtn">Отмена</button><button type="button" class="primary" id="downloadPngBtn">Скачать</button></div>
   </div>
