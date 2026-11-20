@@ -6348,7 +6348,7 @@
     if (side === 'bottom') return { x: node.x + width / 2, y: node.y + height };
     return { x: node.x, y: node.y + height / 2 };
   };
-  const ARROW_OFFSET = 7.5;
+  const ARROW_OFFSET = 12;
   function insetEndpointBySide(point, side, offset) {
     if (!point || !offset) return point;
     if (side === 'left') return { x: point.x - offset, y: point.y };
@@ -6445,7 +6445,7 @@
     else bends = [{x:start.x,y:end.y}];
     return compactPoints([a,start,...bends,end,b]);
   }
-  function edgePath(a, b, fromSide, toSide, style, context) {
+  function edgePath(a, b, fromSide, toSide, style, context, appendArrowStart, appendArrowEnd) {
     if (style === 'straight') return 'M ' + a.x + ' ' + a.y + ' L ' + b.x + ' ' + b.y;
     if (style === 'square') return squarePoints(a,b,fromSide,toSide,context).map((point,index) => (index ? 'L ' : 'M ') + point.x + ' ' + point.y).join(' ');
     const curve = Math.max(28, Math.min(110, Math.max(Math.abs(b.x-a.x),Math.abs(b.y-a.y))*.42));
@@ -6458,7 +6458,16 @@
     if (toSide === 'left') c2.x -= curve;
     if (toSide === 'top') c2.y -= curve;
     if (toSide === 'bottom') c2.y += curve;
-    return 'M ' + a.x + ' ' + a.y + ' C ' + c1.x + ' ' + c1.y + ', ' + c2.x + ' ' + c2.y + ', ' + b.x + ' ' + b.y;
+
+    // Keep the Bézier itself 12px off the node, then finish with a 4.5px
+    // straight segment along the connection side so the arrow enters its base centrally.
+    const startLeadPoint = appendArrowStart ? insetEndpointBySide(a, fromSide, -4.5) : a;
+    const endLeadPoint = appendArrowEnd ? insetEndpointBySide(b, toSide, -4.5) : b;
+    let d = 'M ' + startLeadPoint.x + ' ' + startLeadPoint.y;
+    if (appendArrowStart) d += ' L ' + a.x + ' ' + a.y;
+    d += ' C ' + c1.x + ' ' + c1.y + ', ' + c2.x + ' ' + c2.y + ', ' + b.x + ' ' + b.y;
+    if (appendArrowEnd) d += ' L ' + endLeadPoint.x + ' ' + endLeadPoint.y;
+    return d;
   }
   function svgElement(name, attributes) {
     const element = document.createElementNS(NS, name);
@@ -6528,7 +6537,11 @@
         marker.appendChild(svgElement('path', { d: 'M 2 2.5 L 10.5 6 L 2 9.5 Z', fill: color, stroke: color, 'stroke-width': 1.2, 'stroke-linejoin': 'round' }));
         defs.appendChild(marker);
       }
-      const pathAttributes = { d: edgePath(lineStartPoint,lineEndPoint,fromSide,toSide,edge.style,contexts.get(edge.id)), fill: 'none', stroke: color, 'stroke-width': 1.25, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+      const pathAttributes = { d: edgePath(
+        lineStartPoint, lineEndPoint, fromSide, toSide, edge.style, contexts.get(edge.id),
+        edge.arrowhead !== false && edge.bidirectional === true,
+        edge.arrowhead !== false
+      ), fill: 'none', stroke: color, 'stroke-width': 1.25, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
       if (edge.style === 'dashed') pathAttributes['stroke-dasharray'] = '6 6';
       if (edge.arrowhead !== false) pathAttributes['marker-end'] = 'url(#' + markerId + ')';
       if (edge.arrowhead !== false && edge.bidirectional === true) pathAttributes['marker-start'] = 'url(#' + markerId + ')';

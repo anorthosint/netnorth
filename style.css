@@ -1474,14 +1474,14 @@ body.presentation-mode.dark-theme .presentation-exit:active { background: rgba(3
 }
 .topbar [data-tooltip]::after { top: calc(100% + 8px); transform: translate(-50%, -3px); }
 .floating-dock [data-tooltip]::after { bottom: calc(100% + 10px); transform: translate(-50%, 4px); }
-.topbar [data-tooltip]:hover::after,
-.topbar [data-tooltip]:focus-visible::after,
-.floating-dock [data-tooltip]:hover::after,
-.floating-dock [data-tooltip]:focus-visible::after {
-  opacity: 1;
-  visibility: visible;
-  transform: translate(-50%, 0);
-  transition-delay: .18s, 0s, 0s;
+@media (hover: hover) and (pointer: fine) {
+  .topbar [data-tooltip]:hover::after,
+  .floating-dock [data-tooltip]:hover::after {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, 0);
+    transition-delay: .18s, 0s, 0s;
+  }
 }
 .main { grid-column: 1; grid-row: 2; min-width: 0; min-height: 0; position: relative; }
 .floating-dock {
@@ -1643,9 +1643,14 @@ body.presentation-mode.dark-theme .presentation-exit:active { background: rgba(3
 body.presentation-mode .topbar,
 body.presentation-mode #floatingDock,
 body.presentation-mode .camera-control-rail { display: none !important; }
-@media (hover: none) {
-  .topbar [data-tooltip]::after,
-  .floating-dock [data-tooltip]::after { display: none !important; }
+@media (hover: none), (pointer: coarse) {
+  [data-tooltip]::before,
+  [data-tooltip]::after {
+    display: none !important;
+    opacity: 0 !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
+  }
 }
 @media (max-width: 767px) {
   #app { grid-template-columns: minmax(0,1fr); grid-template-rows: calc(58px + env(safe-area-inset-top)) minmax(0,1fr); }
@@ -1661,7 +1666,15 @@ body.presentation-mode .camera-control-rail { display: none !important; }
   .main { grid-column: 1; grid-row: 2; min-height: 0; }
   .floating-dock { bottom: calc(12px + env(safe-area-inset-bottom)); gap: 2px; padding: 5px; border-radius: 11px; }
   .dock-button { width: 38px; height: 38px; flex-basis: 38px; }
-  .camera-control-rail { left: max(10px, env(safe-area-inset-left)); }
+  .camera-control-rail {
+    left: max(10px, env(safe-area-inset-left));
+    top: 54px;
+    transform: none;
+  }
+  /* Keep the camera capsule compact on touch: tapping a slot must not expand it. */
+  .camera-control-rail:focus-within {
+    width: 46px !important;
+  }
   .playback-panel { bottom: calc(10px + env(safe-area-inset-bottom)); }
 }
 @media (max-width: 380px) {
@@ -1682,4 +1695,50 @@ body.presentation-mode .camera-control-rail { display: none !important; }
   .top-action,
   .topbar [data-tooltip]::after,
   .floating-dock [data-tooltip]::after { transition-duration: .01ms !important; }
+}
+
+/* Final mobile canvas width guard: no legacy sidebar column or side rail. */
+#app {
+  grid-template-columns: minmax(0, 1fr) !important;
+  width: 100vw !important;
+}
+.topbar {
+  grid-column: 1 / -1 !important;
+}
+.main {
+  grid-column: 1 / -1 !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  border-right: 0 !important;
+}
+.workspace {
+  max-width: none !important;
+  border-right: 0 !important;
+}
+.stage {
+  max-width: none !important;
+  border-right: 0 !important;
+}
+
+@media (max-width: 767px) {
+  #app {
+    grid-template-columns: minmax(0, 1fr) !important;
+    width: 100vw !important;
+  }
+  .topbar {
+    grid-column: 1 / -1 !important;
+  }
+  .main {
+    grid-column: 1 / -1 !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    border-right: 0 !important;
+  }
+  .workspace,
+  .stage {
+    max-width: none !important;
+    border-right: 0 !important;
+  }
 }
