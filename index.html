@@ -8,109 +8,36 @@
 </head>
 <body>
 <div id="app">
-  <div class="brand" aria-label="NetNorth">
-    <span class="brand-mark" aria-hidden="true"></span>
-    <span class="brand-name">NetNorth</span>
-  </div>
   <header class="topbar">
-    <button class="mobile-menu-toggle" id="mobileMenuToggle" type="button" aria-label="Открыть меню инструментов" aria-controls="mobileSidebar" aria-expanded="false">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-    </button>
+    <div class="brand" aria-label="NetNorth" role="button" tabindex="0" title="На стартовый экран">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">NetNorth</span>
+    </div>
     <input id="projectTitle" class="project-title" value="Новая схема" aria-label="Название проекта" maxlength="90" spellcheck="false">
     <div class="topbar-spacer"></div>
-    <button class="top-action" id="themeToggleBtn" title="Переключить светлую и тёмную тему"><span>Тема</span></button>
-    <button class="top-action" id="exportBtn" title="Экспортировать проект">
-      <span class="tool-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v11m-4-4 4 4 4-4M5 16v4h14v-4"/></svg></span>
-      <span>Экспорт</span>
-    </button>
-    <button class="top-action presentation-launch" id="presentationModeBtn" type="button" title="Режим презентации" aria-label="Включить режим презентации" aria-pressed="false">
-      <span class="tool-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="1.5"/><path d="M8 21h8M12 17v4M8 9h8M8 12h5"/></svg></span>
-      <span class="presentation-label">Презентация</span>
-    </button>
+    <div class="topbar-actions" aria-label="Действия холста">
+      <button class="top-action danger-action" id="clearBtn" type="button" data-tooltip="Очистить поле" aria-label="Очистить поле">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13"/></svg>
+      </button>
+      <button class="top-action" id="playHistoryBtn" type="button" data-tooltip="История создания" aria-label="История создания">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7V5Z"/></svg>
+      </button>
+      <button class="top-action" id="projectNotesToggle" type="button" data-tooltip="Заметки и задачи" aria-label="Заметки и задачи" aria-controls="projectNotesPanel" aria-expanded="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.5h9l3 3V20.5H6zM15 3.5v4h3M9 11h6M9 14.5h6M9 18h4"/></svg>
+      </button>
+      <button class="top-action" id="themeToggleBtn" type="button" data-tooltip="Переключить тему" aria-label="Переключить светлую и тёмную тему">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
+      </button>
+      <button class="top-action" id="exportBtn" type="button" data-tooltip="Экспорт" aria-label="Экспорт">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m-4-4 4 4 4-4M5 16v4h14v-4"/></svg>
+      </button>
+      <button class="top-action presentation-launch" id="presentationModeBtn" type="button" data-tooltip="Презентация" aria-label="Включить режим презентации" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="1.5"/><path d="M8 21h8M12 17v4M8 9h8M8 12h5"/></svg>
+      </button>
+    </div>
     <input type="file" class="hidden-file" id="importFile" accept="application/json,.json">
     <input type="file" class="hidden-file" id="imageFile" accept=".png,.jpg,.jpeg">
   </header>
-
-  <aside class="sidebar" id="mobileSidebar" aria-label="Инструменты NetNorth">
-    <button class="sidebar-toggle" id="sidebarToggle" type="button" aria-controls="mobileSidebar" aria-expanded="true" aria-label="Свернуть левую панель инструментов" title="Свернуть панель">
-      <span class="sidebar-toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m14.5 5-7 7 7 7"/></svg></span>
-    </button>
-    <div class="sidebar-content" id="sidebarContent">
-    <div class="section-label">ИНСТРУМЕНТЫ</div>
-    <button class="tool-button active" data-mode="select" title="Выбор и перемещение">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="m5 3 14 10-7 1-3 7L5 3Z"/></svg></span><span class="label">Выбор</span><span class="shortcut">V</span>
-    </button>
-    <button class="tool-button" data-mode="text" title="Нажмите на поле, чтобы создать текстовый узел">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M4 6V4h16v2M12 4v16m-4 0h8"/></svg></span><span class="label">Текстовый узел</span><span class="shortcut">T</span>
-    </button>
-    <button class="tool-button" data-mode="connect" title="Выберите два узла, чтобы соединить их">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="m8 8 8 8"/></svg></span><span class="label">Связь</span><span class="shortcut">C</span>
-    </button>
-    <div class="sidebar-separator"></div>
-    <div class="section-label">ДЕЙСТВИЯ</div>
-    <button class="tool-button" id="deleteBtn" title="Удалить выбранный узел">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5"/></svg></span><span class="label">Удалить выбранное</span><span class="shortcut">Del</span>
-    </button>
-    <button class="tool-button" id="undoBtn" title="Отменить действие">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5M4 9h9a6 6 0 0 1 0 12h-2"/></svg></span><span class="label">Отменить</span><span class="shortcut">Ctrl Z</span>
-    </button>
-    <button class="tool-button" id="redoBtn" title="Повторить действие">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5m5 5h-9a6 6 0 0 0 0 12h2"/></svg></span><span class="label">Повторить</span><span class="shortcut">Ctrl ⇧ Z</span>
-    </button>
-    <div class="sidebar-separator"></div>
-    <div class="section-label">ИСТОРИЯ</div>
-    <button class="tool-button" id="playHistoryBtn" title="Ускоренно воспроизвести процесс создания схемы">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg></span><span class="label">Анимация создания</span>
-    </button>
-    <button class="tool-button" id="projectNotesToggle" type="button" aria-controls="projectNotesPanel" aria-expanded="false" title="Заметки и задачи проекта">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M6 3.5h9l3 3V20.5H6zM15 3.5v4h3M9 11h6M9 14.5h6M9 18h4"/></svg></span><span class="label">Заметки</span>
-    </button>
-    <button class="tool-button" id="importBtn" title="Открыть ранее экспортированный проект">
-      <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M12 14V3m-4 4 4-4 4 4M5 14v6h14v-6"/></svg></span><span class="label">Импорт проекта</span>
-    </button>
-    <div class="sidebar-separator"></div>
-    <div class="section-label">ЗАКЛАДКИ КАМЕРЫ</div>
-    <div class="camera-control-rail" id="cameraControlRail" aria-label="Управление закладками камеры">
-      <div class="camera-bookmarks" id="cameraBookmarks" role="group" aria-label="Закладки камеры">
-        <div class="camera-bookmark-item" data-camera-slot="1">
-          <button type="button" class="camera-bookmark-go" data-camera-go="1" title="Сохранить обзор в слот 1 (Ctrl+1)" aria-label="Закладка камеры 1 пуста: сохранить обзор">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-3.8-6 3.8z"/></svg><span>1</span><i class="camera-bookmark-status" aria-hidden="true"></i>
-          </button>
-          <button type="button" class="camera-bookmark-clear" data-camera-clear="1" aria-label="Очистить закладку 1" title="Очистить закладку 1" hidden>×</button>
-        </div>
-        <div class="camera-bookmark-item" data-camera-slot="2">
-          <button type="button" class="camera-bookmark-go" data-camera-go="2" title="Сохранить обзор в слот 2 (Ctrl+2)" aria-label="Закладка камеры 2 пуста: сохранить обзор">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-3.8-6 3.8z"/></svg><span>2</span><i class="camera-bookmark-status" aria-hidden="true"></i>
-          </button>
-          <button type="button" class="camera-bookmark-clear" data-camera-clear="2" aria-label="Очистить закладку 2" title="Очистить закладку 2" hidden>×</button>
-        </div>
-        <div class="camera-bookmark-item" data-camera-slot="3">
-          <button type="button" class="camera-bookmark-go" data-camera-go="3" title="Сохранить обзор в слот 3 (Ctrl+3)" aria-label="Закладка камеры 3 пуста: сохранить обзор">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.5h12v16l-6-3.8-6 3.8z"/></svg><span>3</span><i class="camera-bookmark-status" aria-hidden="true"></i>
-          </button>
-          <button type="button" class="camera-bookmark-clear" data-camera-clear="3" aria-label="Очистить закладку 3" title="Очистить закладку 3" hidden>×</button>
-        </div>
-      </div>
-      <button type="button" class="camera-bookmark-hint-toggle" id="cameraBookmarkHintToggle"
-        aria-expanded="false" aria-controls="cameraBookmarkHint"
-        aria-label="Показать горячие клавиши закладок камеры" title="Показать горячие клавиши">
-        <svg class="camera-bookmark-hint-toggle-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 9.5 5 5 5-5"/></svg>
-      </button>
-      <div class="camera-bookmark-hint" id="cameraBookmarkHint" role="note"
-        aria-label="Горячие клавиши закладок камеры" aria-hidden="true">
-        <div class="camera-bookmark-hint-row"><kbd>Ctrl + 1 / 2 / 3</kbd><span>Сохранить обзор</span></div>
-        <div class="camera-bookmark-hint-row"><kbd>1 / 2 / 3</kbd><span>Перейти к узлу</span></div>
-      </div>
-    </div>
-    <div class="sidebar-spacer"></div>
-    <div class="sidebar-bottom">
-      <button class="tool-button" id="clearBtn" title="Очистить рабочее поле">
-        <span class="tool-icon"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13"/></svg></span><span class="label">Очистить поле</span>
-      </button>
-    </div>
-    </div>
-  </aside>
-  <div class="sidebar-backdrop" id="sidebarBackdrop" aria-hidden="true"></div>
 
   <main class="main" id="mainArea">
     <div class="workspace" id="workspace">
@@ -192,6 +119,51 @@
       <div class="playback-bottom"><span id="playbackTime">0:00</span><span id="playbackStep">Шаг 1</span></div>
     </div>
     <div class="zoom-indicator" id="zoomIndicator" aria-label="Текущий масштаб">100%</div>
+    <div class="floating-dock" id="floatingDock" role="toolbar" aria-label="Инструменты холста">
+      <button type="button" class="dock-button active" data-mode="select" data-tooltip="Выбор · V" aria-label="Выбор" aria-pressed="true">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 3 14 10-7 1-3 7L5 3Z"/></svg>
+      </button>
+      <button type="button" class="dock-button" data-mode="text" data-tooltip="Текстовый узел · T" aria-label="Текстовый узел" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6V4h16v2M12 4v16m-4 0h8"/></svg>
+      </button>
+      <button type="button" class="dock-button" data-mode="connect" data-tooltip="Связь · C" aria-label="Связь" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="m8 8 8 8"/></svg>
+      </button>
+      <span class="dock-divider" aria-hidden="true"></span>
+      <button type="button" class="dock-button" id="undoBtn" data-tooltip="Отменить · Ctrl+Z" aria-label="Отменить">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 14 4 9l5-5M4 9h9a6 6 0 0 1 0 12h-2"/></svg>
+      </button>
+      <button type="button" class="dock-button" id="redoBtn" data-tooltip="Повторить · Ctrl+Shift+Z" aria-label="Повторить">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 14 5-5-5-5m5 5h-9a6 6 0 0 0 0 12h2"/></svg>
+      </button>
+      <button type="button" class="dock-button" id="deleteBtn" data-tooltip="Удалить выбранное · Del" aria-label="Удалить выбранное">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5"/></svg>
+      </button>
+    </div>
+    <div class="camera-control-rail" id="cameraControlRail">
+      <div class="camera-dock-header">ЗАКЛАДКИ КАМЕРЫ</div>
+      <div class="camera-bookmarks" id="cameraBookmarks" role="group" aria-label="Закладки камеры">
+        <div class="camera-bookmark-item" data-camera-slot="1">
+          <button type="button" class="camera-bookmark-go" data-camera-go="1" title="Сохранить обзор в слот 1 (Ctrl+1)" aria-label="Закладка камеры 1 пуста: сохранить обзор">
+            <span class="camera-bookmark-number">1</span><i class="camera-bookmark-status" aria-hidden="true"></i><span class="camera-bookmark-label">Сохранить · Ctrl+1</span>
+          </button>
+          <button type="button" class="camera-bookmark-clear" data-camera-clear="1" aria-label="Очистить закладку 1" title="Очистить закладку 1" hidden>×</button>
+        </div>
+        <div class="camera-bookmark-item" data-camera-slot="2">
+          <button type="button" class="camera-bookmark-go" data-camera-go="2" title="Сохранить обзор в слот 2 (Ctrl+2)" aria-label="Закладка камеры 2 пуста: сохранить обзор">
+            <span class="camera-bookmark-number">2</span><i class="camera-bookmark-status" aria-hidden="true"></i><span class="camera-bookmark-label">Сохранить · Ctrl+2</span>
+          </button>
+          <button type="button" class="camera-bookmark-clear" data-camera-clear="2" aria-label="Очистить закладку 2" title="Очистить закладку 2" hidden>×</button>
+        </div>
+        <div class="camera-bookmark-item" data-camera-slot="3">
+          <button type="button" class="camera-bookmark-go" data-camera-go="3" title="Сохранить обзор в слот 3 (Ctrl+3)" aria-label="Закладка камеры 3 пуста: сохранить обзор">
+            <span class="camera-bookmark-number">3</span><i class="camera-bookmark-status" aria-hidden="true"></i><span class="camera-bookmark-label">Сохранить · Ctrl+3</span>
+          </button>
+          <button type="button" class="camera-bookmark-clear" data-camera-clear="3" aria-label="Очистить закладку 3" title="Очистить закладку 3" hidden>×</button>
+        </div>
+      </div>
+    </div>
+
     <div class="modal-backdrop" id="modalBackdrop">
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
         <h2 id="modalTitle">Очистить рабочее поле?</h2>
@@ -221,7 +193,7 @@
               <button type="button" class="edge-color-toggle" id="edgeColorToggle" aria-haspopup="grid" aria-expanded="false" aria-controls="edgeColorPalette">
                 <span>Цвет</span><span class="edge-color-preview" id="edgeColorPreview" aria-hidden="true"></span>
               </button>
-              <div class="edge-color-palette" id="edgeColorPalette" role="group" aria-label="Цвет связи" hidden>
+              <div class="edge-color-palette" id="edgeColorPalette" role="group" aria-label="Цвет связи">
                 <button type="button" class="edge-color-swatch" data-edge-color="#111111" style="--swatch-color:#111111" aria-label="Чёрный" title="Чёрный" aria-pressed="false"></button>
                 <button type="button" class="edge-color-swatch" data-edge-color="#4b4b4b" style="--swatch-color:#4b4b4b" aria-label="Тёмно-серый" title="Тёмно-серый" aria-pressed="false"></button>
                 <button type="button" class="edge-color-swatch" data-edge-color="#888888" style="--swatch-color:#888888" aria-label="Серый" title="Серый" aria-pressed="false"></button>

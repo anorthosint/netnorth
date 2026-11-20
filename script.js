@@ -1,6 +1,11 @@
 (() => {
   'use strict';
 
+  // Keep the application viewport fixed; canvas navigation is handled by #workspace.
+  window.addEventListener('scroll', () => {
+    if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+  }, { passive: true });
+
   // Declare timer before every function that can schedule/cancel project saves.
   let saveTimer = 0;
   const STORAGE_KEY = 'visualization_workspace_v1';
@@ -18,7 +23,6 @@
   const LEGACY_AUTO_ARRANGE_KEY = 'netnotrh_auto_arrange_v1';
   const LEGACY_EMPTY_HINT_DISMISSED_KEY = 'netnotrh_empty_hint_dismissed_v1';
   const PROJECT_VIEW_KEY = 'netnorth_projects_view_v1';
-  const SIDEBAR_COLLAPSED_KEY = 'netnorth_sidebar_collapsed_v1';
   const PROJECT_DB_NAME = 'netnorth_db';
   const PROJECT_DB_VERSION = 1;
   const PROJECT_DB_STORE = 'projects';
@@ -44,8 +48,6 @@
   const textNodeContextActions = document.getElementById('textNodeContextActions');
   const zoomIndicator = document.getElementById('zoomIndicator');
   const cameraBookmarksPanel = document.getElementById('cameraBookmarks');
-  const cameraBookmarkHintToggle = document.getElementById('cameraBookmarkHintToggle');
-  const cameraBookmarkHint = document.getElementById('cameraBookmarkHint');
   const CANVAS_PAD = 1400;
   let zoom = 1;
   let stageContentBounds = { maxX: 1200, maxY: 800 };
@@ -97,10 +99,6 @@
   const projectDeleteConfirmBtn = document.getElementById('projectDeleteConfirmBtn');
   const exportScreen = document.getElementById('exportScreen');
   const exportFileNameInput = document.getElementById('exportFileNameInput');
-  const mobileMenuToggle = document.getElementById('mobileMenuToggle');
-  const sidebarBackdrop = document.getElementById('sidebarBackdrop');
-  const sidebar = document.querySelector('.sidebar');
-  const sidebarToggle = document.getElementById('sidebarToggle');
   const mainArea = document.getElementById('mainArea');
   const presentationModeBtn = document.getElementById('presentationModeBtn');
   const presentationExitBtn = document.getElementById('presentationExitBtn');
@@ -128,8 +126,6 @@
   let editorVisibilityRaf = 0;
   let lastEditorScrollTarget = null;
   let editorScrollResetTimer = 0;
-  let sidebarBackdropClickGuard = null;
-  let sidebarCenterWorldX = null;
   let cameraFlightRaf = 0;
   let cameraFlightToken = 0;
   let contextCanvasPoint = { x: 0, y: 0 };
@@ -204,6 +200,7 @@
   let renderedNodeToEdges = new Map();
   let renderedSquareGroups = new Map();
   let renderedConnectionsSvg = null;
+  let smartGuidesLayer = null;
   // Spatial buckets keep viewport culling proportional to visible graph cells.
   const VIEWPORT_GRID_CELL_SIZE = 640;
   let viewportNodeGrid = new Map();
@@ -533,6 +530,7 @@
     resizeRenderTimer = 0;
     detachPointerGestureListeners();
     clearLongPress();
+    clearSmartGuides();
     drag = null;
     linkDraft = null;
     boxSelect = null;
@@ -2438,114 +2436,6 @@
     });
   }
 
-  function setMobileSidebarOpen(open) {
-    const shouldOpen = !!open;
-    document.body.classList.toggle('sidebar-open', shouldOpen);
-    if (mobileMenuToggle) {
-      mobileMenuToggle.setAttribute('aria-expanded', String(shouldOpen));
-      mobileMenuToggle.setAttribute('aria-label', shouldOpen ? 'Закрыть меню инструментов' : 'Открыть меню инструментов');
-    }
-    if (sidebarBackdrop) sidebarBackdrop.setAttribute('aria-hidden', String(!shouldOpen));
-  }
-
-  function closeMobileSidebar() {
-    setMobileSidebarOpen(false);
-  }
-
-  function syncCanvasAfterSidebarTransition() {
-    if (!workspace || !stage || !world) return;
-    const centerWorldX = Number.isFinite(sidebarCenterWorldX)
-      ? sidebarCenterWorldX
-      : (workspace.scrollLeft + workspace.clientWidth / 2) / Math.max(zoom, 0.0001);
-    sidebarCenterWorldX = null;
-
-    // The graph stage is a DOM transform layer (not a bitmap canvas). Recalculate
-    // its virtual bounds after the main grid track has finished expanding, then
-    // keep the same world point centered in the newly available viewport.
-    const baseWidth = Math.max(
-      (workspace.clientWidth || 1000) / Math.max(zoom, 0.0001),
-      1200,
-      Math.ceil(stageContentBounds.maxX + 500)
-    );
-    const baseHeight = Math.max(
-      (workspace.clientHeight || 700) / Math.max(zoom, 0.0001),
-      800,
-      Math.ceil(stageContentBounds.maxY + 400)
-    );
-    stage.style.width = `${baseWidth}px`;
-    stage.style.height = `${baseHeight}px`;
-    syncZoomLayout(baseWidth, baseHeight);
-    if (renderedConnectionsSvg) {
-      renderedConnectionsSvg.setAttribute('width', String(Math.max(baseWidth, 1)));
-      renderedConnectionsSvg.setAttribute('height', String(Math.max(baseHeight, 1)));
-    }
-
-    workspace.scrollLeft = Math.max(0, centerWorldX * zoom - workspace.clientWidth / 2);
-    scheduleViewportCulling();
-  }
-
-  function setSidebarCollapsed(collapsed, persist = true) {
-    if (!sidebar || !sidebarToggle) return;
-    const shouldCollapse = !!collapsed;
-    if (window.matchMedia('(max-width: 767px)').matches) return;
-    if (sidebar.classList.contains('collapsed') === shouldCollapse) return;
-
-    // Preserve the currently inspected world point while the grid track,
-    // sidebar content and exterior toggle animate together for 240 ms.
-    if (workspace) {
-      sidebarCenterWorldX = (workspace.scrollLeft + workspace.clientWidth / 2) / Math.max(zoom, 0.0001);
-    }
-
-    sidebar.classList.toggle('collapsed', shouldCollapse);
-    document.body.classList.toggle('sidebar-collapsed', shouldCollapse);
-    sidebarToggle.setAttribute('aria-expanded', String(!shouldCollapse));
-    sidebarToggle.setAttribute('aria-label', shouldCollapse
-      ? 'Развернуть левую панель инструментов'
-      : 'Свернуть левую панель инструментов');
-    sidebarToggle.title = shouldCollapse ? 'Развернуть панель' : 'Свернуть панель';
-
-    if (persist && localStorageAvailable) {
-      try {
-        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, shouldCollapse ? '1' : '0');
-      } catch (_) { /* The panel remains usable when storage is unavailable. */ }
-    }
-
-  }
-
-  function dismissMobileSidebarFromBackdrop(event) {
-    if (!document.body.classList.contains('sidebar-open') || !sidebarBackdrop) return;
-    if (event.target !== sidebarBackdrop) return;
-
-    // Dismiss on pointerdown, not on click. Preventing the default touch action
-    // suppresses the compatibility click that could otherwise land on the canvas
-    // after the backdrop is removed from the hit-testing tree.
-    sidebarBackdropClickGuard = {
-      x: event.clientX,
-      y: event.clientY,
-      until: Date.now() + 500
-    };
-    if (event.cancelable) event.preventDefault();
-    event.stopPropagation();
-    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
-    closeMobileSidebar();
-  }
-
-  function suppressSidebarBackdropGhostClick(event) {
-    const guard = sidebarBackdropClickGuard;
-    if (!guard) return;
-    if (Date.now() > guard.until) {
-      sidebarBackdropClickGuard = null;
-      return;
-    }
-    // Only consume the click at the exact location of the just-dismissed
-    // backdrop tap. A separate, intentional tap elsewhere remains unaffected.
-    if (event.detail === 0 || Math.hypot(event.clientX - guard.x, event.clientY - guard.y) > 28) return;
-    sidebarBackdropClickGuard = null;
-    if (event.cancelable) event.preventDefault();
-    event.stopPropagation();
-    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
-  }
-
   function scheduleActiveEditorVisibilityCheck() {
     if (editorVisibilityRaf || !workspace) return;
     editorVisibilityRaf = requestAnimationFrame(() => {
@@ -2649,7 +2539,6 @@
 
     closeNodeContextMenu();
     closeProjectActionsMenu();
-    closeMobileSidebar();
     if (mainArea && mainArea.classList.contains('project-notes-open')) setProjectNotesOpen(false);
     if (modalBackdrop && modalBackdrop.classList.contains('visible')) closeConfirm(false);
     if (projectRenameBackdrop && projectRenameBackdrop.classList.contains('visible')) closeRenameProjectModal();
@@ -2706,7 +2595,7 @@
       ? previous.mode
       : 'select';
 
-    // Reuse the regular mode setup so cursor, hint and tool-button states stay consistent.
+    // Reuse the regular mode setup so cursor and mode-button states stay consistent.
     setMode(restoredMode);
     if (previous) {
       selectedId = previous.selectedId && validNodeIds.has(previous.selectedId) ? previous.selectedId : null;
@@ -2809,6 +2698,13 @@
       const nodeLabel = node
         ? (node.type === 'image' ? 'изображение' : (String(node.text || '').trim().replace(/\s+/g, ' ').slice(0, 42) || 'текстовый узел'))
         : '';
+      const bookmarkLabel = node
+        ? (node.type === 'image'
+          ? 'Изображение'
+          : (nodeLabel.length > 22 ? nodeLabel.slice(0, 21) + '…' : nodeLabel))
+        : `Сохранить · Ctrl+${slot}`;
+      const labelElement = item.querySelector('.camera-bookmark-label');
+      if (labelElement) labelElement.textContent = bookmarkLabel;
       item.classList.toggle('is-set', !!bookmark);
       goButton.classList.toggle('is-set', !!bookmark);
       goButton.title = bookmark
@@ -3217,6 +3113,17 @@
     return compactPoints([aPoint, start, ...bends, end, bPoint]);
   }
 
+  const ARROW_OFFSET = 12;
+
+  function insetEndpointBySide(point, side, offset) {
+    if (!point || !offset) return point;
+    if (side === 'left') return { x: point.x - offset, y: point.y };
+    if (side === 'right') return { x: point.x + offset, y: point.y };
+    if (side === 'top') return { x: point.x, y: point.y - offset };
+    if (side === 'bottom') return { x: point.x, y: point.y + offset };
+    return point;
+  }
+
   function edgeRouteFor(aPoint, bPoint, fromSide, toSide, style = 'curved', routeContext = null) {
     if (style === 'straight') {
       return { type: 'line', points: [aPoint, bPoint] };
@@ -3244,7 +3151,7 @@
     };
   }
 
-  function pathFor(aPoint, bPoint, fromSide, toSide, style = 'curved', routeContext = null) {
+  function pathFor(aPoint, bPoint, fromSide, toSide, style = 'curved', routeContext = null, appendArrowEnd = false, appendArrowStart = false) {
     const route = edgeRouteFor(aPoint, bPoint, fromSide, toSide, style, routeContext);
     if (route.type === 'line') {
       return `M ${aPoint.x} ${aPoint.y} L ${bPoint.x} ${bPoint.y}`;
@@ -3254,7 +3161,21 @@
         `${index ? 'L' : 'M'} ${point.x} ${point.y}`
       ).join(' ');
     }
-    return `M ${aPoint.x} ${aPoint.y} C ${route.c1.x} ${route.c1.y}, ${route.c2.x} ${route.c2.y}, ${bPoint.x} ${bPoint.y}`;
+
+    // The Bézier stops 12px before the node. A short straight lead continues
+    // along the side normal to the 7.5px arrow-base position. Mirror it at the
+    // source for bidirectional arrows so the curve never bends through a tip.
+    const startLeadPoint = appendArrowStart
+      ? insetEndpointBySide(aPoint, fromSide, -4.5)
+      : aPoint;
+    const endLeadPoint = appendArrowEnd
+      ? insetEndpointBySide(bPoint, toSide, -4.5)
+      : bPoint;
+    let d = `M ${startLeadPoint.x} ${startLeadPoint.y}`;
+    if (appendArrowStart) d += ` L ${aPoint.x} ${aPoint.y}`;
+    d += ` C ${route.c1.x} ${route.c1.y}, ${route.c2.x} ${route.c2.y}, ${bPoint.x} ${bPoint.y}`;
+    if (appendArrowEnd) d += ` L ${endLeadPoint.x} ${endLeadPoint.y}`;
+    return d;
   }
 
   function addResizeHandles(element, nodeId) {
@@ -4043,9 +3964,17 @@
       if (!a || !b) return;
       const aPoint = getStageNodePoint(a, edge.fromSide);
       const bPoint = getStageNodePoint(b, edge.toSide);
+      const lineStartPoint = edge.arrowhead !== false && edge.bidirectional === true
+        ? insetEndpointBySide(aPoint, edge.fromSide, ARROW_OFFSET)
+        : aPoint;
+      const lineEndPoint = edge.arrowhead !== false
+        ? insetEndpointBySide(bPoint, edge.toSide, ARROW_OFFSET)
+        : bPoint;
+      const curvedArrowLead = edge.arrowhead !== false && (edge.style === 'curved' || edge.style === 'dashed');
+      const curvedStartArrowLead = curvedArrowLead && edge.bidirectional === true;
       const d = pathFor(
-        aPoint, bPoint, edge.fromSide, edge.toSide, edge.style,
-        squareRouteContexts.get(edge.id)
+        lineStartPoint, lineEndPoint, edge.fromSide, edge.toSide, edge.style,
+        squareRouteContexts.get(edge.id), curvedArrowLead, curvedStartArrowLead
       );
       const hit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       hit.setAttribute('class', 'edge-hit');
@@ -4106,16 +4035,19 @@
         const markerId = `edgeArrow-${edgeIndex}`;
         const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
         marker.setAttribute('id', markerId);
-        marker.setAttribute('viewBox', '0 0 10 10');
-        marker.setAttribute('refX', '8');
-        marker.setAttribute('refY', '5');
-        marker.setAttribute('markerWidth', '6');
-        marker.setAttribute('markerHeight', '6');
+        marker.setAttribute('viewBox', '0 0 12 12');
+        marker.setAttribute('refX', '10');
+        marker.setAttribute('refY', '6');
+        marker.setAttribute('markerWidth', '10');
+        marker.setAttribute('markerHeight', '10');
         marker.setAttribute('orient', 'auto-start-reverse');
         marker.setAttribute('markerUnits', 'userSpaceOnUse');
         const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        arrow.setAttribute('d', 'M 0 1 L 9 5 L 0 9 z');
+        arrow.setAttribute('d', 'M 2 2.5 L 10.5 6 L 2 9.5 Z');
         arrow.setAttribute('fill', edgeColor);
+        arrow.setAttribute('stroke', edgeColor);
+        arrow.setAttribute('stroke-width', '1.2');
+        arrow.setAttribute('stroke-linejoin', 'round');
         marker.appendChild(arrow);
         defs.appendChild(marker);
         p.setAttribute('marker-end', `url(#${markerId})`);
@@ -4357,6 +4289,7 @@
     workspace.classList.remove('pinching');
     const activeDrag = drag;
     const activeBox = boxSelect;
+    clearSmartGuides();
     clearQueuedGesturePointerMove();
     detachPointerGestureListeners();
     if (dragPaintRaf) {
@@ -4437,9 +4370,135 @@
       drag = { type: 'moveSelection', ids: origins, startX: event.clientX, startY: event.clientY, startZoom: zoom, moved: false, startedOnLink, pointerId, pointerType, button: event.button };
     } else {
       drag = { type: 'move', id, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, moved: false, startedOnLink, pointerId, pointerType, button: event.button };
+      cacheSmartGuideCandidates(drag, n);
     }
     attachPointerGesture(onPointerMove, onPointerUp);
   }
+
+  function cacheSmartGuideCandidates(activeDrag, movingNode) {
+    updateViewportCulling();
+    if (!activeDrag || activeDrag.type !== 'move' || !movingNode) return;
+
+    const movingElement = renderedNodeElements.get(movingNode.id);
+    activeDrag.nodeWidth = Math.max(10, movingElement ? movingElement.offsetWidth : (Number(movingNode.width) || 10));
+    activeDrag.nodeHeight = Math.max(10, movingElement ? movingElement.offsetHeight : (Number(movingNode.height) || 10));
+
+    // Capture only nodes currently visible in the workspace. When the viewport
+    // index has not been populated yet, fall back to every other scene node.
+    const visibleIds = visibleViewportNodeIds.size
+      ? visibleViewportNodeIds
+      : new Set(scene.nodes.filter(node => node && node.id !== movingNode.id).map(node => node.id));
+
+    activeDrag.snapCandidates = scene.nodes
+      .filter(node => node && node.id !== movingNode.id && visibleIds.has(node.id))
+      .map(node => {
+        const element = renderedNodeElements.get(node.id);
+        const width = Math.max(10, element ? element.offsetWidth : (Number(node.width) || 10));
+        const height = Math.max(10, element ? element.offsetHeight : (Number(node.height) || 10));
+        const left = Number(node.x) || 0;
+        const top = Number(node.y) || 0;
+        return {
+          id: node.id,
+          left,
+          centerX: left + width / 2,
+          right: left + width,
+          top,
+          centerY: top + height / 2,
+          bottom: top + height
+        };
+      });
+  }
+
+  function findSmartGuideAlignment(rawPosition, nodeSize, candidates, axisKeys, orthogonalStartKey, orthogonalEndKey, movingOrthogonalStart, movingOrthogonalSize, threshold) {
+    let best = null;
+    const offsets = { left: 0, centerX: nodeSize / 2, right: nodeSize, top: 0, centerY: nodeSize / 2, bottom: nodeSize };
+
+    candidates.forEach(candidate => {
+      axisKeys.forEach(key => {
+        const delta = candidate[key] - (rawPosition + offsets[key]);
+        const distance = Math.abs(delta);
+        if (distance <= threshold && (!best || distance < best.distance)) {
+          best = { delta, distance, coordinate: candidate[key] };
+        }
+      });
+    });
+
+    if (!best) return { position: rawPosition, guide: null };
+
+    // Include every node sharing the exact snapped axis, not only the node
+    // that produced the nearest match, so the guide spans the full alignment.
+    let segmentStart = movingOrthogonalStart;
+    let segmentEnd = movingOrthogonalStart + movingOrthogonalSize;
+    candidates.forEach(candidate => {
+      const sharesAxis = axisKeys.some(key => Math.abs(candidate[key] - best.coordinate) <= 0.5);
+      if (!sharesAxis) return;
+      segmentStart = Math.min(segmentStart, candidate[orthogonalStartKey]);
+      segmentEnd = Math.max(segmentEnd, candidate[orthogonalEndKey]);
+    });
+
+    return {
+      position: Math.max(0, rawPosition + best.delta),
+      guide: { coordinate: best.coordinate, start: segmentStart, end: segmentEnd }
+    };
+  }
+
+  function ensureSmartGuidesLayer() {
+    if (smartGuidesLayer && smartGuidesLayer.isConnected) return smartGuidesLayer;
+    smartGuidesLayer = stage.querySelector('.smart-guides-layer');
+    if (!smartGuidesLayer) {
+      smartGuidesLayer = document.createElement('div');
+      smartGuidesLayer.className = 'smart-guides-layer';
+      smartGuidesLayer.setAttribute('aria-hidden', 'true');
+      stage.appendChild(smartGuidesLayer);
+    }
+    return smartGuidesLayer;
+  }
+
+  function clearSmartGuides() {
+    const layer = smartGuidesLayer && smartGuidesLayer.isConnected
+      ? smartGuidesLayer
+      : stage.querySelector('.smart-guides-layer');
+    if (layer) layer.remove();
+    smartGuidesLayer = null;
+  }
+
+  function paintSmartGuides(activeGuides) {
+    const vertical = activeGuides && activeGuides.vertical;
+    const horizontal = activeGuides && activeGuides.horizontal;
+    if (!vertical && !horizontal) {
+      clearSmartGuides();
+      return;
+    }
+
+    const layer = ensureSmartGuidesLayer();
+    const updateLine = (type, guide) => {
+      let line = layer.querySelector(`.smart-guide.${type}`);
+      if (!guide) {
+        if (line) line.remove();
+        return;
+      }
+      if (!line) {
+        line = document.createElement('div');
+        line.className = `smart-guide ${type}`;
+        layer.appendChild(line);
+      }
+      if (type === 'vertical') {
+        line.style.left = `${guide.coordinate}px`;
+        line.style.top = `${guide.start - 16}px`;
+        line.style.height = `${Math.max(0, guide.end - guide.start + 32)}px`;
+        line.style.width = '0px';
+      } else {
+        line.style.left = `${guide.start - 16}px`;
+        line.style.top = `${guide.coordinate}px`;
+        line.style.width = `${Math.max(0, guide.end - guide.start + 32)}px`;
+        line.style.height = '0px';
+      }
+    };
+
+    updateLine('vertical', vertical);
+    updateLine('horizontal', horizontal);
+  }
+
   function startResize(event, id, handle) {
     if (presentationMode) return;
     event.preventDefault(); event.stopPropagation();
@@ -4675,13 +4734,25 @@
       const from = renderedNodeModels.get(edge.from);
       const to = renderedNodeModels.get(edge.to);
       if (!from || !to) return;
+      const aPoint = getStageNodePoint(from, edge.fromSide);
+      const bPoint = getStageNodePoint(to, edge.toSide);
+      const lineStartPoint = edge.arrowhead !== false && edge.bidirectional === true
+        ? insetEndpointBySide(aPoint, edge.fromSide, ARROW_OFFSET)
+        : aPoint;
+      const lineEndPoint = edge.arrowhead !== false
+        ? insetEndpointBySide(bPoint, edge.toSide, ARROW_OFFSET)
+        : bPoint;
+      const curvedArrowLead = edge.arrowhead !== false && (edge.style === 'curved' || edge.style === 'dashed');
+      const curvedStartArrowLead = curvedArrowLead && edge.bidirectional === true;
       const d = pathFor(
-        getStageNodePoint(from, edge.fromSide),
-        getStageNodePoint(to, edge.toSide),
+        lineStartPoint,
+        lineEndPoint,
         edge.fromSide,
         edge.toSide,
         edge.style,
-        squareRouteContexts.get(edge.id)
+        squareRouteContexts.get(edge.id),
+        curvedArrowLead,
+        curvedStartArrowLead
       );
       bundle.hit.setAttribute('d', d);
       bundle.line.setAttribute('d', d);
@@ -4690,6 +4761,8 @@
 
   function paintDragGeometry() {
     if (!drag || drag.type === 'pan') return;
+    if (drag.type === 'move') paintSmartGuides(drag.activeGuides);
+    else clearSmartGuides();
     let ids = [];
     if (drag.type === 'move') ids = [drag.id];
     else if (drag.type === 'moveSelection') ids = drag.ids.map(item => item.id);
@@ -4772,6 +4845,7 @@
       button: event.button,
       clientX: event.clientX,
       clientY: event.clientY,
+      altKey: !!event.altKey,
       cancelable: false,
       preventDefault() {}
     };
@@ -4866,9 +4940,38 @@
         });
       } else if (drag.type === 'move') {
         const n = renderedNodeModels.get(drag.id) || nodeById(drag.id); if (!n) return;
-        // Free movement; model coordinates are scaled by the current canvas zoom only once.
-        n.x = Math.max(0, drag.originX + modelDx);
-        n.y = Math.max(0, drag.originY + modelDy);
+        // Always calculate from the original pointer-down position. Re-evaluating
+        // the raw position each frame lets the node naturally unstick past 5 screen px.
+        const rawX = Math.max(0, drag.originX + modelDx);
+        const rawY = Math.max(0, drag.originY + modelDy);
+        let nextX = rawX;
+        let nextY = rawY;
+        let verticalGuide = null;
+        let horizontalGuide = null;
+
+        if (!event.altKey && drag.snapCandidates?.length) {
+          const snapThreshold = 5 / (drag.startZoom || zoom);
+          const xSnap = findSmartGuideAlignment(
+            rawX, drag.nodeWidth, drag.snapCandidates,
+            ['left', 'centerX', 'right'], 'top', 'bottom', rawY, drag.nodeHeight, snapThreshold
+          );
+          const ySnap = findSmartGuideAlignment(
+            rawY, drag.nodeHeight, drag.snapCandidates,
+            ['top', 'centerY', 'bottom'], 'left', 'right', rawX, drag.nodeWidth, snapThreshold
+          );
+          nextX = xSnap.position;
+          nextY = ySnap.position;
+          if (xSnap.guide) {
+            verticalGuide = { coordinate: xSnap.guide.coordinate, start: Math.min(xSnap.guide.start, nextY), end: Math.max(xSnap.guide.end, nextY + drag.nodeHeight) };
+          }
+          if (ySnap.guide) {
+            horizontalGuide = { coordinate: ySnap.guide.coordinate, start: Math.min(ySnap.guide.start, nextX), end: Math.max(ySnap.guide.end, nextX + drag.nodeWidth) };
+          }
+        }
+
+        n.x = nextX;
+        n.y = nextY;
+        drag.activeGuides = { vertical: verticalGuide, horizontal: horizontalGuide };
       } else if (drag.type === 'resize') {
         const n = renderedNodeModels.get(drag.id) || nodeById(drag.id); if (!n) return;
         const west = drag.handle.includes('w');
@@ -4939,6 +5042,7 @@
     if (drag && drag.pointerId != null && event.pointerId !== drag.pointerId) return;
     if (linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
     flushQueuedGesturePointerMove(event.pointerId);
+    clearSmartGuides();
     // Snapshot the active gesture's movement before clearing its global state.
     const movementWasTracked = wasDragging;
     wasDragging = false;
@@ -5831,7 +5935,7 @@
       edgeColorToggle.onclick = null;
       edgeColorToggle.setAttribute('aria-expanded', 'false');
     }
-    if (edgeColorPalette) edgeColorPalette.hidden = true;
+    if (edgeColorPalette) edgeColorPalette.classList.remove('is-expanded');
     if (edgeBidirectionalInput) {
       edgeBidirectionalInput.onchange = null;
       edgeBidirectionalInput.indeterminate = false;
@@ -6013,14 +6117,16 @@
 
     if (edgeStyleOptions) {
       edgeStyleOptions.hidden = false;
-      if (edgeColorPalette) edgeColorPalette.hidden = true;
+      if (edgeColorPalette) edgeColorPalette.classList.remove('is-expanded');
       if (edgeColorToggle) {
         edgeColorToggle.setAttribute('aria-expanded', 'false');
         edgeColorToggle.onclick = event => {
           event.preventDefault();
           event.stopPropagation();
-          const open = edgeColorPalette ? edgeColorPalette.hidden : false;
-          if (edgeColorPalette) edgeColorPalette.hidden = !open;
+          const open = edgeColorPalette
+            ? !edgeColorPalette.classList.contains('is-expanded')
+            : false;
+          if (edgeColorPalette) edgeColorPalette.classList.toggle('is-expanded', open);
           edgeColorToggle.setAttribute('aria-expanded', String(open));
         };
       }
@@ -6038,7 +6144,7 @@
             color,
             'Цвет связи обновлён'
           );
-          if (edgeColorPalette) edgeColorPalette.hidden = false;
+          if (edgeColorPalette) edgeColorPalette.classList.add('is-expanded');
           if (edgeColorToggle) edgeColorToggle.setAttribute('aria-expanded', 'true');
         };
       });
@@ -6053,7 +6159,7 @@
             color,
             'Произвольный цвет связи обновлён'
           );
-          if (edgeColorPalette) edgeColorPalette.hidden = false;
+          if (edgeColorPalette) edgeColorPalette.classList.add('is-expanded');
           if (edgeColorToggle) edgeColorToggle.setAttribute('aria-expanded', 'true');
         };
       }
@@ -6242,6 +6348,15 @@
     if (side === 'bottom') return { x: node.x + width / 2, y: node.y + height };
     return { x: node.x, y: node.y + height / 2 };
   };
+  const ARROW_OFFSET = 7.5;
+  function insetEndpointBySide(point, side, offset) {
+    if (!point || !offset) return point;
+    if (side === 'left') return { x: point.x - offset, y: point.y };
+    if (side === 'right') return { x: point.x + offset, y: point.y };
+    if (side === 'top') return { x: point.x, y: point.y - offset };
+    if (side === 'bottom') return { x: point.x, y: point.y + offset };
+    return point;
+  }
   const vectorFor = side => ({ top: {x:0,y:-1}, right:{x:1,y:0}, bottom:{x:0,y:1}, left:{x:-1,y:0} }[side] || {x:1,y:0});
   const compactPoints = points => points.filter((point, index) => {
     if (!index) return true;
@@ -6398,16 +6513,22 @@
       if (!from || !to) return;
       const fromSide = validSide(edge.fromSide), toSide = validSide(edge.toSide);
       const a = pointFor(from, fromSide), b = pointFor(to, toSide);
+      const lineStartPoint = edge.arrowhead !== false && edge.bidirectional === true
+        ? insetEndpointBySide(a, fromSide, ARROW_OFFSET)
+        : a;
+      const lineEndPoint = edge.arrowhead !== false
+        ? insetEndpointBySide(b, toSide, ARROW_OFFSET)
+        : b;
       const rawColor = /^#[0-9a-f]{6}$/i.test(edge.color || '') ? edge.color.toLowerCase() : '#171717';
       const isDefault = rawColor === '#171717' || rawColor === '#111111';
       const color = data.theme === 'dark' && isDefault ? '#e5e5e5' : rawColor;
       const markerId = 'arrow-' + index;
       if (edge.arrowhead !== false) {
-        const marker = svgElement('marker', { id: markerId, viewBox: '0 0 10 10', refX: 8, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
-        marker.appendChild(svgElement('path', { d: 'M 0 1 L 9 5 L 0 9 z', fill: color }));
+        const marker = svgElement('marker', { id: markerId, viewBox: '0 0 12 12', refX: 10, refY: 6, markerWidth: 10, markerHeight: 10, orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
+        marker.appendChild(svgElement('path', { d: 'M 2 2.5 L 10.5 6 L 2 9.5 Z', fill: color, stroke: color, 'stroke-width': 1.2, 'stroke-linejoin': 'round' }));
         defs.appendChild(marker);
       }
-      const pathAttributes = { d: edgePath(a,b,fromSide,toSide,edge.style,contexts.get(edge.id)), fill: 'none', stroke: color, 'stroke-width': 1.7, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+      const pathAttributes = { d: edgePath(lineStartPoint,lineEndPoint,fromSide,toSide,edge.style,contexts.get(edge.id)), fill: 'none', stroke: color, 'stroke-width': 1.25, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
       if (edge.style === 'dashed') pathAttributes['stroke-dasharray'] = '6 6';
       if (edge.arrowhead !== false) pathAttributes['marker-end'] = 'url(#' + markerId + ')';
       if (edge.arrowhead !== false && edge.bidirectional === true) pathAttributes['marker-start'] = 'url(#' + markerId + ')';
@@ -6513,7 +6634,7 @@
     if (!state) return;
     if (distance(state.start, {x:event.clientX,y:event.clientY}) > 5) state.moved = true;
     const cancelled = event.type === 'pointercancel' || event.type === 'lostpointercapture';
-    if (!cancelled && state.link && !state.moved && pointers.size === 1) {
+    if (!cancelled && state.link && !state.moved && !pinch && pointers.size <= 1) {
       const href = state.link.href;
       window.open(href, '_blank', 'noopener,noreferrer');
     }
@@ -6887,11 +7008,17 @@
         if (!a || !b) return;
         const ap = nodePoint(a, edge.fromSide);
         const bp = nodePoint(b, edge.toSide);
+        const lineStartPoint = edge.arrowhead !== false && edge.bidirectional === true
+          ? insetEndpointBySide(ap, edge.fromSide, ARROW_OFFSET)
+          : ap;
+        const lineEndPoint = edge.arrowhead !== false
+          ? insetEndpointBySide(bp, edge.toSide, ARROW_OFFSET)
+          : bp;
         const route = edgeRouteFor(
-          ap, bp, edge.fromSide, edge.toSide, edge.style,
+          lineStartPoint, lineEndPoint, edge.fromSide, edge.toSide, edge.style,
           squareRouteContexts.get(edge.id)
         );
-        edgeGeometry.push({ edge, ap, bp, route });
+        edgeGeometry.push({ edge, ap, bp, lineStartPoint, lineEndPoint, route });
         if (route.type === 'bezier') {
           includePoint(route.c1.x, route.c1.y);
           includePoint(route.c2.x, route.c2.y);
@@ -6900,8 +7027,8 @@
         }
         // Arrowheads must be included in the export bounds at both ends when enabled.
         if (edge.arrowhead !== false) {
-          includePoint(bp.x, bp.y, 12);
-          if (edge.bidirectional === true) includePoint(ap.x, ap.y, 12);
+          includePoint(bp.x, bp.y, 20);
+          if (edge.bidirectional === true) includePoint(ap.x, ap.y, 20);
         }
       });
 
@@ -6956,29 +7083,51 @@
       ctx.fillRect(0, 0, W, H);
 
       function drawExportArrowhead(tip, angle, color) {
-        // Keep arrowheads proportional to export scale while limiting extremes.
-        const arrowSize = Math.max(4, Math.min(14, 7 * scale));
-        const wing = arrowSize * 0.6;
-        const baseX = tip.x - Math.cos(angle) * arrowSize;
-        const baseY = tip.y - Math.sin(angle) * arrowSize;
+        const arrowLength = Math.max(7, Math.min(16, 9.5 * scale));
+        const halfWidth = arrowLength * 0.44;
+        const baseX = tip.x - Math.cos(angle) * arrowLength;
+        const baseY = tip.y - Math.sin(angle) * arrowLength;
+        const perpX = -Math.sin(angle) * halfWidth;
+        const perpY = Math.cos(angle) * halfWidth;
+
+        ctx.save();
         ctx.beginPath();
         ctx.moveTo(tip.x, tip.y);
-        ctx.lineTo(baseX - Math.sin(angle) * wing, baseY + Math.cos(angle) * wing);
-        ctx.lineTo(baseX + Math.sin(angle) * wing, baseY - Math.cos(angle) * wing);
+        ctx.lineTo(baseX + perpX, baseY + perpY);
+        ctx.lineTo(baseX - perpX, baseY - perpY);
         ctx.closePath();
         ctx.fillStyle = color;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = Math.max(1, 1.1 * scale);
+        ctx.lineJoin = 'round';
         ctx.fill();
+        ctx.stroke();
+        ctx.restore();
       }
 
-      edgeGeometry.forEach(({ edge, ap, bp, route }) => {
+      edgeGeometry.forEach(({ edge, ap, bp, lineStartPoint, lineEndPoint, route }) => {
+        const hasCurvedArrowLead = edge.arrowhead !== false && route.type === 'bezier';
+        const hasCurvedStartArrowLead = hasCurvedArrowLead && edge.bidirectional === true;
+        const exportStartLeadPoint = hasCurvedStartArrowLead
+          ? insetEndpointBySide(lineStartPoint, edge.fromSide, -4.5)
+          : lineStartPoint;
+        const exportEndLeadPoint = hasCurvedArrowLead
+          ? insetEndpointBySide(lineEndPoint, edge.toSide, -4.5)
+          : lineEndPoint;
         ctx.beginPath();
-        ctx.moveTo(tx + ap.x * scale, ty + ap.y * scale);
+        ctx.moveTo(tx + exportStartLeadPoint.x * scale, ty + exportStartLeadPoint.y * scale);
         if (route.type === 'bezier') {
+          if (hasCurvedStartArrowLead) {
+            ctx.lineTo(tx + lineStartPoint.x * scale, ty + lineStartPoint.y * scale);
+          }
           ctx.bezierCurveTo(
             tx + route.c1.x * scale, ty + route.c1.y * scale,
             tx + route.c2.x * scale, ty + route.c2.y * scale,
-            tx + bp.x * scale, ty + bp.y * scale
+            tx + lineEndPoint.x * scale, ty + lineEndPoint.y * scale
           );
+          if (hasCurvedArrowLead) {
+            ctx.lineTo(tx + exportEndLeadPoint.x * scale, ty + exportEndLeadPoint.y * scale);
+          }
         } else {
           route.points.slice(1).forEach(point => {
             ctx.lineTo(tx + point.x * scale, ty + point.y * scale);
@@ -6990,7 +7139,7 @@
         const isDefaultDarkEdge = rawEdgeColor === '#171717' || rawEdgeColor === '#111111';
         const edgeColor = (dark && isDefaultDarkEdge) ? '#e5e5e5' : rawEdgeColor;
         ctx.strokeStyle = edgeColor;
-        ctx.lineWidth = Math.max(1, 1.7 * scale);
+        ctx.lineWidth = Math.max(1, 1.25 * scale);
         ctx.setLineDash(edge.style === 'dashed' ? [6, 6] : []);
         ctx.stroke();
         ctx.setLineDash([]);
@@ -6999,14 +7148,20 @@
           let endAngle;
           let startAngle;
           if (route.type === 'bezier') {
-            endAngle = Math.atan2(bp.y - route.c2.y, bp.x - route.c2.x);
-            startAngle = Math.atan2(route.c1.y - ap.y, route.c1.x - ap.x) + Math.PI;
+            endAngle = hasCurvedArrowLead
+              ? Math.atan2(exportEndLeadPoint.y - lineEndPoint.y, exportEndLeadPoint.x - lineEndPoint.x)
+              : Math.atan2(lineEndPoint.y - route.c2.y, lineEndPoint.x - route.c2.x);
+            startAngle = hasCurvedStartArrowLead
+              ? Math.atan2(exportStartLeadPoint.y - lineStartPoint.y, exportStartLeadPoint.x - lineStartPoint.x)
+              : Math.atan2(route.c1.y - lineStartPoint.y, route.c1.x - lineStartPoint.x) + Math.PI;
           } else {
-            const points = route.points && route.points.length > 1 ? route.points : [ap, bp];
+            const points = route.points && route.points.length > 1
+              ? route.points
+              : [lineStartPoint, lineEndPoint];
             const previous = points[points.length - 2];
             const next = points[1];
-            endAngle = Math.atan2(bp.y - previous.y, bp.x - previous.x);
-            startAngle = Math.atan2(next.y - ap.y, next.x - ap.x) + Math.PI;
+            endAngle = Math.atan2(lineEndPoint.y - previous.y, lineEndPoint.x - previous.x);
+            startAngle = Math.atan2(next.y - lineStartPoint.y, next.x - lineStartPoint.x) + Math.PI;
           }
           drawExportArrowhead(
             { x: tx + bp.x * scale, y: ty + bp.y * scale },
@@ -8033,36 +8188,8 @@
     if (editingId) finishEditing(editingId, true);
     startPan(event);
   }, { passive: false });
-  document.getElementById('app')?.addEventListener('transitionend', event => {
-    // Grid is the layout clock for the desktop sidebar. Its transitionend fires
-    // only after the workspace reaches its final width; stage/SVG bounds and the
-    // camera center are synchronized once against that settled viewport.
-    if (event.target !== event.currentTarget || event.propertyName !== 'grid-template-columns') return;
-    syncCanvasAfterSidebarTransition();
-  });
-  sidebarToggle?.addEventListener('click', () => {
-    setSidebarCollapsed(!sidebar?.classList.contains('collapsed'));
-  });
-  mobileMenuToggle?.addEventListener('click', () => {
-    setMobileSidebarOpen(!document.body.classList.contains('sidebar-open'));
-  });
-  sidebarBackdrop?.addEventListener('pointerdown', dismissMobileSidebarFromBackdrop, { capture: true, passive: false });
-  sidebarBackdrop?.addEventListener('click', event => {
-    if (!document.body.classList.contains('sidebar-open')) {
-      if (event.cancelable) event.preventDefault();
-      event.stopPropagation();
-      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
-      return;
-    }
-    dismissMobileSidebarFromBackdrop(event);
-  }, { capture: true });
-  window?.addEventListener('click', suppressSidebarBackdropGhostClick, { capture: true });
-  sidebar?.addEventListener('click', event => {
-    if (event.target.closest('button')) closeMobileSidebar();
-  });
   document.querySelectorAll('[data-mode]').forEach(btn => btn?.addEventListener('click', () => {
     setMode(btn.dataset.mode);
-    closeMobileSidebar();
   }));
   document.getElementById('deleteBtn')?.addEventListener('click', deleteSelected);
   document.getElementById('undoBtn')?.addEventListener('click', undo);
@@ -8102,7 +8229,6 @@
     exportPng(option ? option.value : 'png', fileName);
   });
   exportScreen?.addEventListener('pointerdown', event => { if (event.target === exportScreen) exportScreen.classList.remove('visible'); });
-  document.getElementById('importBtn')?.addEventListener('click', () => importFile.click());
   importFile?.addEventListener('change', () => importProjectFile(importFile.files && importFile.files[0]));
   imageFile?.addEventListener('change', event => {
     const file = event.currentTarget.files && event.currentTarget.files[0];
@@ -8159,7 +8285,6 @@
 
 
   projectNotesToggle?.addEventListener('click', () => {
-    closeMobileSidebar();
     setProjectNotesOpen(!mainArea.classList.contains('project-notes-open'));
   });
   projectNotesClose?.addEventListener('click', () => setProjectNotesOpen(false));
@@ -8210,18 +8335,6 @@
       event.stopImmediatePropagation();
     }
   });
-  cameraBookmarkHintToggle?.addEventListener('click', () => {
-    const isExpanded = cameraBookmarkHintToggle.getAttribute('aria-expanded') !== 'true';
-    cameraBookmarkHintToggle.setAttribute('aria-expanded', String(isExpanded));
-    cameraBookmarkHintToggle.setAttribute(
-      'aria-label',
-      isExpanded ? 'Скрыть горячие клавиши закладок камеры' : 'Показать горячие клавиши закладок камеры'
-    );
-    cameraBookmarkHintToggle.title = isExpanded ? 'Скрыть горячие клавиши' : 'Показать горячие клавиши';
-    cameraBookmarkHint?.classList.toggle('is-expanded', isExpanded);
-    cameraBookmarkHint?.setAttribute('aria-hidden', String(!isExpanded));
-  });
-
   cameraBookmarksPanel?.addEventListener('click', event => {
     const clearButton = event.target.closest('[data-camera-clear]');
     if (clearButton) {
@@ -8278,10 +8391,15 @@
     closeProjectActionsMenu();
     void beginNewProject();
   });
-  document.querySelector('.brand')?.addEventListener('click', event => {
+  const brandHome = document.querySelector('.brand');
+  const activateBrandHome = event => {
     event.preventDefault();
     closeProjectActionsMenu();
     void confirmExit();
+  };
+  brandHome?.addEventListener('click', activateBrandHome);
+  brandHome?.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') activateBrandHome(event);
   });
   document.getElementById('openPreviousBtn')?.addEventListener('click', () => {
     closeProjectActionsMenu();
@@ -8373,6 +8491,15 @@
   });
   document.getElementById('importFromStartBtn')?.addEventListener('click', () => importFile.click());
 
+  // Mouse clicks should not leave toolbar buttons as the keyboard focus target.
+  const blurToolbarButtonAfterClick = event => {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest('button');
+    if (button) button.blur();
+  };
+  document.querySelector('.topbar')?.addEventListener('click', blurToolbarButtonAfterClick);
+  document.getElementById('floatingDock')?.addEventListener('click', blurToolbarButtonAfterClick);
+
   document?.addEventListener('keydown', event => {
     if (presentationMode) {
       if (event.key === 'Escape') {
@@ -8388,7 +8515,6 @@
     const target = event.target;
     const inTextField = target && (target.isContentEditable || ['INPUT','TEXTAREA','SELECT'].includes(target.tagName));
     if (event.key === 'Escape') {
-      if (document.body.classList.contains('sidebar-open')) { closeMobileSidebar(); return; }
       if (projectRenameBackdrop.classList.contains('visible')) { closeRenameProjectModal(); return; }
       if (projectDeleteBackdrop.classList.contains('visible')) { closeDeleteProjectModal(); return; }
       if (projectActionsMenu.classList.contains('visible')) { closeProjectActionsMenu(); return; }
@@ -8403,6 +8529,11 @@
       return;
     }
     if (inTextField) return;
+
+    if (event.code === 'Space' || event.key === ' ' || ['PageUp', 'PageDown', 'Home', 'End'].includes(event.code)) {
+      event.preventDefault();
+      return;
+    }
 
     const hasPrimaryModifier = event.ctrlKey || event.metaKey;
     const isCopyKey = event.code === 'KeyC' || String(event.key || '').toLowerCase() === 'c';
@@ -8500,7 +8631,6 @@
       const rect = nodeContextMenu.getBoundingClientRect();
       positionContextMenu(rect.left, rect.top);
     }
-    if (window.innerWidth >= 768) closeMobileSidebar();
     if (resizeRenderTimer) clearTimeout(resizeRenderTimer);
     resizeRenderTimer = window.setTimeout(() => {
       resizeRenderTimer = 0;
@@ -8535,7 +8665,6 @@
       autoArrangeEnabled = localStorage.getItem(AUTO_ARRANGE_KEY) !== '0';
       emptyHintDismissed = localStorage.getItem(EMPTY_HINT_DISMISSED_KEY) === '1';
       projectViewMode = normalizeProjectViewMode(localStorage.getItem(PROJECT_VIEW_KEY) || 'list');
-      setSidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1', false);
     } catch (_) {
       applyTheme('light', false);
       autoArrangeEnabled = true;
