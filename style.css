@@ -703,32 +703,6 @@
     grid-template-rows: calc(58px + env(safe-area-inset-top)) minmax(0, 1fr);
   }
 
-  .topbar {
-    grid-column: 1;
-    grid-row: 1;
-    gap: 8px;
-    padding: env(safe-area-inset-top) 10px 0;
-    min-height: calc(58px + env(safe-area-inset-top));
-  }
-  .project-title {
-    width: auto;
-    min-width: 0;
-    max-width: 42vw;
-    flex: 1 1 auto;
-    margin-left: 0;
-    padding: 9px 5px;
-    font-size: 14px;
-    text-overflow: ellipsis;
-  }
-  .topbar-spacer { display: none; }
-  .top-action {
-    flex: 0 0 auto;
-    min-height: 40px;
-    padding: 8px 9px;
-    gap: 5px;
-    font-size: 11px;
-    white-space: nowrap;
-  }
 
   .main { grid-column: 1; grid-row: 2; min-height: 0; }
   .context-menu,
@@ -768,7 +742,6 @@
   .zoom-indicator { right: calc(12px + env(safe-area-inset-right)); bottom: calc(12px + env(safe-area-inset-bottom)); }
   .empty-state { width: min(90%, 320px); }
   .empty-state-close { width: 36px; height: 36px; right: -10px; top: -42px; }
-  .playback-panel { left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: auto; }
   .modal-backdrop, .project-modal-backdrop, .exit-confirm-backdrop, .export-screen { padding: 12px; }
 
   /* Compact mobile affordances with practical but less intrusive touch targets. */
@@ -868,12 +841,21 @@
   .dark-theme .node-text a.node-link:hover { color: #82baff; }
 }
 
-/* Keep an editable text node physically focusable when it is empty on mobile. */
+/* Keep existing text metrics identical between editing and viewing so
+   highlight backgrounds do not jump when contenteditable is removed. */
 .node.editing .node-text {
+  display: inline;
+  min-width: 1ch;
+  min-height: 0;
+  outline: none;
+  vertical-align: baseline;
+}
+
+/* Only an empty editor needs a wider inline-block hit area for its placeholder. */
+.node.editing:has(.node-placeholder:not(.hidden)) .node-text {
   display: inline-block;
   min-width: 60px;
   min-height: 20px;
-  outline: none;
   vertical-align: middle;
 }
 
@@ -1742,5 +1724,40 @@ body.presentation-mode .camera-control-rail { display: none !important; }
   .stage {
     max-width: none !important;
     border-right: 0 !important;
+  }
+}
+
+
+/* Mobile history controls: override the desktop centered transform so the
+   timeline stays fully inside the safe viewport on narrow screens. */
+@media (max-width: 767px) {
+  .playback-panel {
+    left: max(10px, env(safe-area-inset-left, 0px)) !important;
+    right: max(10px, env(safe-area-inset-right, 0px)) !important;
+    bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    width: auto !important;
+    transform: none;
+  }
+
+  @keyframes panelInMobile {
+    from { opacity: 0; transform: translateY(7px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .playback-panel.visible {
+    animation: panelInMobile .2s ease-out both;
+  }
+
+  /* Keep the touch hit areas generous while making the visible connection
+     dots and resize grips smaller and less intrusive. */
+  .anchor::after {
+    width: 6px;
+    height: 6px;
+    border-width: 1px;
+  }
+  .resize-handle::after {
+    width: 6px;
+    height: 6px;
+    border-width: 1px;
   }
 }

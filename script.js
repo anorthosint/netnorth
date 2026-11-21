@@ -1588,18 +1588,18 @@
     const selectedNodeCount = selectedIds.length || (selectedId ? 1 : 0);
     const selectedEdgeCount = selectedEdgeIds.length;
     deleteButton.disabled = !(selectedNodeCount || selectedEdgeCount) || playback.active;
-    const deleteLabel = document.querySelector('#deleteBtn .label');
-    if (deleteLabel) {
-      if (selectedNodeCount && selectedEdgeCount) {
-        deleteLabel.textContent = `Удалить выбранное (${selectedNodeCount} узл., ${selectedEdgeCount} связ.)`;
-      } else if (selectedEdgeCount) {
-        deleteLabel.textContent = selectedEdgeCount > 1 ? `Удалить связи (${selectedEdgeCount})` : 'Удалить связь';
-      } else if (selectedNodeCount > 1) {
-        deleteLabel.textContent = `Удалить выбранные (${selectedNodeCount})`;
-      } else {
-        deleteLabel.textContent = 'Удалить выбранное';
-      }
+    let deleteLabel = 'Удалить выбранное · Del';
+    if (selectedNodeCount && selectedEdgeCount) {
+      deleteLabel = `Удалить выбранное (${selectedNodeCount} узл., ${selectedEdgeCount} связ.) · Del`;
+    } else if (selectedEdgeCount) {
+      deleteLabel = selectedEdgeCount > 1
+        ? `Удалить связи (${selectedEdgeCount}) · Del`
+        : 'Удалить связь · Del';
+    } else if (selectedNodeCount > 1) {
+      deleteLabel = `Удалить выбранные (${selectedNodeCount}) · Del`;
     }
+    deleteButton.dataset.tooltip = deleteLabel;
+    deleteButton.setAttribute('aria-label', deleteLabel);
   }
 
   async function showStartPanel(panelName) {
@@ -4367,8 +4367,13 @@
     if (rightButtonOnSelection || (selectedIds.length > 1 && selectedIds.includes(id))) {
       const origins = selectedIds.map(nodeId => nodeById(nodeId)).filter(Boolean).map(node => ({ id: node.id, x: node.x, y: node.y }));
       if (!origins.length) return;
+      // Always establish the exact pre-drag baseline, including after imports or sparse history states.
+      pushUndoSnapshot();
       drag = { type: 'moveSelection', ids: origins, startX: event.clientX, startY: event.clientY, startZoom: zoom, moved: false, startedOnLink, pointerId, pointerType, button: event.button };
+      cacheSmartGuideCandidates(drag, null);
     } else {
+      // Capture the original node position before the first pointer movement.
+      pushUndoSnapshot();
       drag = { type: 'move', id, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, moved: false, startedOnLink, pointerId, pointerType, button: event.button };
       cacheSmartGuideCandidates(drag, n);
     }
@@ -4377,20 +4382,50 @@
 
   function cacheSmartGuideCandidates(activeDrag, movingNode) {
     updateViewportCulling();
-    if (!activeDrag || activeDrag.type !== 'move' || !movingNode) return;
+    if (!activeDrag || (activeDrag.type !== 'move' && activeDrag.type !== 'moveSelection')) return;
 
-    const movingElement = renderedNodeElements.get(movingNode.id);
-    activeDrag.nodeWidth = Math.max(10, movingElement ? movingElement.offsetWidth : (Number(movingNode.width) || 10));
-    activeDrag.nodeHeight = Math.max(10, movingElement ? movingElement.offsetHeight : (Number(movingNode.height) || 10));
+    const selectedSet = activeDrag.type === 'moveSelection'
+      ? new Set(activeDrag.ids.map(origin => origin.id))
+      : new Set(movingNode ? [movingNode.id] : []);
 
-    // Capture only nodes currently visible in the workspace. When the viewport
-    // index has not been populated yet, fall back to every other scene node.
+    if (activeDrag.type === 'moveSelection') {
+      // Build one immutable bounding box from the selected nodes' pointer-down
+      // coordinates. DOM dimensions are measured only once at drag start.
+      const selectedBounds = activeDrag.ids.map(origin => {
+        const node = nodeById(origin.id);
+        if (!node) return null;
+        const element = renderedNodeElements.get(origin.id);
+        const width = Math.max(10, element ? element.offsetWidth : (Number(node.width) || 10));
+        const height = Math.max(10, element ? element.offsetHeight : (Number(node.height) || 10));
+        const left = Number(origin.x) || 0;
+        const top = Number(origin.y) || 0;
+        return { left, top, right: left + width, bottom: top + height };
+      }).filter(Boolean);
+      if (!selectedBounds.length) return;
+
+      const originGroupLeft = Math.min(...selectedBounds.map(bounds => bounds.left));
+      const originGroupTop = Math.min(...selectedBounds.map(bounds => bounds.top));
+      const originGroupRight = Math.max(...selectedBounds.map(bounds => bounds.right));
+      const originGroupBottom = Math.max(...selectedBounds.map(bounds => bounds.bottom));
+      activeDrag.originX = originGroupLeft;
+      activeDrag.originY = originGroupTop;
+      activeDrag.nodeWidth = Math.max(10, originGroupRight - originGroupLeft);
+      activeDrag.nodeHeight = Math.max(10, originGroupBottom - originGroupTop);
+    } else {
+      if (!movingNode) return;
+      const movingElement = renderedNodeElements.get(movingNode.id);
+      activeDrag.nodeWidth = Math.max(10, movingElement ? movingElement.offsetWidth : (Number(movingNode.width) || 10));
+      activeDrag.nodeHeight = Math.max(10, movingElement ? movingElement.offsetHeight : (Number(movingNode.height) || 10));
+    }
+
+    // Capture only visible nodes outside the moving set. When the viewport
+    // index is empty, fall back to every non-selected node in the scene.
     const visibleIds = visibleViewportNodeIds.size
       ? visibleViewportNodeIds
-      : new Set(scene.nodes.filter(node => node && node.id !== movingNode.id).map(node => node.id));
+      : new Set(scene.nodes.filter(node => node && !selectedSet.has(node.id)).map(node => node.id));
 
     activeDrag.snapCandidates = scene.nodes
-      .filter(node => node && node.id !== movingNode.id && visibleIds.has(node.id))
+      .filter(node => node && !selectedSet.has(node.id) && visibleIds.has(node.id))
       .map(node => {
         const element = renderedNodeElements.get(node.id);
         const width = Math.max(10, element ? element.offsetWidth : (Number(node.width) || 10));
@@ -4518,6 +4553,8 @@
       ? nodeRect.height / resizeZoom
       : (Number(n.height) || 10));
     const originFontSize = clamp(Number(n.fontSize) || 16, 10, 80);
+    // Store the original dimensions and autoSize state before resize mutates the node.
+    pushUndoSnapshot();
     // Once a text node is resized, persist its proportional width so existing
     // line breaks do not collapse back to max-content after the drag commits.
     n.autoSize = false;
@@ -4761,7 +4798,7 @@
 
   function paintDragGeometry() {
     if (!drag || drag.type === 'pan') return;
-    if (drag.type === 'move') paintSmartGuides(drag.activeGuides);
+    if (drag.type === 'move' || drag.type === 'moveSelection') paintSmartGuides(drag.activeGuides);
     else clearSmartGuides();
     let ids = [];
     if (drag.type === 'move') ids = [drag.id];
@@ -4931,13 +4968,44 @@
       const scale = drag.startZoom || zoom;
       const modelDx = dx / scale, modelDy = dy / scale;
       if (drag.type === 'moveSelection') {
+        // Snap the complete group's bounding box, then apply one shared delta
+        // to every selected node so their relative positions never change.
+        const rawX = Math.max(0, drag.originX + modelDx);
+        const rawY = Math.max(0, drag.originY + modelDy);
+        let nextX = rawX;
+        let nextY = rawY;
+        let verticalGuide = null;
+        let horizontalGuide = null;
+
+        if (!event.altKey && drag.snapCandidates?.length) {
+          const snapThreshold = 5 / (drag.startZoom || zoom);
+          const xSnap = findSmartGuideAlignment(
+            rawX, drag.nodeWidth, drag.snapCandidates,
+            ['left', 'centerX', 'right'], 'top', 'bottom', rawY, drag.nodeHeight, snapThreshold
+          );
+          const ySnap = findSmartGuideAlignment(
+            rawY, drag.nodeHeight, drag.snapCandidates,
+            ['top', 'centerY', 'bottom'], 'left', 'right', rawX, drag.nodeWidth, snapThreshold
+          );
+          nextX = xSnap.position;
+          nextY = ySnap.position;
+          if (xSnap.guide) {
+            verticalGuide = { coordinate: xSnap.guide.coordinate, start: Math.min(xSnap.guide.start, nextY), end: Math.max(xSnap.guide.end, nextY + drag.nodeHeight) };
+          }
+          if (ySnap.guide) {
+            horizontalGuide = { coordinate: ySnap.guide.coordinate, start: Math.min(ySnap.guide.start, nextX), end: Math.max(ySnap.guide.end, nextX + drag.nodeWidth) };
+          }
+        }
+
+        const appliedDx = nextX - drag.originX;
+        const appliedDy = nextY - drag.originY;
         drag.ids.forEach(origin => {
           const node = renderedNodeModels.get(origin.id) || nodeById(origin.id);
           if (!node) return;
-          // Keep fractional model coordinates so low zoom levels do not feel jumpy.
-          node.x = Math.max(0, origin.x + modelDx);
-          node.y = Math.max(0, origin.y + modelDy);
+          node.x = Math.max(0, origin.x + appliedDx);
+          node.y = Math.max(0, origin.y + appliedDy);
         });
+        drag.activeGuides = { vertical: verticalGuide, horizontal: horizontalGuide };
       } else if (drag.type === 'move') {
         const n = renderedNodeModels.get(drag.id) || nodeById(drag.id); if (!n) return;
         // Always calculate from the original pointer-down position. Re-evaluating
@@ -5061,7 +5129,14 @@
       workspace.classList.remove('panning');
       stage.style.cursor = mode === 'select' ? 'grab' : (mode === 'text' || mode === 'connect' ? 'crosshair' : 'default');
       if (finished.type === 'pan') {
-        if (!changed) { selectedId = null; selectedIds.splice(0); renderScene(); }
+        if (!changed) {
+          selectedId = null;
+          selectedIds.splice(0);
+          selectedEdgeIds.splice(0);
+          refreshNodeSelectionDecorations(scene, false);
+          refreshEdgeSelectionDecorations(scene, false);
+          updateActionButtons();
+        }
         return;
       }
       if (changed) {
@@ -5191,13 +5266,34 @@
       });
     }
 
+    // Keep the child anchor facing the parent branch. Reusing a side chosen
+    // before auto-arranging can route the curve around the child and make the
+    // arrow loop back across itself after the branch changes direction.
+    const childSideByBranchSide = {
+      right: 'left',
+      left: 'right',
+      bottom: 'top',
+      top: 'bottom'
+    };
+    const childSide = childSideByBranchSide[side];
+    const arrangedTargetIds = new Set(targets.map(node => node.id));
+    let edgeSideChanged = false;
+    if (childSide) {
+      branchEdges.forEach(edge => {
+        if (!arrangedTargetIds.has(edge.to) || edge.toSide === childSide) return;
+        edge.toSide = childSide;
+        edgeSideChanged = true;
+      });
+    }
+
     // Do not run chooseSides across the whole scene here: that used to rewrite
     // unrelated branches and collapse the parent's four independent directions.
-    // Keep each edge's chosen anchor sides intact while only positions change.
-    return targets.some(node => {
+    // Only the child ends participating in this branch are corrected above.
+    const positionsChanged = targets.some(node => {
       const old = before.get(node.id);
       return old && (Math.abs(old.x - node.x) > 0.25 || Math.abs(old.y - node.y) > 0.25);
     });
+    return positionsChanged || edgeSideChanged;
   }
 
   function addEdge(from, to, fromSide, toSide) {
@@ -5399,7 +5495,7 @@
     if (presentationMode || undoIndex <= 0 || playback.active) return;
     if (editingId) finishEditing(editingId, true);
     undoIndex--;
-    scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
+    scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); selectedEdgeIds.splice(0); editingId = null;
     const invalidBookmarkSlots = pruneInvalidCameraBookmarks(scene.nodes);
     recordTimeline(); renderScene(); updateCameraBookmarksUI(); saveProject(); updateActionButtons();
     showToast(invalidBookmarkSlots.length
@@ -5409,7 +5505,7 @@
   function redo() {
     if (presentationMode || undoIndex >= undoStack.length - 1 || playback.active) return;
     undoIndex++;
-    scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); editingId = null;
+    scene = materializeSceneSnapshot(undoStack[undoIndex]); selectedId = null; selectedIds.splice(0); selectedEdgeIds.splice(0); editingId = null;
     const invalidBookmarkSlots = pruneInvalidCameraBookmarks(scene.nodes);
     recordTimeline(); renderScene(); updateCameraBookmarksUI(); saveProject(); updateActionButtons();
     showToast(invalidBookmarkSlots.length
@@ -7639,16 +7735,15 @@
 
   function startBoxSelection(event) {
     if (presentationMode) return;
-    const isTouchMarquee = event.pointerType === 'touch' && event.button === 0;
+    // Marquee selection is intentionally desktop-only (right mouse button).
+    // A single touch on empty canvas is reserved for natural one-finger panning.
     const isMouseMarquee = event.pointerType !== 'touch' && event.button === 2;
-    if ((!isTouchMarquee && !isMouseMarquee) || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
+    if (!isMouseMarquee || playback.active || mode !== 'select' || drag || linkDraft || boxSelect) return;
     const target = event.target;
     if (target.closest && (target.closest('.node[data-node-id]') || target.closest('.edge-hit') || target.closest('.anchor') || target.closest('.resize-handle'))) return;
 
-    // On touch, a one-finger drag on empty canvas is a marquee gesture rather
-    // than a pan. The capture-phase touch tracker runs before this handler, so
-    // its long-press timer can still switch to the selection tool when the finger
-    // stays down; actual movement cancels that timer in handleWorkspaceTouchMove.
+    // Desktop right-drag is the only marquee gesture. Touch input is routed
+    // through startPan() so one finger always pans the canvas naturally.
     if (editingId) finishEditing(editingId, true);
     if (event.cancelable) event.preventDefault();
     event.stopImmediatePropagation();
@@ -7805,9 +7900,9 @@
     if (candidate.startedOnLink) suppressImmediateDraggedLinkClick(1200);
 
     if (candidate.isBlankCanvas) {
-      // A stationary hold on empty canvas now activates the selection tool.
-      // Cancel the pending marquee rectangle; a following drag starts a fresh
-      // box-selection gesture with the intended tool already active.
+      // A stationary hold on empty canvas activates the selection tool.
+      // End the pending one-finger pan cleanly; subsequent finger drags remain
+      // ordinary canvas pans rather than being converted into touch marquees.
       if (drag || linkDraft || boxSelect) cancelPointerGesture();
       lastMobileCanvasTap = null;
       setMode('select');
@@ -8198,6 +8293,8 @@
       showToast('Нажмите на начальный узел, затем на второй');
       return;
     }
+    // Finalize the active editor before starting a canvas pan. finishEditing()
+    // may commit/render once; onPointerUp now only refreshes selection decorations.
     if (editingId) finishEditing(editingId, true);
     startPan(event);
   }, { passive: false });
