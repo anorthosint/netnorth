@@ -359,6 +359,12 @@
     <div class="export-actions"><button type="button" id="cancelPngExportBtn">Отмена</button><button type="button" class="primary" id="downloadPngBtn">Скачать</button></div>
   </div>
 </div>
+<div id="imageLightbox" class="image-lightbox" aria-hidden="true" role="dialog" aria-label="Просмотр изображения">
+  <button type="button" id="imageLightboxClose" class="image-lightbox-close" aria-label="Закрыть просмотр">×</button>
+  <div class="image-lightbox-stage">
+    <img id="imageLightboxImg" class="image-lightbox-img" alt="" draggable="false">
+  </div>
+</div>
 <script src="script.js"></script>
 </body>
 </html>

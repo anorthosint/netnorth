@@ -106,7 +106,97 @@
 }
   .node-text { display: inline; color: inherit; font: inherit; line-height: inherit; letter-spacing: inherit; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
   .node.image-node { padding: 0; line-height: 0; font-size: 0; white-space: normal; overflow-wrap: normal; word-break: normal; overflow: hidden; max-width: none; min-width: 10px; min-height: 10px; background: transparent; }
-  .node.image-node .node-image { display: block; width: 100%; height: 100%; max-width: none; line-height: 0; font-size: 0; object-fit: fill; pointer-events: none; user-select: none; -webkit-user-drag: none; }
+  .node.image-node .node-image { display: block; width: 100%; height: 100%; max-width: none; line-height: 0; font-size: 0; object-fit: fill; pointer-events: none; user-select: none; -webkit-user-drag: none; transition: filter .22s cubic-bezier(.2,.75,.25,1); }
+  .node.image-node.image-expand-visible .node-image { filter: brightness(.88); }
+  .image-expand-button {
+    position: absolute;
+    z-index: 6;
+    top: 8px;
+    right: 8px;
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border: 1px solid rgba(255,255,255,.55);
+    border-radius: 9px;
+    background: rgba(28,30,34,.42);
+    color: #fff;
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 3px 14px rgba(0,0,0,.16);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: scale(.88);
+    cursor: pointer;
+    transition: opacity .22s cubic-bezier(.2,.75,.25,1), transform .22s cubic-bezier(.2,.75,.25,1), visibility 0s linear .22s, background-color .2s ease;
+  }
+  .image-expand-button svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .node.image-node.image-expand-visible .image-expand-button { opacity: 1; visibility: visible; pointer-events: auto; transform: scale(1); transition-delay: 0s; }
+  .image-expand-button:hover { background: rgba(20,22,26,.68); }
+  .image-expand-button:active { transform: scale(.94); }
+  .image-lightbox {
+    position: fixed;
+    z-index: 5000;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 5vh 5vw;
+    background: rgba(10,11,13,.9);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity .2s ease, visibility 0s linear .2s;
+  }
+  .image-lightbox.visible { opacity: 1; visibility: visible; pointer-events: auto; transition-delay: 0s; }
+  .image-lightbox-stage { display: grid; place-items: center; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; touch-action: none; }
+  .image-lightbox-img {
+    display: block;
+    max-width: 85vw;
+    max-height: 85vh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    user-select: none;
+    -webkit-user-drag: none;
+    touch-action: none;
+    transform-origin: center center;
+    will-change: transform;
+    cursor: zoom-in;
+  }
+  .image-lightbox-img:not([src]),
+  .image-lightbox-img[src=""] {
+    opacity: 0;
+    visibility: hidden;
+  }
+  .image-lightbox-img[data-zoom]:not([data-zoom="1"]) { cursor: grab; }
+  .image-lightbox-close {
+    position: absolute;
+    z-index: 2;
+    top: max(18px, env(safe-area-inset-top, 0px));
+    right: max(18px, env(safe-area-inset-right, 0px));
+    display: grid;
+    place-items: center;
+    width: 42px;
+    height: 42px;
+    padding: 0 0 3px;
+    border: 1px solid rgba(255,255,255,.28);
+    border-radius: 12px;
+    background: rgba(255,255,255,.12);
+    color: #fff;
+    font-size: 30px;
+    font-weight: 300;
+    line-height: 1;
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    cursor: pointer;
+    transition: background-color .2s ease, transform .2s ease;
+  }
+  .image-lightbox-close:hover { background: rgba(255,255,255,.22); }
+  .image-lightbox-close:active { transform: scale(.94); }
+  body.image-lightbox-open { user-select: none; }
   .node.highlight .node-text { background: #ffea00; box-shadow: 2px 0 0 #ffea00, -2px 0 0 #ffea00; }
   .node.underlined .node-text { text-decoration: none; background-image: linear-gradient(currentColor, currentColor); background-repeat: repeat-x; background-size: 100% 1.5px; background-position: left calc(100% - 1px); -webkit-box-decoration-break: clone; box-decoration-break: clone; }
   .node.selected { border-color: transparent; outline: 2px solid var(--accent-color, #3b82f6); outline-offset: 2px; background: rgba(255,255,255,.82); }

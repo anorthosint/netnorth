@@ -39,8 +39,21 @@
   let lastLocalSaveErrorToastAt = 0;
   let presentationMode = false;
   let presentationPreviousState = null;
+  let imageLightboxScale = 1;
+  let imageLightboxOffsetX = 0;
+  let imageLightboxOffsetY = 0;
+  const imageLightboxPointers = new Map();
+  let imageLightboxPinchStart = null;
+  let imageLightboxPanStart = null;
+  let imageLightboxSrcCleanupTimer = null;
+  let lastDraggedImageNodeIds = new Set();
+  let lastImageDragAt = 0;
   const stage = document.getElementById('stage');
   const workspace = document.getElementById('workspace');
+  const imageLightbox = document.getElementById('imageLightbox');
+  const imageLightboxClose = document.getElementById('imageLightboxClose');
+  const imageLightboxStage = imageLightbox?.querySelector('.image-lightbox-stage') || null;
+  const imageLightboxImg = document.getElementById('imageLightboxImg');
   const world = document.getElementById('world');
   const nodeContextMenu = document.getElementById('nodeContextMenu');
   const canvasContextActions = document.getElementById('canvasContextActions');
@@ -248,6 +261,177 @@
     return 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   }
   function nodeById(id, model = scene) { return model.nodes.find(n => n.id === id); }
+
+  function getImageNodeSource(node) {
+    if (!node || node.type !== 'image') return '';
+    if (typeof node.image === 'string' && node.image) return node.image;
+    const key = typeof node.imageKey === 'string' ? node.imageKey : '';
+    return key ? (imageStore.get(key) || '') : '';
+  }
+
+  function clearImageExpandButtons() {
+    renderedNodeElements.forEach(element => element.classList.remove('image-expand-visible'));
+  }
+
+  function clampImageLightboxOffsets() {
+    if (!imageLightboxImg || !imageLightboxStage) return;
+    if (imageLightboxScale <= 1) {
+      imageLightboxOffsetX = 0;
+      imageLightboxOffsetY = 0;
+      return;
+    }
+
+    // offsetWidth/offsetHeight are layout dimensions and do not include the CSS scale.
+    const baseWidth = imageLightboxImg.offsetWidth || 0;
+    const baseHeight = imageLightboxImg.offsetHeight || 0;
+    const stageWidth = imageLightboxStage.clientWidth || window.innerWidth;
+    const stageHeight = imageLightboxStage.clientHeight || window.innerHeight;
+
+    const scaledWidth = baseWidth * imageLightboxScale;
+    const scaledHeight = baseHeight * imageLightboxScale;
+    const maxOffsetX = Math.max(0, (scaledWidth - stageWidth) / 2);
+    const maxOffsetY = Math.max(0, (scaledHeight - stageHeight) / 2);
+
+    imageLightboxOffsetX = clamp(imageLightboxOffsetX, -maxOffsetX, maxOffsetX);
+    imageLightboxOffsetY = clamp(imageLightboxOffsetY, -maxOffsetY, maxOffsetY);
+  }
+
+  function updateImageLightboxTransform() {
+    if (!imageLightboxImg) return;
+    clampImageLightboxOffsets();
+    imageLightboxImg.style.transform = `translate3d(${imageLightboxOffsetX}px, ${imageLightboxOffsetY}px, 0) scale(${imageLightboxScale})`;
+    imageLightboxImg.dataset.zoom = String(imageLightboxScale);
+  }
+
+  function resetImageLightboxView() {
+    imageLightboxScale = 1;
+    imageLightboxOffsetX = 0;
+    imageLightboxOffsetY = 0;
+    imageLightboxPointers.clear();
+    imageLightboxPinchStart = null;
+    imageLightboxPanStart = null;
+    updateImageLightboxTransform();
+  }
+
+  function openImageLightbox(nodeId) {
+    if (!imageLightbox || !imageLightboxImg || presentationMode || playback.active) return;
+    const node = nodeById(nodeId);
+    if (!node || node.type !== 'image') return;
+    const source = getImageNodeSource(node);
+    if (!source) {
+      showToast('Не удалось открыть изображение');
+      return;
+    }
+    // Cancel any pending source cleanup when the viewer is opened again.
+    if (imageLightboxSrcCleanupTimer !== null) {
+      window.clearTimeout(imageLightboxSrcCleanupTimer);
+      imageLightboxSrcCleanupTimer = null;
+    }
+    imageLightboxImg.src = source;
+    resetImageLightboxView();
+    imageLightbox.classList.add('visible');
+    imageLightbox.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('image-lightbox-open');
+    window.setTimeout(() => {
+      if (imageLightbox.classList.contains('visible')) {
+        try { imageLightboxClose?.focus({ preventScroll: true }); } catch (_) { imageLightboxClose?.focus(); }
+      }
+    }, 0);
+  }
+
+  function closeImageLightbox() {
+    if (!imageLightbox || !imageLightbox.classList.contains('visible')) return;
+    imageLightbox.classList.remove('visible');
+    imageLightbox.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('image-lightbox-open');
+    resetImageLightboxView();
+    // Keep the image source while the lightbox fades out, so the browser
+    // never flashes the image's alt fallback during the closing transition.
+    if (imageLightboxSrcCleanupTimer !== null) {
+      window.clearTimeout(imageLightboxSrcCleanupTimer);
+    }
+    imageLightboxSrcCleanupTimer = window.setTimeout(() => {
+      if (!imageLightbox.classList.contains('visible') && imageLightboxImg) {
+        imageLightboxImg.removeAttribute('src');
+      }
+      imageLightboxSrcCleanupTimer = null;
+    }, 220);
+  }
+
+  function setImageLightboxZoom(nextScale) {
+    imageLightboxScale = clamp(nextScale, 1, 5);
+    if (imageLightboxScale <= 1) {
+      imageLightboxOffsetX = 0;
+      imageLightboxOffsetY = 0;
+    }
+    updateImageLightboxTransform();
+  }
+
+  function getLightboxPointerDistance() {
+    const points = [...imageLightboxPointers.values()];
+    if (points.length < 2) return 0;
+    return Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+  }
+
+  function handleImageLightboxPointerDown(event) {
+    if (!imageLightbox?.classList.contains('visible')) return;
+    if (event.target !== imageLightboxImg) {
+      closeImageLightbox();
+      return;
+    }
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    event.preventDefault();
+    imageLightboxPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    try { imageLightboxImg.setPointerCapture(event.pointerId); } catch (_) {}
+    if (imageLightboxPointers.size >= 2) {
+      imageLightboxPinchStart = {
+        distance: Math.max(1, getLightboxPointerDistance()),
+        scale: imageLightboxScale
+      };
+      imageLightboxPanStart = null;
+    } else if (imageLightboxScale > 1) {
+      imageLightboxPanStart = {
+        x: event.clientX,
+        y: event.clientY,
+        offsetX: imageLightboxOffsetX,
+        offsetY: imageLightboxOffsetY
+      };
+    }
+  }
+
+  function handleImageLightboxPointerMove(event) {
+    if (!imageLightboxPointers.has(event.pointerId)) return;
+    imageLightboxPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (imageLightboxPointers.size >= 2 && imageLightboxPinchStart) {
+      event.preventDefault();
+      const distance = Math.max(1, getLightboxPointerDistance());
+      setImageLightboxZoom(imageLightboxPinchStart.scale * distance / imageLightboxPinchStart.distance);
+      return;
+    }
+    if (imageLightboxScale > 1 && imageLightboxPanStart) {
+      event.preventDefault();
+      imageLightboxOffsetX = imageLightboxPanStart.offsetX + event.clientX - imageLightboxPanStart.x;
+      imageLightboxOffsetY = imageLightboxPanStart.offsetY + event.clientY - imageLightboxPanStart.y;
+      updateImageLightboxTransform();
+    }
+  }
+
+  function handleImageLightboxPointerEnd(event) {
+    if (!imageLightboxPointers.has(event.pointerId)) return;
+    imageLightboxPointers.delete(event.pointerId);
+    if (imageLightboxPointers.size < 2) imageLightboxPinchStart = null;
+    if (imageLightboxPointers.size === 1 && imageLightboxScale > 1) {
+      const remaining = [...imageLightboxPointers.values()][0];
+      imageLightboxPanStart = {
+        x: remaining.x,
+        y: remaining.y,
+        offsetX: imageLightboxOffsetX,
+        offsetY: imageLightboxOffsetY
+      };
+    } else {
+      imageLightboxPanStart = null;
+    }
+  }
 
   function ensureNodeImageKey(node) {
     if (!node || node.type !== 'image') return '';
@@ -2513,6 +2697,7 @@
 
   function enterPresentationMode() {
     if (presentationMode || (startScreen && startScreen.classList.contains('visible'))) return;
+    closeImageLightbox();
 
     // Close/finalize any editor or transient UI before switching to the read-only view.
     if (playback.active) exitPlayback();
@@ -3704,7 +3889,7 @@
         imageEl.className = 'node-image';
         imageEl.alt = 'Изображение';
         imageEl.draggable = false;
-        imageEl.src = n.image;
+        imageEl.src = getImageNodeSource(n);
         imageEl?.addEventListener('load', () => {
           const liveNode = nodeById(n.id);
           if (!liveNode || liveNode.type !== 'image') return;
@@ -3719,6 +3904,25 @@
           }
         }, { once: true });
         el.appendChild(imageEl);
+        if (!isPlayback && !presentationMode) {
+          const expandButton = document.createElement('button');
+          expandButton.type = 'button';
+          expandButton.className = 'image-expand-button';
+          expandButton.setAttribute('aria-label', 'Открыть изображение');
+          expandButton.setAttribute('title', 'Открыть изображение');
+          expandButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4H4v4M16 4h4v4M20 16v4h-4M8 20H4v-4"/></svg>';
+          expandButton.addEventListener('pointerdown', event => {
+            // The overlay button must not bubble into the image node's drag handler.
+            event.stopPropagation();
+          });
+          expandButton.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            clearImageExpandButtons();
+            openImageLightbox(n.id);
+          });
+          el.appendChild(expandButton);
+        }
       } else {
         // On phones, let text nodes size to their contents but cap the line
         // length to the visible workspace. This also clamps legacy fixed-width
@@ -3901,14 +4105,47 @@
           if (event.target.closest('.resize-handle') || event.target.closest('.anchor')) return;
           if (event.target.closest('.node')) startNodeDrag(event, n.id);
         });
+        if (n.type === 'image') {
+          el?.addEventListener('click', event => {
+            const target = event.target instanceof Element ? event.target : null;
+            if (target?.closest('.image-expand-button')) return;
+            if (event.detail !== 1) return;
+
+            // A native click can still be dispatched after a drag on some browsers.
+            // Ignore it for the just-dragged image, but only for the matching node.
+            const draggedRecently = lastDraggedImageNodeIds.has(n.id) &&
+              performance.now() - lastImageDragAt < 350;
+            if (draggedRecently) {
+              lastDraggedImageNodeIds.delete(n.id);
+              return;
+            }
+
+            clearImageExpandButtons();
+            if (
+              mode === 'select' &&
+              selectedIds.length <= 1 &&
+              !presentationMode &&
+              !playback.active &&
+              !drag &&
+              !wasDragging
+            ) {
+              el.classList.add('image-expand-visible');
+            }
+          });
+        }
         el?.addEventListener('dblclick', event => {
           if (presentationMode) { event.preventDefault(); event.stopPropagation(); return; }
           const target = event.target instanceof Element ? event.target : null;
           // Double-clicking a URL must not enter node text-edit mode.
           if (target?.closest('a.node-link')) return;
-          if (event.button !== 0 || mode !== 'select') return;
+          if (event.button !== 0 || mode !== 'select' || playback.active) return;
           event.preventDefault(); event.stopPropagation();
-          if (n.type !== 'image') startEditing(n.id);
+          if (n.type === 'image') {
+            clearImageExpandButtons();
+            openImageLightbox(n.id);
+          } else {
+            startEditing(n.id);
+          }
         });
         el?.addEventListener('contextmenu', event => {
           if (presentationMode) { event.preventDefault(); event.stopPropagation(); return; }
@@ -5119,6 +5356,13 @@
     if (drag) {
       const finished = drag;
       const changed = finished.moved;
+      if (changed && (finished.type === 'move' || finished.type === 'moveSelection')) {
+        const movedIds = finished.type === 'moveSelection'
+          ? (finished.ids || []).map(item => item.id)
+          : [finished.id];
+        lastDraggedImageNodeIds = new Set(movedIds.filter(id => nodeById(id)?.type === 'image'));
+        lastImageDragAt = performance.now();
+      }
       const suppressPostDragLinkClick = movementWasTracked && !!finished.startedOnLink;
       // Browsers may dispatch contextmenu after releasing ПКМ. Suppress it only
       // after an actual right-button drag so the group does not open a menu on drop.
@@ -8129,8 +8373,9 @@
 
   stage?.addEventListener('pointerdown', startBoxSelection);
   document?.addEventListener('click', event => {
-    if (!presentationMode) return;
     const target = event.target instanceof Element ? event.target : null;
+    if (!target?.closest('.node.image-node')) clearImageExpandButtons();
+    if (!presentationMode) return;
     if (!target || !target.closest('#stage')) return;
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -8439,6 +8684,34 @@
     renderProjectChecklist();
     saveProject();
   });
+  imageLightboxClose?.addEventListener('click', closeImageLightbox);
+  imageLightbox?.addEventListener('pointerdown', event => {
+    if (event.target !== imageLightboxImg) closeImageLightbox();
+  });
+  imageLightboxStage?.addEventListener('pointerdown', handleImageLightboxPointerDown);
+  imageLightboxStage?.addEventListener('pointermove', handleImageLightboxPointerMove, { passive: false });
+  imageLightboxStage?.addEventListener('pointerup', handleImageLightboxPointerEnd);
+  imageLightboxStage?.addEventListener('pointercancel', handleImageLightboxPointerEnd);
+  imageLightboxStage?.addEventListener('lostpointercapture', handleImageLightboxPointerEnd);
+  imageLightboxStage?.addEventListener('wheel', event => {
+    if (!imageLightbox?.classList.contains('visible')) return;
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? 1.14 : 1 / 1.14;
+    setImageLightboxZoom(imageLightboxScale * factor);
+  }, { passive: false });
+  window.addEventListener('resize', () => {
+    if (imageLightbox?.classList.contains('visible')) updateImageLightboxTransform();
+  });
+  imageLightbox?.addEventListener('click', event => {
+    if (event.target === imageLightbox) closeImageLightbox();
+  });
+  document?.addEventListener('keydown', event => {
+    if (!imageLightbox?.classList.contains('visible')) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (event.key === 'Escape') closeImageLightbox();
+  }, true);
+
   document?.addEventListener('keydown', event => {
     if (event.key === 'Escape' && mainArea.classList.contains('project-notes-open')) {
       setProjectNotesOpen(false);
