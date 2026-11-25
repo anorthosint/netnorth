@@ -244,6 +244,7 @@
   // Это не позволяет сохранению проекта A записать уже активное состояние проекта B.
   let pendingSave = null;
   let shouldFocusNewNode = false;
+  let pendingEditingCaretCoords = null;
   let confirmCallback = null;
   let localStorageAvailable = true;
   let autoArrangeEnabled = true;
@@ -3965,9 +3966,11 @@
         }
         el.appendChild(textSpan);
         let placeholderEl = null;
-        if (!isPlayback && n.id === editingId && !n.text.trim()) {
+        if (!isPlayback && n.id === editingId) {
+          // Keep a placeholder node for the full editing session so it can
+          // appear immediately if the user deletes all text from an existing node.
           placeholderEl = document.createElement('span');
-          placeholderEl.className = 'node-placeholder';
+          placeholderEl.className = `node-placeholder${String(n.text || '').trim() ? ' hidden' : ''}`;
           placeholderEl.textContent = 'Введите текст…';
           el.appendChild(placeholderEl);
         }
@@ -4052,11 +4055,20 @@
           el?.addEventListener('pointerdown', event => {
             if (event.button !== 0 || editingId !== n.id) return;
             if (event.target instanceof Element && event.target.closest('a.node-link')) return;
-            try { textSpan.focus({ preventScroll: true }); } catch (_) { textSpan.focus(); }
-            placeCaretAtEnd(textSpan);
-            // The hit is often on the node/placeholder rather than the empty
-            // inline editor. Prevent the browser from moving focus back to body.
-            if (event.cancelable) event.preventDefault();
+
+            const clickedText = event.target === textSpan || textSpan.contains(event.target);
+            // For populated text, let the browser calculate the exact caret
+            // position from the pointer coordinates. For an empty editor or
+            // a hit on the node's padding/placeholder, restore focus at the end.
+            if (clickedText && textSpan.textContent.length > 0) return;
+
+            if (!textSpan.textContent.trim() || !clickedText) {
+              try { textSpan.focus({ preventScroll: true }); } catch (_) { textSpan.focus(); }
+              placeCaretAtEnd(textSpan);
+              // The hit is often on the node/placeholder rather than the empty
+              // inline editor. Prevent the browser from moving focus back to body.
+              if (event.cancelable) event.preventDefault();
+            }
           });
         }
       }
@@ -4144,7 +4156,7 @@
             clearImageExpandButtons();
             openImageLightbox(n.id);
           } else {
-            startEditing(n.id);
+            startEditing(n.id, { clientX: event.clientX, clientY: event.clientY });
           }
         });
         el?.addEventListener('contextmenu', event => {
@@ -4331,7 +4343,20 @@
       if (editingText && shouldFocusNewNode) {
         shouldFocusNewNode = false;
         editingText.focus({ preventScroll: true });
-        placeCaretAtEnd(editingText);
+        const caretCoords = pendingEditingCaretCoords;
+        pendingEditingCaretCoords = null;
+        if (caretCoords && editingText.textContent.length > 0) {
+          const range = getEditorDropRange(editingText, caretCoords.clientX, caretCoords.clientY);
+          const selection = window.getSelection();
+          if (range && selection) {
+            selection.removeAllRanges();
+            selection.addRange(range);
+          } else {
+            placeCaretAtEnd(editingText);
+          }
+        } else {
+          placeCaretAtEnd(editingText);
+        }
       }
     }
     updateEmptyState(model, isPlayback);
@@ -4441,6 +4466,7 @@
     }
     editingId = null;
     editingOriginalText = null;
+    pendingEditingCaretCoords = null;
     selectedId = null; selectedIds.splice(0);
     if (n && !n.text.trim()) {
       scene.nodes = scene.nodes.filter(item => item.id !== id);
@@ -4456,11 +4482,19 @@
     }
   }
 
-  function startEditing(id) {
+  function startEditing(id, caretCoords = null) {
     if (presentationMode) return;
     const n = nodeById(id);
     if (!n || playback.active) return;
-    selectedId = id; selectedIds.splice(0, selectedIds.length, id); editingId = id; editingOriginalText = n.text; shouldFocusNewNode = true;
+    selectedId = id;
+    selectedIds.splice(0, selectedIds.length, id);
+    editingId = id;
+    editingOriginalText = n.text;
+    pendingEditingCaretCoords = caretCoords &&
+      Number.isFinite(caretCoords.clientX) && Number.isFinite(caretCoords.clientY)
+      ? { clientX: caretCoords.clientX, clientY: caretCoords.clientY }
+      : null;
+    shouldFocusNewNode = true;
     renderScene();
   }
 

@@ -931,22 +931,19 @@
   .dark-theme .node-text a.node-link:hover { color: #82baff; }
 }
 
-/* Keep existing text metrics identical between editing and viewing so
-   highlight backgrounds do not jump when contenteditable is removed. */
+/* Keep an editable line box even when contenteditable temporarily contains
+   no text nodes, so the caret stays inside the node while the placeholder appears. */
 .node.editing .node-text {
-  display: inline;
+  display: inline-block;
   min-width: 1ch;
-  min-height: 0;
+  min-height: 1.28em;
   outline: none;
-  vertical-align: baseline;
+  vertical-align: top;
 }
 
-/* Only an empty editor needs a wider inline-block hit area for its placeholder. */
+/* An empty editor keeps a comfortable hit area beside its visible placeholder. */
 .node.editing:has(.node-placeholder:not(.hidden)) .node-text {
-  display: inline-block;
   min-width: 60px;
-  min-height: 20px;
-  vertical-align: middle;
 }
 
 /* Make context-sheet actions easier to hit on touch screens. */
