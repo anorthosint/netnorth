@@ -3310,6 +3310,31 @@
     return point;
   }
 
+  function getAxisAlignedEdgePoints(aPoint, bPoint, fromSide, toSide, style = 'curved') {
+    if (style !== 'curved' && style !== 'dashed') return null;
+
+    const horizontalSides = side => side === 'left' || side === 'right';
+    const verticalSides = side => side === 'top' || side === 'bottom';
+
+    if (horizontalSides(fromSide) && horizontalSides(toSide) &&
+        Math.abs(aPoint.y - bPoint.y) <= 1.5) {
+      return {
+        axis: 'horizontal',
+        bPoint: { x: bPoint.x, y: aPoint.y }
+      };
+    }
+
+    if (verticalSides(fromSide) && verticalSides(toSide) &&
+        Math.abs(aPoint.x - bPoint.x) <= 1.5) {
+      return {
+        axis: 'vertical',
+        bPoint: { x: aPoint.x, y: bPoint.y }
+      };
+    }
+
+    return null;
+  }
+
   function edgeRouteFor(aPoint, bPoint, fromSide, toSide, style = 'curved', routeContext = null) {
     if (style === 'straight') {
       return { type: 'line', points: [aPoint, bPoint] };
@@ -3338,6 +3363,17 @@
   }
 
   function pathFor(aPoint, bPoint, fromSide, toSide, style = 'curved', routeContext = null, appendArrowEnd = false, appendArrowStart = false) {
+    const axisAlignment = getAxisAlignedEdgePoints(aPoint, bPoint, fromSide, toSide, style);
+    if (axisAlignment) {
+      const startLeadPoint = appendArrowStart
+        ? insetEndpointBySide(aPoint, fromSide, -4.5)
+        : aPoint;
+      const endLeadPoint = appendArrowEnd
+        ? insetEndpointBySide(axisAlignment.bPoint, toSide, -4.5)
+        : axisAlignment.bPoint;
+      return `M ${startLeadPoint.x} ${startLeadPoint.y} L ${endLeadPoint.x} ${endLeadPoint.y}`;
+    }
+
     const route = edgeRouteFor(aPoint, bPoint, fromSide, toSide, style, routeContext);
     if (route.type === 'line') {
       return `M ${aPoint.x} ${aPoint.y} L ${bPoint.x} ${bPoint.y}`;
@@ -4181,7 +4217,10 @@
         el.classList.toggle('tiny-node', n.width <= 18 || n.height <= 18);
         return;
       }
-      n.width = Math.max(10, el.offsetWidth);
+      const rect = el.getBoundingClientRect();
+      const safeZoom = Math.max(0.01, Number(zoom) || 1);
+      const exactWidth = rect.width > 0 ? rect.width / safeZoom : el.offsetWidth;
+      n.width = Math.max(10, Math.ceil(exactWidth) + 2);
       n.height = Math.max(10, el.offsetHeight);
       el.classList.toggle('tiny-node', n.width <= 18 || n.height <= 18);
     });
@@ -4561,6 +4600,7 @@
     const activeDrag = drag;
     const activeBox = boxSelect;
     clearSmartGuides();
+    clearFontSizeSnapHighlights(activeDrag);
     clearQueuedGesturePointerMove();
     detachPointerGestureListeners();
     if (dragPaintRaf) {
@@ -4658,6 +4698,22 @@
     const selectedSet = activeDrag.type === 'moveSelection'
       ? new Set(activeDrag.ids.map(origin => origin.id))
       : new Set(movingNode ? [movingNode.id] : []);
+    const safeZoom = Math.max(0.01, Number(zoom) || 1);
+    const measureNodeSize = (node, element) => {
+      if (element && element.isConnected && typeof element.getBoundingClientRect === 'function') {
+        const rect = element.getBoundingClientRect();
+        const exactWidth = rect.width > 0 ? rect.width / safeZoom : (Number(node.width) || 10);
+        const exactHeight = rect.height > 0 ? rect.height / safeZoom : (Number(node.height) || 10);
+        return {
+          width: Math.max(10, exactWidth),
+          height: Math.max(10, exactHeight)
+        };
+      }
+      return {
+        width: Math.max(10, Number(node.width) || 10),
+        height: Math.max(10, Number(node.height) || 10)
+      };
+    };
 
     if (activeDrag.type === 'moveSelection') {
       // Build one immutable bounding box from the selected nodes' pointer-down
@@ -4666,8 +4722,7 @@
         const node = nodeById(origin.id);
         if (!node) return null;
         const element = renderedNodeElements.get(origin.id);
-        const width = Math.max(10, element ? element.offsetWidth : (Number(node.width) || 10));
-        const height = Math.max(10, element ? element.offsetHeight : (Number(node.height) || 10));
+        const { width, height } = measureNodeSize(node, element);
         const left = Number(origin.x) || 0;
         const top = Number(origin.y) || 0;
         return { left, top, right: left + width, bottom: top + height };
@@ -4685,8 +4740,9 @@
     } else {
       if (!movingNode) return;
       const movingElement = renderedNodeElements.get(movingNode.id);
-      activeDrag.nodeWidth = Math.max(10, movingElement ? movingElement.offsetWidth : (Number(movingNode.width) || 10));
-      activeDrag.nodeHeight = Math.max(10, movingElement ? movingElement.offsetHeight : (Number(movingNode.height) || 10));
+      const { width, height } = measureNodeSize(movingNode, movingElement);
+      activeDrag.nodeWidth = width;
+      activeDrag.nodeHeight = height;
     }
 
     // Capture only visible nodes outside the moving set. When the viewport
@@ -4699,8 +4755,7 @@
       .filter(node => node && !selectedSet.has(node.id) && visibleIds.has(node.id))
       .map(node => {
         const element = renderedNodeElements.get(node.id);
-        const width = Math.max(10, element ? element.offsetWidth : (Number(node.width) || 10));
-        const height = Math.max(10, element ? element.offsetHeight : (Number(node.height) || 10));
+        const { width, height } = measureNodeSize(node, element);
         const left = Number(node.x) || 0;
         const top = Number(node.y) || 0;
         return {
@@ -4768,6 +4823,36 @@
     smartGuidesLayer = null;
   }
 
+  function clearFontSizeSnapHighlights(activeDrag = drag) {
+    if (!activeDrag) return;
+    const highlightedIds = Array.isArray(activeDrag.fontSizeSnapHighlightIds)
+      ? activeDrag.fontSizeSnapHighlightIds
+      : [];
+    highlightedIds.forEach(id => {
+      const element = renderedNodeElements.get(id);
+      if (element) element.classList.remove('font-size-snap-match');
+    });
+    activeDrag.fontSizeSnapHighlightIds = [];
+  }
+
+  function paintFontSizeSnapHighlights(activeDrag, movingNode, matchedFontSize) {
+    clearFontSizeSnapHighlights(activeDrag);
+    if (!activeDrag || !movingNode || !Number.isFinite(matchedFontSize)) return;
+
+    const ids = new Set([movingNode.id]);
+    (Array.isArray(activeDrag.sizeSnapCandidates) ? activeDrag.sizeSnapCandidates : [])
+      .forEach(candidate => {
+        if (candidate.type === 'image' || !Number.isFinite(candidate.fontSize)) return;
+        if (Math.abs(candidate.fontSize - matchedFontSize) <= 0.001) ids.add(candidate.id);
+      });
+
+    ids.forEach(id => {
+      const element = renderedNodeElements.get(id);
+      if (element && element.isConnected) element.classList.add('font-size-snap-match');
+    });
+    activeDrag.fontSizeSnapHighlightIds = [...ids];
+  }
+
   function paintSmartGuides(activeGuides) {
     const vertical = activeGuides && activeGuides.vertical;
     const horizontal = activeGuides && activeGuides.horizontal;
@@ -4805,6 +4890,108 @@
     updateLine('horizontal', horizontal);
   }
 
+  function cacheResizeSnapCandidates(activeDrag, movingNode) {
+    if (!activeDrag || activeDrag.type !== 'resize' || !movingNode) return;
+    updateViewportCulling();
+
+    const safeZoom = Math.max(0.01, Number(zoom) || 1);
+    const visibleIds = visibleViewportNodeIds.size
+      ? visibleViewportNodeIds
+      : new Set(scene.nodes.filter(node => node && node.id !== movingNode.id).map(node => node.id));
+
+    activeDrag.sizeSnapCandidates = scene.nodes
+      .filter(node => node && node.id !== movingNode.id && visibleIds.has(node.id))
+      .map(node => {
+        const element = renderedNodeElements.get(node.id);
+        const rect = element && element.isConnected && typeof element.getBoundingClientRect === 'function'
+          ? element.getBoundingClientRect()
+          : null;
+        const width = Math.max(10, rect && rect.width > 0
+          ? rect.width / safeZoom
+          : (Number(node.width) || 10));
+        const height = Math.max(10, rect && rect.height > 0
+          ? rect.height / safeZoom
+          : (Number(node.height) || 10));
+        const left = Number(node.x) || 0;
+        const top = Number(node.y) || 0;
+
+        return {
+          id: node.id,
+          type: node.type || 'text',
+          fontSize: node.type === 'image'
+            ? null
+            : Math.round((Number(node.fontSize) || 16) * 2) / 2,
+          width,
+          height,
+          left,
+          right: left + width,
+          top,
+          bottom: top + height
+        };
+      });
+  }
+
+  function buildResizeSmartGuides(node, activeDrag) {
+    if (!node || !activeDrag || activeDrag.snapDisabled) return null;
+    const candidates = Array.isArray(activeDrag.sizeSnapCandidates) ? activeDrag.sizeSnapCandidates : [];
+    if (!candidates.length) return null;
+
+    const threshold = 5 / (activeDrag.startZoom || zoom || 1);
+    const west = activeDrag.handle.includes('w');
+    const north = activeDrag.handle.includes('n');
+
+    if (node.type === 'image') {
+      const match = activeDrag.sizeSnapMatch;
+      if (!match || !match.candidate) return null;
+      const candidate = match.candidate;
+      if (match.axis === 'width') {
+        const coordinate = west ? node.x : node.x + node.width;
+        return {
+          vertical: {
+            coordinate,
+            start: Math.min(node.y, candidate.top),
+            end: Math.max(node.y + node.height, candidate.bottom)
+          },
+          horizontal: null
+        };
+      }
+      if (match.axis === 'height') {
+        const coordinate = north ? node.y : node.y + node.height;
+        return {
+          vertical: null,
+          horizontal: {
+            coordinate,
+            start: Math.min(node.x, candidate.left),
+            end: Math.max(node.x + node.width, candidate.right)
+          }
+        };
+      }
+      return null;
+    }
+
+    // Text size is snapped through fontSize; edge guides are a secondary
+    // visual aid when the resized left/right edge approaches another node.
+    const movingEdge = west ? node.x : node.x + node.width;
+    let best = null;
+    candidates.forEach(candidate => {
+      [candidate.left, candidate.right].forEach(coordinate => {
+        const distance = Math.abs(coordinate - movingEdge);
+        if (distance <= threshold && (!best || distance < best.distance)) {
+          best = { candidate, coordinate, distance };
+        }
+      });
+    });
+    if (!best) return null;
+    return {
+      vertical: {
+        coordinate: best.coordinate,
+        start: Math.min(node.y, best.candidate.top),
+        end: Math.max(node.y + node.height, best.candidate.bottom)
+      },
+      horizontal: null
+    };
+  }
+
   function startResize(event, id, handle) {
     if (presentationMode) return;
     event.preventDefault(); event.stopPropagation();
@@ -4830,6 +5017,7 @@
     // line breaks do not collapse back to max-content after the drag commits.
     n.autoSize = false;
     drag = { type: 'resize', id, handle, startX: event.clientX, startY: event.clientY, startZoom: zoom, originX: n.x, originY: n.y, originW, originH, originFontSize, originAutoSize, moved: false, pointerId: event.pointerId };
+    cacheResizeSnapCandidates(drag, n);
     attachPointerGesture(onPointerMove, onPointerUp);
   }
 
@@ -5070,7 +5258,7 @@
   function paintDragGeometry() {
     if (!drag || drag.type === 'pan') return;
     if (drag.type === 'move' || drag.type === 'moveSelection') paintSmartGuides(drag.activeGuides);
-    else clearSmartGuides();
+    else if (drag.type !== 'resize') clearSmartGuides();
     let ids = [];
     if (drag.type === 'move') ids = [drag.id];
     else if (drag.type === 'moveSelection') ids = drag.ids.map(item => item.id);
@@ -5128,6 +5316,11 @@
       el.style.top = `${node.y}px`;
     });
 
+    if (drag && drag.type === 'resize') {
+      const resizedNode = renderedNodeModels.get(drag.id) || nodeById(drag.id);
+      drag.activeGuides = buildResizeSmartGuides(resizedNode, drag);
+      paintSmartGuides(drag.activeGuides);
+    }
     ensureStageBoundsForDrag(ids);
     updateRenderedEdgesForNodes(ids);
     scheduleViewportCulling();
@@ -5317,10 +5510,16 @@
         const north = drag.handle.includes('n');
         const horizontalDelta = west ? -modelDx : modelDx;
         const verticalDelta = north ? -modelDy : modelDy;
+        const snapThreshold = 5 / (drag.startZoom || zoom || 1);
+        drag.snapDisabled = !!event.altKey;
+        drag.sizeSnapMatch = null;
+        drag.activeGuides = null;
+        clearFontSizeSnapHighlights(drag);
         n.autoSize = false;
+
         if (n.type === 'image') {
-          // Resize the image uniformly. Clamp the shared scale so both dimensions
-          // stay within 10–2000px without distorting the stored aspect ratio.
+          // Resize uniformly first; Smart Size Snap may then replace the
+          // proposed width with an exact visible image width/height match.
           const originW = Math.max(10, drag.originW);
           const aspect = Math.max(0.01, Number(n.aspectRatio) || (originW / Math.max(1, drag.originH)));
           const originH = originW / aspect;
@@ -5331,8 +5530,40 @@
           const minScale = Math.max(10 / originW, 10 / originH);
           const maxScale = Math.min(2000 / originW, 2000 / originH);
           const imageScale = clamp(proposedScale, minScale, maxScale);
-          n.width = Math.round(originW * imageScale * 10) / 10;
-          n.height = Math.round((n.width / aspect) * 10) / 10;
+          let nextWidth = Math.round(originW * imageScale * 10) / 10;
+          let nextHeight = Math.round((nextWidth / aspect) * 10) / 10;
+          let hasExactImageSizeSnap = false;
+
+          if (!event.altKey && drag.sizeSnapCandidates?.length) {
+            const minWidth = Math.max(10, 10 * aspect);
+            const maxWidth = Math.min(2000, 2000 * aspect);
+            let bestMatch = null;
+            const considerMatch = (axis, distance, candidate, matchedWidth) => {
+              if (distance > snapThreshold || matchedWidth < minWidth || matchedWidth > maxWidth) return;
+              if (!bestMatch || distance < bestMatch.distance) {
+                bestMatch = { axis, distance, candidate, width: matchedWidth };
+              }
+            };
+
+            drag.sizeSnapCandidates.forEach(candidate => {
+              if (candidate.type !== 'image') return;
+              considerMatch('width', Math.abs(nextWidth - candidate.width), candidate, candidate.width);
+              considerMatch('height', Math.abs(nextHeight - candidate.height), candidate, candidate.height * aspect);
+            });
+
+            if (bestMatch) {
+              nextWidth = bestMatch.width;
+              hasExactImageSizeSnap = true;
+              drag.sizeSnapMatch = { axis: bestMatch.axis, candidate: bestMatch.candidate };
+              // Keep the image's own aspect ratio even when matching a peer's height.
+              nextHeight = nextWidth / aspect;
+            }
+          }
+
+          // Preserve the candidate's exact subpixel dimension when snapped;
+          // only freehand resizing keeps the normal tenth-pixel rounding.
+          n.width = hasExactImageSizeSnap ? nextWidth : Math.round(nextWidth * 10) / 10;
+          n.height = hasExactImageSizeSnap ? (n.width / aspect) : Math.round((n.width / aspect) * 10) / 10;
           n.x = west ? Math.max(0, drag.originX + drag.originW - n.width) : drag.originX;
           n.y = north ? Math.max(0, drag.originY + drag.originH - n.height) : drag.originY;
         } else {
@@ -5348,7 +5579,24 @@
           const scaleFactor = Math.max(0, 1 + projectedMovement / originDiagonal);
           const originFontSize = clamp(Number(drag.originFontSize) || Number(n.fontSize) || 16, 10, 80);
           const clampedFontSize = clamp(originFontSize * scaleFactor, 10, 80);
-          n.fontSize = clamp(Math.round(clampedFontSize * 2) / 2, 10, 80);
+          let nextFontSize = clamp(Math.round(clampedFontSize * 2) / 2, 10, 80);
+          let bestFontMatch = null;
+
+          if (!event.altKey && drag.sizeSnapCandidates?.length) {
+            drag.sizeSnapCandidates.forEach(candidate => {
+              if (candidate.type === 'image' || !Number.isFinite(candidate.fontSize)) return;
+              const distance = Math.abs(candidate.fontSize - nextFontSize);
+              if (distance <= 1.5 && (!bestFontMatch || distance < bestFontMatch.distance)) {
+                bestFontMatch = { fontSize: candidate.fontSize, distance };
+              }
+            });
+            if (bestFontMatch) nextFontSize = bestFontMatch.fontSize;
+          }
+
+          n.fontSize = nextFontSize;
+          if (bestFontMatch) {
+            paintFontSizeSnapHighlights(drag, n, bestFontMatch.fontSize);
+          }
           // Apply the font size immediately; the next geometry paint measures
           // the resulting DOM box and anchors its opposite corner to originX/Y.
           const textElement = renderedNodeElements.get(drag.id);
@@ -5382,6 +5630,7 @@
     if (linkDraft && linkDraft.pointerId != null && event.pointerId !== linkDraft.pointerId) return;
     flushQueuedGesturePointerMove(event.pointerId);
     clearSmartGuides();
+    clearFontSizeSnapHighlights(drag);
     // Snapshot the active gesture's movement before clearing its global state.
     const movementWasTracked = wasDragging;
     wasDragging = false;
@@ -6284,7 +6533,9 @@
     if (presentationMode) return;
     document.getElementById('modalTitle').textContent = title;
     document.getElementById('modalText').textContent = message;
-    document.getElementById('modalConfirm').textContent = confirmLabel;
+    const confirmBtn = document.getElementById('modalConfirm');
+    confirmBtn.textContent = confirmLabel;
+    confirmBtn.classList.toggle('danger', /удалить|очистить/i.test(String(confirmLabel || '')));
     document.getElementById('modalCancel').textContent = cancelLabel;
     confirmCallback = callback;
     confirmCancelCallback = cancelCallback;
@@ -6583,8 +6834,14 @@
         const fallback = node.type === 'image'
           ? { width: Math.max(10, Number(node.width) || 360), height: Math.max(10, Number(node.height) || 240) }
           : createFallbackExportNodeMetrics(node, measureContext);
-        const width = live && Number(liveElement.offsetWidth) > 0
-          ? Number(liveElement.offsetWidth)
+        const liveRect = live && typeof liveElement.getBoundingClientRect === 'function'
+          ? liveElement.getBoundingClientRect()
+          : null;
+        const liveExactWidth = liveRect && liveRect.width > 0
+          ? Math.ceil(liveRect.width / Math.max(0.01, Number(zoom) || 1)) + 3
+          : 0;
+        const width = liveExactWidth > 0
+          ? liveExactWidth
           : Number(fallback.width) || Math.max(10, Number(node.width) || 180);
         const height = live && Number(liveElement.offsetHeight) > 0
           ? Number(liveElement.offsetHeight)
@@ -6613,6 +6870,7 @@
           borderColor,
           highlight: node.type !== 'image' && !!node.highlight,
           underline: node.type !== 'image' && !!node.underline,
+          autoSize: node.autoSize !== false,
           imageKey
         };
       });
@@ -6822,6 +7080,23 @@
   function edgePath(a, b, fromSide, toSide, style, context, appendArrowStart, appendArrowEnd) {
     if (style === 'straight') return 'M ' + a.x + ' ' + a.y + ' L ' + b.x + ' ' + b.y;
     if (style === 'square') return squarePoints(a,b,fromSide,toSide,context).map((point,index) => (index ? 'L ' : 'M ') + point.x + ' ' + point.y).join(' ');
+
+    const horizontalSides = side => side === 'left' || side === 'right';
+    const verticalSides = side => side === 'top' || side === 'bottom';
+    let alignedB = null;
+    if (style === 'curved' || style === 'dashed') {
+      if (horizontalSides(fromSide) && horizontalSides(toSide) && Math.abs(a.y - b.y) <= 1.5) {
+        alignedB = { x: b.x, y: a.y };
+      } else if (verticalSides(fromSide) && verticalSides(toSide) && Math.abs(a.x - b.x) <= 1.5) {
+        alignedB = { x: a.x, y: b.y };
+      }
+    }
+    if (alignedB) {
+      const startLeadPoint = appendArrowStart ? insetEndpointBySide(a, fromSide, -4.5) : a;
+      const endLeadPoint = appendArrowEnd ? insetEndpointBySide(alignedB, toSide, -4.5) : alignedB;
+      return 'M ' + startLeadPoint.x + ' ' + startLeadPoint.y + ' L ' + endLeadPoint.x + ' ' + endLeadPoint.y;
+    }
+
     const curve = Math.max(28, Math.min(110, Math.max(Math.abs(b.x-a.x),Math.abs(b.y-a.y))*.42));
     const c1 = {x:a.x,y:a.y}, c2 = {x:b.x,y:b.y};
     if (fromSide === 'right') c1.x += curve;
@@ -6927,7 +7202,12 @@
       element.className = 'node' + (isImage ? ' image-node' : '') + (node.framed ? ' framed' : '') + (node.highlight ? ' highlight' : '') + (node.underline ? ' underlined' : '');
       element.style.left = node.x + 'px';
       element.style.top = node.y + 'px';
-      element.style.width = nodeWidth(node) + 'px';
+      if (!isImage && node.autoSize !== false) {
+        element.style.width = 'max-content';
+        element.style.minWidth = nodeWidth(node) + 'px';
+      } else {
+        element.style.width = nodeWidth(node) + 'px';
+      }
       element.style.height = nodeHeight(node) + 'px';
       if (isImage) {
         element.style.padding = '0';
@@ -7267,6 +7547,21 @@
     };
   }
 
+  async function copyPngBlobToClipboard(pngBlob) {
+    if (!pngBlob || !navigator.clipboard || typeof navigator.clipboard.write !== 'function' || typeof ClipboardItem === 'undefined') {
+      return false;
+    }
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({ 'image/png': pngBlob })
+      ]);
+      return true;
+    } catch (error) {
+      console.warn('Could not copy PNG to clipboard:', error);
+      return false;
+    }
+  }
+
   async function exportPng(format = 'png', customFileName = null) {
     exportScreen.classList.remove('visible');
     if (editingId) finishEditing(editingId, true);
@@ -7315,7 +7610,9 @@
         const elementStyle = isLiveElement ? window.getComputedStyle(element) : null;
         const textStyle = textElement ? window.getComputedStyle(textElement) : elementStyle;
         const fallback = createFallbackExportNodeMetrics(node, fallbackMeasureContext);
-        const liveWidth = isLiveElement ? Number(element.offsetWidth) : 0;
+        const liveWidth = isLiveElement
+          ? Math.ceil(element.getBoundingClientRect().width / Math.max(0.01, Number(zoom) || 1)) + 2
+          : 0;
         const liveHeight = isLiveElement ? Number(element.offsetHeight) : 0;
         const width = liveWidth > 0 ? liveWidth : fallback.width;
         const height = liveHeight > 0 ? liveHeight : fallback.height;
@@ -7343,7 +7640,7 @@
           borderRight,
           borderTop,
           borderBottom,
-          contentWidth: Math.max(1, width - paddingLeft - paddingRight - borderLeft - borderRight),
+          contentWidth: Math.max(1, width - paddingLeft - paddingRight - borderLeft - borderRight + 3),
           fontSize: Math.max(1, fontSize),
           lineHeight: Math.max(1, computedLineHeight),
           letterSpacing,
@@ -7401,11 +7698,22 @@
         const lineEndPoint = edge.arrowhead !== false
           ? insetEndpointBySide(bp, edge.toSide, ARROW_OFFSET)
           : bp;
-        const route = edgeRouteFor(
-          lineStartPoint, lineEndPoint, edge.fromSide, edge.toSide, edge.style,
-          squareRouteContexts.get(edge.id)
+        const axisAlignment = getAxisAlignedEdgePoints(
+          lineStartPoint, lineEndPoint, edge.fromSide, edge.toSide, edge.style
         );
-        edgeGeometry.push({ edge, ap, bp, lineStartPoint, lineEndPoint, route });
+        const routedEndPoint = axisAlignment ? axisAlignment.bPoint : lineEndPoint;
+        const arrowTipPoint = axisAlignment
+          ? (axisAlignment.axis === 'horizontal'
+            ? { x: bp.x, y: routedEndPoint.y }
+            : { x: routedEndPoint.x, y: bp.y })
+          : bp;
+        const route = axisAlignment
+          ? { type: 'axis-line', points: [lineStartPoint, routedEndPoint] }
+          : edgeRouteFor(
+            lineStartPoint, lineEndPoint, edge.fromSide, edge.toSide, edge.style,
+            squareRouteContexts.get(edge.id)
+          );
+        edgeGeometry.push({ edge, ap, bp, arrowTipPoint, lineStartPoint, lineEndPoint: routedEndPoint, route });
         if (route.type === 'bezier') {
           includePoint(route.c1.x, route.c1.y);
           includePoint(route.c2.x, route.c2.y);
@@ -7492,13 +7800,15 @@
         ctx.restore();
       }
 
-      edgeGeometry.forEach(({ edge, ap, bp, lineStartPoint, lineEndPoint, route }) => {
+      edgeGeometry.forEach(({ edge, ap, bp, arrowTipPoint, lineStartPoint, lineEndPoint, route }) => {
         const hasCurvedArrowLead = edge.arrowhead !== false && route.type === 'bezier';
+        const hasAxisAlignedArrowLead = edge.arrowhead !== false && route.type === 'axis-line';
         const hasCurvedStartArrowLead = hasCurvedArrowLead && edge.bidirectional === true;
-        const exportStartLeadPoint = hasCurvedStartArrowLead
+        const hasAxisAlignedStartArrowLead = hasAxisAlignedArrowLead && edge.bidirectional === true;
+        const exportStartLeadPoint = (hasCurvedStartArrowLead || hasAxisAlignedStartArrowLead)
           ? insetEndpointBySide(lineStartPoint, edge.fromSide, -4.5)
           : lineStartPoint;
-        const exportEndLeadPoint = hasCurvedArrowLead
+        const exportEndLeadPoint = (hasCurvedArrowLead || hasAxisAlignedArrowLead)
           ? insetEndpointBySide(lineEndPoint, edge.toSide, -4.5)
           : lineEndPoint;
         ctx.beginPath();
@@ -7515,6 +7825,8 @@
           if (hasCurvedArrowLead) {
             ctx.lineTo(tx + exportEndLeadPoint.x * scale, ty + exportEndLeadPoint.y * scale);
           }
+        } else if (route.type === 'axis-line') {
+          ctx.lineTo(tx + exportEndLeadPoint.x * scale, ty + exportEndLeadPoint.y * scale);
         } else {
           route.points.slice(1).forEach(point => {
             ctx.lineTo(tx + point.x * scale, ty + point.y * scale);
@@ -7541,6 +7853,15 @@
             startAngle = hasCurvedStartArrowLead
               ? Math.atan2(exportStartLeadPoint.y - lineStartPoint.y, exportStartLeadPoint.x - lineStartPoint.x)
               : Math.atan2(route.c1.y - lineStartPoint.y, route.c1.x - lineStartPoint.x) + Math.PI;
+          } else if (route.type === 'axis-line') {
+            endAngle = Math.atan2(
+              exportEndLeadPoint.y - lineEndPoint.y,
+              exportEndLeadPoint.x - lineEndPoint.x
+            );
+            startAngle = Math.atan2(
+              exportStartLeadPoint.y - lineStartPoint.y,
+              exportStartLeadPoint.x - lineStartPoint.x
+            );
           } else {
             const points = route.points && route.points.length > 1
               ? route.points
@@ -7551,7 +7872,7 @@
             startAngle = Math.atan2(next.y - lineStartPoint.y, next.x - lineStartPoint.x) + Math.PI;
           }
           drawExportArrowhead(
-            { x: tx + bp.x * scale, y: ty + bp.y * scale },
+            { x: tx + arrowTipPoint.x * scale, y: ty + arrowTipPoint.y * scale },
             endAngle,
             edgeColor
           );
@@ -7683,7 +8004,7 @@
       });
 
       const name = String(customFileName ?? (projectTitle.value.trim() || 'NetNorth')).replace(/[\\/:*?"<>|]+/g, '_').trim() || 'NetNorth';
-      canvas.toBlob(blob => {
+      canvas.toBlob(async blob => {
         if (!blob) { showToast(`Не удалось подготовить ${formatLabel}`); return; }
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -7693,7 +8014,12 @@
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 1500);
-        showToast(`${formatLabel} экспортирован (${W} × ${H})`);
+        const copiedToClipboard = outputFormat === 'png' ? await copyPngBlobToClipboard(blob) : false;
+        if (copiedToClipboard) {
+          showToast(`PNG экспортирован и скопирован в буфер (${W} × ${H})`);
+        } else {
+          showToast(`${formatLabel} экспортирован (${W} × ${H})`);
+        }
       }, mimeType, outputFormat === 'jpeg' ? 0.9 : undefined);
     } catch (error) {
       console.warn('Image export failed:', error);
@@ -8946,6 +9272,12 @@
       return;
     }
     if (inTextField) return;
+
+    // Alt disables Smart Size Snap immediately, even before the next pointermove.
+    if (event.key === 'Alt' || event.code === 'AltLeft' || event.code === 'AltRight') {
+      if (drag && drag.type === 'resize') clearFontSizeSnapHighlights(drag);
+      return;
+    }
 
     if (event.code === 'Space' || event.key === ' ' || ['PageUp', 'PageDown', 'Home', 'End'].includes(event.code)) {
       event.preventDefault();
