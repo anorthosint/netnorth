@@ -35,7 +35,7 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="1.5"/><path d="M8 21h8M12 17v4M8 9h8M8 12h5"/></svg>
       </button>
     </div>
-    <input type="file" class="hidden-file" id="importFile" accept="application/json,.json">
+    <input type="file" class="hidden-file" id="importFile" accept="application/json,.json,text/html,.html,.htm">
     <input type="file" class="hidden-file" id="imageFile" accept=".png,.jpg,.jpeg">
   </header>
 
@@ -285,7 +285,7 @@
           </button>
         </div>
         <div class="saved-project-list" id="savedProjectList" data-view="list"></div>
-        <button class="start-button" id="importFromStartBtn" style="margin-top:10px"><span>Импортировать JSON</span><span class="start-chevron">↓</span></button>
+        <button class="start-button" id="importFromStartBtn" style="margin-top:10px"><span>Импортировать проект</span><span aria-hidden="true">↓</span></button>
       </section>
       <section id="startSettingsPanel" hidden>
         <button class="start-back" data-start-back="main">← Главное меню</button>
@@ -363,6 +363,13 @@
   <button type="button" id="imageLightboxClose" class="image-lightbox-close" aria-label="Закрыть просмотр">×</button>
   <div class="image-lightbox-stage">
     <img id="imageLightboxImg" class="image-lightbox-img" alt="" draggable="false">
+  </div>
+</div>
+<div id="fileDropOverlay" class="file-drop-overlay" aria-hidden="true">
+  <div class="file-drop-card" role="presentation">
+    <span class="file-drop-icon" aria-hidden="true">↓</span>
+    <strong>Отпустите файл, чтобы импортировать проект</strong>
+    <span>Поддерживаются HTML-отчёты и файлы проектов NetNorth</span>
   </div>
 </div>
 <script src="script.js"></script>

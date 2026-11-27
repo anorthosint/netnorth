@@ -88,6 +88,7 @@
   const playPauseIcon = document.getElementById('playPauseIcon');
   const importFile = document.getElementById('importFile');
   const imageFile = document.getElementById('imageFile');
+  const fileDropOverlay = document.getElementById('fileDropOverlay');
   const modalBackdrop = document.getElementById('modalBackdrop');
   const edgeStyleOptions = document.getElementById('edgeStyleOptions');
   const edgeColorToggle = document.getElementById('edgeColorToggle');
@@ -2366,7 +2367,7 @@
       currentRenderScene = null;
       mode = 'select'; syncModeButtons();
       startScreen.classList.remove('visible'); renderScene(); updateActionButtons();
-      requestAnimationFrame(() => { workspace.scrollLeft = CANVAS_PAD * zoom; workspace.scrollTop = CANVAS_PAD * zoom; scheduleViewportCulling(); });
+      requestAnimationFrame(() => centerCameraOnScene(scene));
     } catch (error) {
       if (imageStoreReplaced) {
         imageStore.clear();
@@ -2861,6 +2862,36 @@
     workspace.scrollLeft = Math.max(0, (centerX + CANVAS_PAD) * zoom - workspace.clientWidth / 2);
     workspace.scrollTop = Math.max(0, (centerY + CANVAS_PAD) * zoom - workspace.clientHeight / 2);
     scheduleViewportCulling();
+  }
+
+  function centerCameraOnScene(targetScene = scene) {
+    const nodes = Array.isArray(targetScene && targetScene.nodes) ? targetScene.nodes : [];
+    if (!nodes.length) {
+      workspace.scrollLeft = CANVAS_PAD * zoom;
+      workspace.scrollTop = CANVAS_PAD * zoom;
+      scheduleViewportCulling();
+      return;
+    }
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+
+    nodes.forEach(node => {
+      const x = Number.isFinite(Number(node && node.x)) ? Number(node.x) : 0;
+      const y = Number.isFinite(Number(node && node.y)) ? Number(node.y) : 0;
+      const width = Number.isFinite(Number(node && node.width)) ? Math.max(0, Number(node.width)) : 0;
+      const height = Number.isFinite(Number(node && node.height)) ? Math.max(0, Number(node.height)) : 0;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + width);
+      maxY = Math.max(maxY, y + height);
+    });
+
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    applyCameraView(centerX, centerY, zoom);
   }
 
   function flushPendingCameraInput() {
@@ -6826,6 +6857,10 @@
       const dark = document.body.classList.contains('dark-theme');
       const activeTheme = dark ? 'dark' : 'light';
       const sceneSnapshot = snapshot(scene);
+      const timelineSnapshot = timeline.map(frame => ({
+        at: Math.max(0, Number(frame.at) || 0),
+        scene: snapshot(frame.scene)
+      }));
       const measureCanvas = document.createElement('canvas');
       const measureContext = measureCanvas.getContext('2d');
       const nodes = sceneSnapshot.nodes.map(node => {
@@ -6866,8 +6901,10 @@
           text: String(node.text || ''),
           fontSize: clamp(Number(node.fontSize) || 16, 8, 80),
           color: textColor,
+          rawColor: normalizedColor,
           framed: node.type !== 'image' && !!node.framed,
           borderColor,
+          rawBorderColor: normalizedBorder,
           highlight: node.type !== 'image' && !!node.highlight,
           underline: node.type !== 'image' && !!node.underline,
           autoSize: node.autoSize !== false,
@@ -6886,7 +6923,7 @@
         arrowhead: edge.arrowhead !== false,
         bidirectional: edge.bidirectional === true
       }));
-      const imageAssets = collectProjectImageAssets([sceneSnapshot]);
+      const imageAssets = collectProjectImageAssets([sceneSnapshot, ...timelineSnapshot.map(frame => frame.scene)]);
       // Include every referenced image directly from the immutable image store.
       nodes.forEach(node => {
         if (node.type !== 'image' || !node.imageKey || imageAssets[node.imageKey]) return;
@@ -6904,12 +6941,29 @@
       const escapeHtml = value => String(value).replace(/[&<>"']/g, character => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       }[character]));
+      const editorUrl = (() => {
+        try {
+          const url = new URL(window.location.href);
+          url.hash = '';
+          url.search = '';
+          return url.toString();
+        } catch (_) { return ''; }
+      })();
       const viewerData = {
+        format: 'netnorth-standalone',
+        version: 1,
         title,
         theme: activeTheme,
         nodes,
         edges,
-        images: imageAssets
+        timeline: timelineSnapshot,
+        images: imageAssets,
+        projectStartedAt,
+        workedMs: currentProjectWorkedMs(),
+        notes: projectNotes,
+        checklist: clone(projectChecklist),
+        cameraBookmarks: clone(cameraState.bookmarks),
+        textNodeDefaults: getTextNodeDefaults()
       };
       const json = JSON.stringify(viewerData)
         .replace(/<\/script/gi, '<\\/script')
@@ -6939,19 +6993,30 @@
   .node.image-node { padding: 0; border-color: transparent; border-radius: 0; background: transparent; line-height: 0; font-size: 0; white-space: normal; overflow: hidden; }
   .node-image { display: block; width: 100%; height: 100%; object-fit: fill; pointer-events: none; user-select: none; -webkit-user-drag: none; }
   a.node-link { color: ${dark ? '#82baff' : '#145fc3'}; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; cursor: pointer; overflow-wrap: break-word; word-break: normal; -webkit-user-drag: none; }
-  #fitButton { position: fixed; z-index: 10; top: max(14px, env(safe-area-inset-top)); right: max(14px, env(safe-area-inset-right)); display: grid; place-items: center; width: 38px; height: 38px; padding: 0; border: 1px solid ${dark ? 'rgba(255,255,255,.17)' : 'rgba(0,0,0,.12)'}; border-radius: 9px; color: ${dark ? '#eeeeee' : '#252525'}; background: ${dark ? 'rgba(34,34,34,.68)' : 'rgba(255,255,255,.72)'}; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); cursor: pointer; opacity: .72; transition: opacity .16s ease, background .16s ease, transform .16s ease; }
+  #viewerActions { position: fixed; z-index: 10; top: max(14px, env(safe-area-inset-top)); right: max(14px, env(safe-area-inset-right)); display: flex; align-items: center; gap: 7px; }
+  #fitButton { display: grid; place-items: center; flex: 0 0 38px; width: 38px; height: 38px; padding: 0; border: 1px solid ${dark ? 'rgba(255,255,255,.17)' : 'rgba(0,0,0,.12)'}; border-radius: 9px; color: ${dark ? '#eeeeee' : '#252525'}; background: ${dark ? 'rgba(34,34,34,.68)' : 'rgba(255,255,255,.72)'}; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); cursor: pointer; opacity: .78; transition: opacity .16s ease, background .16s ease, transform .16s ease; }
   #fitButton:hover { opacity: 1; transform: translateY(-1px); }
   #fitButton:active { transform: scale(.96); }
   #fitButton svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  #editInNetNorthButton { min-height: 38px; padding: 0 13px; border: 1px solid ${dark ? 'rgba(255,255,255,.17)' : 'rgba(0,0,0,.12)'}; border-radius: 9px; color: ${dark ? '#eeeeee' : '#252525'}; background: ${dark ? 'rgba(34,34,34,.78)' : 'rgba(255,255,255,.82)'}; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); font: 600 12px/1 ui-sans-serif, system-ui, sans-serif; white-space: nowrap; cursor: pointer; transition: opacity .16s ease, background .16s ease, transform .16s ease; }
+  #editInNetNorthButton:hover { opacity: 1; background: ${dark ? 'rgba(48,48,48,.94)' : 'rgba(255,255,255,.98)'}; transform: translateY(-1px); }
+  #editInNetNorthButton:active { transform: scale(.97); }
+  #editHint { position: fixed; z-index: 11; top: calc(max(14px, env(safe-area-inset-top)) + 48px); right: max(14px, env(safe-area-inset-right)); max-width: min(340px, calc(100vw - 28px)); padding: 10px 12px; border: 1px solid ${dark ? 'rgba(255,255,255,.15)' : 'rgba(0,0,0,.1)'}; border-radius: 8px; color: ${dark ? '#eeeeee' : '#252525'}; background: ${dark ? 'rgba(28,28,28,.92)' : 'rgba(255,255,255,.94)'}; box-shadow: 0 8px 28px rgba(0,0,0,.12); backdrop-filter: blur(12px); font-size: 12px; line-height: 1.45; opacity: 0; visibility: hidden; transform: translateY(-4px); transition: opacity .18s ease, transform .2s cubic-bezier(.2,.75,.25,1), visibility 0s linear .2s; pointer-events: none; }
+  #editHint.visible { opacity: 1; visibility: visible; transform: translateY(0); transition-delay: 0s; }
   #watermark { position: fixed; z-index: 9; right: max(15px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); color: ${dark ? '#ffffff' : '#111111'}; opacity: .35; font-size: 11px; font-weight: 750; letter-spacing: .12em; pointer-events: none; }
-  @media (prefers-reduced-motion: reduce) { #fitButton { transition: none; } }
+  @media (max-width: 520px) { #editInNetNorthButton { max-width: 190px; padding: 0 10px; font-size: 11px; } }
+  @media (prefers-reduced-motion: reduce) { #fitButton, #editInNetNorthButton, #editHint { transition: none; } }
 </style>
 </head>
 <body>
 <div id="viewer" aria-label="Интерактивная схема NetNorth">
   <div id="world"><svg id="edges" aria-hidden="true"></svg></div>
 </div>
-<button id="fitButton" type="button" aria-label="Вписать в экран" title="Вписать в экран"><svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3M8 8h8v8H8z"/></svg></button>
+<div id="viewerActions">
+  <button id="editInNetNorthButton" type="button">Редактировать в NetNorth</button>
+  <button id="fitButton" type="button" aria-label="Вписать в экран" title="Вписать в экран"><svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3M8 8h8v8H8z"/></svg></button>
+</div>
+<div id="editHint" role="status" aria-live="polite">Чтобы продолжить редактирование, просто перетащите этот HTML-файл в окно NetNorth.</div>
 <div id="watermark">NetNorth</div>
 <script type="application/json" id="scene-data">${json}</script>
 <script>
@@ -6964,6 +7029,9 @@
   const world = document.getElementById('world');
   const svg = document.getElementById('edges');
   const fitButton = document.getElementById('fitButton');
+  const editInNetNorthButton = document.getElementById('editInNetNorthButton');
+  const editHint = document.getElementById('editHint');
+  const EDITOR_URL = ${JSON.stringify(editorUrl).replace(/</g, '\\u003c')};
   const NS = 'http://www.w3.org/2000/svg';
   const nodes = Array.isArray(data.nodes) ? data.nodes : [];
   const edges = Array.isArray(data.edges) ? data.edges : [];
@@ -7247,6 +7315,192 @@
     applyTransform();
   }
   fitButton.addEventListener('click', fitToScreen);
+  let editorTransferWindow = null;
+  let editorTransferRetryTimer = 0;
+  let editorTransferStopTimer = 0;
+  let editorTransferReadyTimer = 0;
+  let editorTransferAcknowledged = false;
+
+  function showEditorImportHint(message) {
+    if (message) editHint.textContent = message;
+    editHint.classList.add('visible');
+  }
+
+  function clearEditorTransferTimers() {
+    if (editorTransferRetryTimer) window.clearInterval(editorTransferRetryTimer);
+    if (editorTransferStopTimer) window.clearTimeout(editorTransferStopTimer);
+    if (editorTransferReadyTimer) window.clearTimeout(editorTransferReadyTimer);
+    editorTransferRetryTimer = 0;
+    editorTransferStopTimer = 0;
+    editorTransferReadyTimer = 0;
+  }
+
+  function encodeUtf8Base64Url(value) {
+    let binary = '';
+    if (typeof TextEncoder !== 'undefined') {
+      const bytes = new TextEncoder().encode(value);
+      const chunkSize = 0x8000;
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)));
+      }
+    } else {
+      binary = unescape(encodeURIComponent(value));
+    }
+    return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/g, '');
+  }
+
+  function createImageFreeImportUrl() {
+    if (!EDITOR_URL) return '';
+    const keepSceneWithoutImages = sourceScene => {
+      if (!sourceScene || typeof sourceScene !== 'object') return { nodes: [], edges: [] };
+      const nodesWithoutImages = (Array.isArray(sourceScene.nodes) ? sourceScene.nodes : [])
+        .filter(node => node && node.type !== 'image');
+      const keptIds = new Set(nodesWithoutImages.map(node => String(node.id)));
+      return {
+        ...sourceScene,
+        nodes: nodesWithoutImages,
+        edges: (Array.isArray(sourceScene.edges) ? sourceScene.edges : [])
+          .filter(edge => edge && keptIds.has(String(edge.from)) && keptIds.has(String(edge.to)))
+      };
+    };
+    const compactProject = {
+      format: 'osint-visualization',
+      version: 2,
+      title: data.title,
+      scene: keepSceneWithoutImages({ nodes: data.nodes, edges: data.edges }),
+      timeline: (Array.isArray(data.timeline) ? data.timeline : []).map(frame => ({
+        at: Math.max(0, numberOr(frame.at, 0)),
+        scene: keepSceneWithoutImages(frame.scene)
+      })),
+      images: {},
+      projectStartedAt: data.projectStartedAt,
+      workedMs: data.workedMs,
+      notes: data.notes,
+      checklist: data.checklist,
+      cameraBookmarks: data.cameraBookmarks,
+      textNodeDefaults: data.textNodeDefaults
+    };
+    try {
+      const encoded = encodeUtf8Base64Url(JSON.stringify(compactProject));
+      // Keep the fallback below conservative browser URL-length limits.
+      if (!encoded || encoded.length > 1000000) return '';
+      const fallbackUrl = new URL(EDITOR_URL);
+      fallbackUrl.hash = 'import=' + encoded;
+      return fallbackUrl.toString();
+    } catch (error) {
+      console.warn('Could not prepare image-free project URL:', error);
+      return '';
+    }
+  }
+
+  function navigateEditorToImageFreeFallback(editorWin) {
+    const fallbackUrl = createImageFreeImportUrl();
+    if (!fallbackUrl) {
+      showEditorImportHint('Автоматическая передача недоступна в этом браузере. Перетащите исходный HTML-файл в окно NetNorth для импорта всех данных и изображений.');
+      return false;
+    }
+    try {
+      if (editorWin && !editorWin.closed) {
+        // Navigating an already-open cross-origin window to a URL is permitted;
+        // the hash payload contains no image binaries.
+        editorWin.location = fallbackUrl;
+        showEditorImportHint('Открываем проект без изображений. Для переноса картинок перетащите исходный HTML-файл в окно NetNorth.');
+        return true;
+      }
+    } catch (_) { /* Fall through to a fresh tab. */ }
+    const fallbackWindow = window.open(fallbackUrl, '_blank');
+    if (fallbackWindow) {
+      showEditorImportHint('Открываем проект без изображений. Для переноса картинок перетащите исходный HTML-файл в окно NetNorth.');
+      return true;
+    }
+    showEditorImportHint('Браузер заблокировал новое окно. Перетащите этот HTML-файл в окно NetNorth для импорта проекта.');
+    return false;
+  }
+
+  window.addEventListener('message', event => {
+    if (!editorTransferWindow || event.source !== editorTransferWindow) return;
+    const message = event.data;
+    if (!message || typeof message !== 'object') return;
+
+    if (message.type === 'netnorth-ready') {
+      if (editorTransferRetryTimer || editorTransferAcknowledged) return;
+      if (editorTransferReadyTimer) {
+        window.clearTimeout(editorTransferReadyTimer);
+        editorTransferReadyTimer = 0;
+      }
+      const sendProject = () => {
+        try {
+          if (editorTransferWindow && !editorTransferWindow.closed) {
+            editorTransferWindow.postMessage({ type: 'netnorth-import-project', payload: data }, '*');
+          }
+        } catch (error) {
+          console.warn('Could not send project to NetNorth:', error);
+        }
+      };
+      sendProject();
+      editorTransferRetryTimer = window.setInterval(sendProject, 300);
+      editorTransferStopTimer = window.setTimeout(() => {
+        if (editorTransferRetryTimer) window.clearInterval(editorTransferRetryTimer);
+        editorTransferRetryTimer = 0;
+        editorTransferStopTimer = 0;
+      }, 3000);
+      // Allow the editor time to validate and persist the complete payload.
+      editorTransferReadyTimer = window.setTimeout(() => {
+        editorTransferReadyTimer = 0;
+        if (!editorTransferAcknowledged) {
+          const target = editorTransferWindow;
+          clearEditorTransferTimers();
+          navigateEditorToImageFreeFallback(target);
+        }
+      }, 12000);
+      return;
+    }
+
+    if (message.type === 'netnorth-imported') {
+      editorTransferAcknowledged = true;
+      clearEditorTransferTimers();
+      showEditorImportHint('Проект успешно открыт в NetNorth.');
+      return;
+    }
+
+    if (message.type === 'netnorth-import-failed') {
+      clearEditorTransferTimers();
+      navigateEditorToImageFreeFallback(editorTransferWindow);
+    }
+  });
+
+  editInNetNorthButton.addEventListener('click', () => {
+    if (!EDITOR_URL) {
+      showEditorImportHint('Не удалось определить адрес редактора. Перетащите этот HTML-файл в окно NetNorth для импорта.');
+      return;
+    }
+    clearEditorTransferTimers();
+    editorTransferAcknowledged = false;
+
+    // Keep window.opener available: the editor uses it to signal readiness
+    // and receive the complete project payload via postMessage.
+    const editorWin = window.open(EDITOR_URL + '#await-import', '_blank');
+    editorTransferWindow = editorWin;
+    if (!editorWin) {
+      navigateEditorToImageFreeFallback(null);
+      return;
+    }
+
+    let openerAvailable = false;
+    try { openerAvailable = editorWin.opener === window; } catch (_) { openerAvailable = false; }
+    if (!openerAvailable) {
+      navigateEditorToImageFreeFallback(editorWin);
+      return;
+    }
+
+    editorTransferReadyTimer = window.setTimeout(() => {
+      editorTransferReadyTimer = 0;
+      if (!editorTransferAcknowledged && !editorTransferRetryTimer) {
+        navigateEditorToImageFreeFallback(editorTransferWindow);
+      }
+    }, 10000);
+    showEditorImportHint('Подключаем редактор и передаём проект…');
+  });
   window.addEventListener('resize', fitToScreen);
   let pointers = new Map();
   let pan = null;
@@ -8027,99 +8281,196 @@
     }
   }
 
+  function restoreImportedSceneColors(sourceScene) {
+    if (!sourceScene || typeof sourceScene !== 'object' || Array.isArray(sourceScene)) return sourceScene;
+    const nodes = Array.isArray(sourceScene.nodes) ? sourceScene.nodes.map(node => {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+      const restored = { ...node };
+      const rawColor = typeof node.rawColor === 'string' && /^#[0-9a-f]{6}$/i.test(node.rawColor)
+        ? node.rawColor.toLowerCase()
+        : node.color;
+      const rawBorderColor = typeof node.rawBorderColor === 'string' && /^#[0-9a-f]{6}$/i.test(node.rawBorderColor)
+        ? node.rawBorderColor.toLowerCase()
+        : node.borderColor;
+      if (typeof rawColor === 'string') restored.color = rawColor;
+      if (typeof rawBorderColor === 'string') restored.borderColor = rawBorderColor;
+      delete restored.rawColor;
+      delete restored.rawBorderColor;
+      return restored;
+    }) : sourceScene.nodes;
+    return { ...sourceScene, nodes };
+  }
+
+  function normalizeImportedProjectObject(rawData) {
+    if (!rawData || typeof rawData !== 'object' || Array.isArray(rawData)) {
+      throw new Error('Invalid imported project object');
+    }
+    let data = rawData;
+    if (rawData.format === 'netnorth-standalone' && Array.isArray(rawData.nodes)) {
+      data = {
+        format: 'osint-visualization',
+        version: 2,
+        title: rawData.title,
+        scene: restoreImportedSceneColors({ nodes: rawData.nodes, edges: rawData.edges }),
+        timeline: Array.isArray(rawData.timeline) ? rawData.timeline.map(frame => ({
+          ...frame,
+          scene: restoreImportedSceneColors(frame && frame.scene)
+        })) : rawData.timeline,
+        images: rawData.images,
+        projectStartedAt: rawData.projectStartedAt,
+        workedMs: rawData.workedMs,
+        notes: rawData.notes,
+        checklist: rawData.checklist,
+        cameraBookmarks: rawData.cameraBookmarks,
+        textNodeDefaults: rawData.textNodeDefaults
+      };
+    } else if (rawData.scene && typeof rawData.scene === 'object') {
+      // Also restore raw theme-independent colors if a compatible envelope
+      // includes standalone-viewer color metadata.
+      data = {
+        ...rawData,
+        scene: restoreImportedSceneColors(rawData.scene),
+        timeline: Array.isArray(rawData.timeline) ? rawData.timeline.map(frame => ({
+          ...frame,
+          scene: restoreImportedSceneColors(frame && frame.scene)
+        })) : rawData.timeline
+      };
+    }
+    validateProjectDataStructure(data);
+    return data;
+  }
+
+  async function loadImportedProjectObject(rawData) {
+    const previousImageStore = new Map(imageStore);
+    let imageStoreReplaced = false;
+    try {
+      const data = normalizeImportedProjectObject(rawData);
+      const imageAssets = normalizeProjectImageAssets(data.images);
+      const importedTitle = typeof data.title === 'string' && data.title.trim()
+        ? data.title.slice(0, 90)
+        : 'Импортированная схема';
+      const timelineInput = Array.isArray(data.timeline) ? data.timeline : [];
+      const importedProjectStartedAt = Number(data.projectStartedAt) || Date.now();
+      const importedNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
+      const importedChecklist = sanitizeProjectChecklist(data.checklist);
+      const importedCameraBookmarksData = data.cameraBookmarks;
+      const importedTextNodeDefaults = normalizeTextNodeDefaults(data.textNodeDefaults);
+      const importedWorkedMs = Math.max(0, Number(data.workedMs) || 0);
+
+      // Complete storage migration before creating a new imported project record.
+      await projectStorageMigrationPromise;
+      if (playback.active) exitPlayback();
+      if (presentationMode) exitPresentationMode();
+      if (editingId) finishEditing(editingId, true);
+      if (!await flushPendingSave()) {
+        showToast('Не удалось сохранить текущий проект перед импортом');
+        return false;
+      }
+
+      clearProjectRuntimeCaches(false);
+      imageStore.clear();
+      Object.entries(imageAssets).forEach(([key, value]) => imageStore.set(key, value));
+      imageStoreReplaced = true;
+
+      const importedScene = sanitizeScene(data.scene);
+      let importedTimeline = timelineInput.map(frame => ({
+        at: Math.max(0, Number(frame.at) || 0),
+        scene: snapshot(sanitizeScene(frame.scene))
+      }));
+      if (!importedTimeline.length) {
+        importedTimeline = [
+          { at: 0, scene: snapshot(freshScene()) },
+          { at: 1, scene: snapshot(importedScene) }
+        ];
+      }
+
+      scene = importedScene;
+      currentProjectId = makeProjectId();
+      isNewUnsavedSessionProject = true;
+      initialOpenedProjectBaseline = null;
+      activeSavedProjectId = null;
+      activeSavedProjectData = null;
+      projectTitle.value = importedTitle;
+      timeline = importedTimeline;
+      projectStartedAt = importedProjectStartedAt;
+      projectNotes = importedNotes;
+      projectChecklist = importedChecklist;
+      setTextNodeDefaults(importedTextNodeDefaults);
+      cameraState.bookmarks = normalizeCameraBookmarks(importedCameraBookmarksData, scene.nodes);
+      updateCameraBookmarksUI();
+      projectWorkedMs = importedWorkedMs;
+      projectSessionStartedAt = Date.now();
+      syncProjectNotesPanel();
+      selectedId = editingId = null;
+      selectedIds.splice(0);
+      selectedEdgeIds.splice(0);
+      mode = 'select';
+      undoStack = [snapshot()];
+      undoIndex = 0;
+      currentRenderScene = null;
+      syncModeButtons();
+      startScreen.classList.remove('visible');
+      renderScene();
+      requestAnimationFrame(() => centerCameraOnScene(scene));
+      saveProject();
+      updateActionButtons();
+      showToast('Проект открыт');
+      return true;
+    } catch (error) {
+      if (imageStoreReplaced) {
+        imageStore.clear();
+        previousImageStore.forEach((value, key) => imageStore.set(key, value));
+        currentRenderScene = null;
+        try { renderScene(scene); } catch (_) {}
+      }
+      console.warn('Project import failed:', error);
+      showToast('Не удалось открыть файл проекта');
+      return false;
+    }
+  }
+
   function importProjectFile(file) {
     if (!file) return;
     if (drag || linkDraft || boxSelect) cancelPointerGesture();
+    const fileName = String(file.name || '').toLowerCase();
+    const fileType = String(file.type || '').toLowerCase();
+    const isHtmlReport = /\.(?:html?|xhtml)$/.test(fileName) || fileType === 'text/html';
+    const isJsonBackup = /\.json$/.test(fileName) || fileType === 'application/json';
+    if (!isHtmlReport && !isJsonBackup) {
+      showToast('Выберите HTML-отчёт или JSON-файл NetNorth');
+      return;
+    }
     const reader = new FileReader();
     reader.onload = async () => {
-      const previousImageStore = new Map(imageStore);
-      let imageStoreReplaced = false;
       try {
-        // Validate the envelope before switching away from the current project.
-        const data = JSON.parse(String(reader.result || ''));
-        validateProjectDataStructure(data);
-        const imageAssets = normalizeProjectImageAssets(data.images);
-        const importedTitle = typeof data.title === 'string' && data.title.trim()
-          ? data.title.slice(0, 90)
-          : 'Импортированная схема';
-        const timelineInput = Array.isArray(data.timeline) ? data.timeline : [];
-        const importedProjectStartedAt = Number(data.projectStartedAt) || Date.now();
-        const importedNotes = typeof data.notes === 'string' ? data.notes.slice(0, 100000) : '';
-        const importedChecklist = sanitizeProjectChecklist(data.checklist);
-        const importedCameraBookmarksData = data.cameraBookmarks;
-        const importedTextNodeDefaults = normalizeTextNodeDefaults(data.textNodeDefaults);
-        const importedWorkedMs = Math.max(0, Number(data.workedMs) || 0);
-
-        // Commit the previous project while its image cache is still available.
-        if (playback.active) exitPlayback();
-        if (editingId) finishEditing(editingId, true);
-        if (!await flushPendingSave()) {
-          showToast('Не удалось сохранить текущий проект перед импортом');
-          importFile.value = '';
-          return;
+        const fileText = String(reader.result || '');
+        let rawData;
+        if (isHtmlReport) {
+          // Imported HTML is treated as inert data. Only the JSON payload is read;
+          // no script from the document is ever executed.
+          const parsedDocument = new DOMParser().parseFromString(fileText, 'text/html');
+          const sceneDataElement = parsedDocument.getElementById('scene-data');
+          if (!sceneDataElement || sceneDataElement.tagName !== 'SCRIPT' ||
+              sceneDataElement.getAttribute('type') !== 'application/json') {
+            throw new Error('HTML report does not contain a valid scene-data block');
+          }
+          rawData = JSON.parse(sceneDataElement.textContent || '{}');
+        } else {
+          rawData = JSON.parse(fileText);
         }
-        clearProjectRuntimeCaches(false);
-        imageStore.clear();
-        Object.entries(imageAssets).forEach(([key, value]) => imageStore.set(key, value));
-        imageStoreReplaced = true;
-
-        const importedScene = sanitizeScene(data.scene);
-        let importedTimeline = timelineInput.map(frame => ({
-          at: Math.max(0, Number(frame.at) || 0),
-          scene: snapshot(sanitizeScene(frame.scene))
-        }));
-        if (!importedTimeline.length) {
-          importedTimeline = [
-            { at: 0, scene: snapshot(freshScene()) },
-            { at: 1, scene: snapshot(importedScene) }
-          ];
-        }
-
-        scene = importedScene;
-        currentProjectId = makeProjectId();
-        isNewUnsavedSessionProject = true;
-        initialOpenedProjectBaseline = null;
-        activeSavedProjectId = null;
-        activeSavedProjectData = null;
-        projectTitle.value = importedTitle;
-        timeline = importedTimeline;
-        projectStartedAt = importedProjectStartedAt;
-        projectNotes = importedNotes;
-        projectChecklist = importedChecklist;
-        setTextNodeDefaults(importedTextNodeDefaults);
-        cameraState.bookmarks = normalizeCameraBookmarks(importedCameraBookmarksData, scene.nodes);
-        updateCameraBookmarksUI();
-        projectWorkedMs = importedWorkedMs;
-        projectSessionStartedAt = Date.now();
-        syncProjectNotesPanel();
-        selectedId = editingId = null;
-        selectedIds.splice(0);
-        mode = 'select';
-        undoStack = [snapshot()];
-        undoIndex = 0;
-        currentRenderScene = null;
-        syncModeButtons();
-        startScreen.classList.remove('visible');
-        renderScene();
-        saveProject();
-        updateActionButtons();
-        showToast('Проект открыт');
+        await loadImportedProjectObject(rawData);
       } catch (error) {
-        if (imageStoreReplaced) {
-          imageStore.clear();
-          previousImageStore.forEach((value, key) => imageStore.set(key, value));
-          currentRenderScene = null;
-          try { renderScene(scene); } catch (_) {}
-        }
-        console.warn('Project import failed:', error);
-        showToast('Не удалось открыть файл проекта');
+        console.warn('Project file parsing failed:', error);
+        showToast('Не удалось прочитать файл проекта');
       }
-      importFile.value = '';
+      if (importFile) importFile.value = '';
     };
-    reader.onerror = () => showToast('Ошибка чтения файла');
+    reader.onerror = () => {
+      showToast('Ошибка чтения файла');
+      if (importFile) importFile.value = '';
+    };
     reader.readAsText(file);
   }
-
   function formatTime(seconds) {
     const s = Math.max(0, Math.floor(seconds));
     return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
@@ -8950,6 +9301,73 @@
     event.currentTarget.value = ''; // Allows choosing the same image again later.
     if (file) insertImageFile(file, pendingImagePoint);
   });
+
+  // Accept operating-system files anywhere in the app, while leaving ordinary
+  // text selection/dragging inside editable nodes completely untouched.
+  let externalFileDragDepth = 0;
+  const dragContainsFiles = event => {
+    const types = event.dataTransfer && event.dataTransfer.types;
+    return !!types && Array.from(types).includes('Files');
+  };
+  const hideFileDropOverlay = () => {
+    externalFileDragDepth = 0;
+    fileDropOverlay?.classList.remove('visible');
+    fileDropOverlay?.setAttribute('aria-hidden', 'true');
+  };
+  window.addEventListener('dragenter', event => {
+    if (!dragContainsFiles(event)) return;
+    event.preventDefault();
+    externalFileDragDepth += 1;
+    fileDropOverlay?.classList.add('visible');
+    fileDropOverlay?.setAttribute('aria-hidden', 'false');
+  });
+  window.addEventListener('dragover', event => {
+    if (!dragContainsFiles(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    if (fileDropOverlay && !fileDropOverlay.classList.contains('visible')) {
+      fileDropOverlay.classList.add('visible');
+      fileDropOverlay.setAttribute('aria-hidden', 'false');
+    }
+  });
+  window.addEventListener('dragleave', event => {
+    if (!dragContainsFiles(event)) return;
+    externalFileDragDepth = Math.max(0, externalFileDragDepth - 1);
+    if (externalFileDragDepth === 0) hideFileDropOverlay();
+  });
+  window.addEventListener('drop', event => {
+    if (!dragContainsFiles(event)) return;
+    event.preventDefault();
+    hideFileDropOverlay();
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (!files.length) return;
+
+    const projectFile = files.find(file => /\.(?:html?|json)$/i.test(String(file.name || '')) ||
+      ['text/html', 'application/json'].includes(String(file.type || '').toLowerCase()));
+    if (projectFile) {
+      importProjectFile(projectFile);
+      return;
+    }
+
+    const image = files.find(file => /\.(?:png|jpe?g)$/i.test(String(file.name || '')) ||
+      ['image/png', 'image/jpeg'].includes(String(file.type || '').toLowerCase()));
+    if (image) {
+      const rect = workspace.getBoundingClientRect();
+      const droppedOnWorkspace = !startScreen.classList.contains('visible') &&
+        event.clientX >= rect.left && event.clientX <= rect.right &&
+        event.clientY >= rect.top && event.clientY <= rect.bottom &&
+        !presentationMode && !playback.active;
+      if (droppedOnWorkspace) {
+        pendingImagePoint = getStagePoint(event);
+        insertImageFile(image, pendingImagePoint);
+      } else {
+        showToast('Перетащите изображение непосредственно на открытый холст');
+      }
+      return;
+    }
+
+    showToast('Поддерживаются HTML, HTM, JSON, PNG и JPG');
+  });
   document?.addEventListener('paste', event => {
     if (presentationMode) {
       internalClipboardPasteRequested = false;
@@ -9467,4 +9885,56 @@
     if (hasProjectContent()) saveProject();
   }, 60000);
   showStartScreen();
+
+  // Accept complete projects only from the window that opened this editor.
+  // The payload is normalized and validated before replacing the current scene.
+  let externalProjectImportPromise = null;
+  window.addEventListener('message', async event => {
+    if (!window.opener || event.source !== window.opener) return;
+    const message = event.data;
+    if (!message || typeof message !== 'object' || message.type !== 'netnorth-import-project') return;
+    if (externalProjectImportPromise) return;
+
+    const sourceWindow = event.source;
+    externalProjectImportPromise = loadImportedProjectObject(message.payload);
+    const imported = await externalProjectImportPromise;
+    externalProjectImportPromise = null;
+    try {
+      sourceWindow?.postMessage({ type: imported ? 'netnorth-imported' : 'netnorth-import-failed' }, '*');
+    } catch (error) {
+      console.warn('Could not acknowledge NetNorth project handoff:', error);
+    }
+  });
+
+  function decodeProjectHashPayload(encoded) {
+    const normalized = String(encoded || '').replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+    const decoded = typeof TextDecoder !== 'undefined'
+      ? new TextDecoder().decode(bytes)
+      : decodeURIComponent(Array.from(bytes, byte => '%' + byte.toString(16).padStart(2, '0')).join(''));
+    return JSON.parse(decoded);
+  }
+
+  const startupHash = String(window.location.hash || '');
+  if (startupHash === '#await-import' && window.opener) {
+    try { window.opener.postMessage({ type: 'netnorth-ready' }, '*'); }
+    catch (error) { console.warn('Could not notify the project source window:', error); }
+    try {
+      window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search);
+    } catch (_) { /* Hash cleanup is optional in restricted embedded browsers. */ }
+  } else if (startupHash.startsWith('#import=')) {
+    const encodedPayload = startupHash.slice('#import='.length);
+    try {
+      window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search);
+    } catch (_) { /* Keep running even if the embedded browser forbids history replacement. */ }
+    try {
+      const hashProject = decodeProjectHashPayload(encodedPayload);
+      void loadImportedProjectObject(hashProject);
+    } catch (error) {
+      console.warn('Could not restore project from URL hash:', error);
+      showToast('Не удалось восстановить проект из ссылки');
+    }
+  }
 })();
